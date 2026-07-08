@@ -1,0 +1,100 @@
+//@version=6
+indicator("Gold ICT Pro v0.2.1 - Alternation Engine", overlay=true, max_labels_count=500)
+
+//====================================================
+// INPUTS
+//====================================================
+
+groupCandidate = "Candidate Engine"
+
+ce_swingLength = input.int(5, "Swing Length", minval=2, maxval=20, group=groupCandidate)
+showCandidates = input.bool(true, "Show Confirmed Swings", group=groupCandidate)
+
+//====================================================
+// CANDIDATE DETECTION
+//====================================================
+
+candidateHigh = ta.pivothigh(high, ce_swingLength, ce_swingLength)
+candidateLow  = ta.pivotlow(low, ce_swingLength, ce_swingLength)
+
+//====================================================
+// ALTERNATION ENGINE
+//====================================================
+
+var bool waitingForHigh = true
+var bool waitingForLow  = false
+
+var float confirmedHigh = na
+var float confirmedLow  = na
+
+var int confirmedHighBar = na
+var int confirmedLowBar = na
+
+bool plotHigh = false
+bool plotLow = false
+
+// ---------- HIGH ----------
+
+if not na(candidateHigh)
+
+    pivotBar = bar_index - ce_swingLength
+
+    if waitingForHigh
+
+        confirmedHigh := candidateHigh
+        confirmedHighBar := pivotBar
+
+        waitingForHigh := false
+        waitingForLow := true
+
+        plotHigh := true
+
+    else if waitingForLow
+
+        if candidateHigh > confirmedHigh
+
+            confirmedHigh := candidateHigh
+            confirmedHighBar := pivotBar
+
+// ---------- LOW ----------
+
+if not na(candidateLow)
+
+    pivotBar = bar_index - ce_swingLength
+
+    if waitingForLow
+
+        confirmedLow := candidateLow
+        confirmedLowBar := pivotBar
+
+        waitingForLow := false
+        waitingForHigh := true
+
+        plotLow := true
+
+    else if waitingForHigh
+
+        if candidateLow < confirmedLow
+
+            confirmedLow := candidateLow
+            confirmedLowBar := pivotBar
+
+//====================================================
+// VISUALIZATION
+//====================================================
+
+plotshape(plotHigh,
+     style=shape.circle,
+     location=location.abovebar,
+     color=color.red,
+     size=size.small,
+     offset=-ce_swingLength,
+     title="Confirmed High")
+
+plotshape(plotLow,
+     style=shape.circle,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.small,
+     offset=-ce_swingLength,
+     title="Confirmed Low")
