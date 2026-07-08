@@ -1,0 +1,43 @@
+//@version=6
+indicator("Gold ICT Pro v0.2.0", overlay=true, max_labels_count=500)
+
+//====================================================
+// CANDIDATE ENGINE
+//====================================================
+
+// Inputs
+groupCandidate = "Candidate Engine"
+
+ce_swingLength = input.int(5, "Swing Length", minval=2, maxval=20, group=groupCandidate)
+showCandidates = input.bool(true, "Show Candidate Points", group=groupCandidate)
+
+//====================================================
+// Candidate Detection
+//====================================================
+
+ce_candidateHigh = ta.pivothigh(high, ce_swingLength, ce_swingLength)
+ce_candidateLow  = ta.pivotlow(low, ce_swingLength, ce_swingLength)
+
+//====================================================
+// Debug Plot
+//====================================================
+
+plotshape(
+    series = showCandidates and not na(ce_candidateHigh),
+    title = "Candidate High",
+    style = shape.circle,
+    location = location.abovebar,
+    color = color.red,
+    size = size.tiny,
+    offset = -ce_swingLength
+)
+
+plotshape(
+    series = showCandidates and not na(ce_candidateLow),
+    title = "Candidate Low",
+    style = shape.circle,
+    location = location.belowbar,
+    color = color.lime,
+    size = size.tiny,
+    offset = -ce_swingLength
+)
