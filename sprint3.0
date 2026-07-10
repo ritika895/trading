@@ -1,0 +1,501 @@
+//@version=6
+indicator("Gold ICT Pro - Replacement Engine v1", overlay = true, max_labels_count = 500, max_lines_count = 100)
+
+//====================================================================
+// CONFIGURATION
+//====================================================================
+
+// Swing Types
+const int SWING_NONE = 0
+const int SWING_HIGH = 1
+const int SWING_LOW = -1
+
+// Swing Status
+const int STATUS_PENDING = 0
+const int STATUS_CONFIRMED = 1
+const int STATUS_REPLACED = 2
+const int STATUS_REJECTED = 3
+
+// Engine Events
+const int EVENT_ACCEPTED = 1
+const int EVENT_REPLACED = 2
+const int EVENT_REJECTED = 3
+
+// Display Modes
+const string DISPLAY_DEVELOPER = "Developer"
+const string DISPLAY_TEST = "Test"
+const string DISPLAY_TRADER = "Trader"
+
+// Reserved Defaults
+const int NO_INDEX = -1
+const int NO_SWING_ID = 0
+const int RESERVED_INT_DEFAULT = 0
+const string RESERVED_STRING_DEFAULT = ""
+
+//====================================================================
+// INPUTS
+//====================================================================
+
+pivotLeftBars = input.int(3, "Candidate Left Bars", minval = 1)
+pivotRightBars = input.int(3, "Candidate Right Bars", minval = 1)
+
+displayMode = input.string(DISPLAY_DEVELOPER, "Display Mode", options = [DISPLAY_DEVELOPER, DISPLAY_TEST, DISPLAY_TRADER])
+
+showDebugLabels = input.bool(true, "Debug Mode")
+showConfirmedSwings = input.bool(true, "Show Confirmed Swings")
+
+acceptedColor = input.color(color.new(color.lime, 0), "Accepted Swing Color")
+replacedColor = input.color(color.new(color.orange, 0), "Replaced Swing Color")
+rejectedColor = input.color(color.new(color.red, 0), "Rejected Swing Color")
+
+//====================================================================
+// CANDIDATE ENGINE
+// Candidate detection is unchanged.
+//====================================================================
+
+candidateHighPrice = ta.pivothigh(high, pivotLeftBars, pivotRightBars)
+candidateLowPrice = ta.pivotlow(low, pivotLeftBars, pivotRightBars)
+
+hasCandidateHigh = not na(candidateHighPrice)
+hasCandidateLow = not na(candidateLowPrice)
+
+candidateHighBar = bar_index - pivotRightBars
+candidateLowBar = bar_index - pivotRightBars
+
+//====================================================================
+// SWING DATABASE
+//====================================================================
+
+var int nextSwingId = 1
+
+var array<int> swingIds = array.new_int()
+var array<int> swingTypes = array.new_int()
+var array<float> swingPrices = array.new_float()
+var array<int> swingBars = array.new_int()
+var array<int> swingStatuses = array.new_int()
+
+var array<float> swingATR = array.new_float()
+var array<float> swingLegLength = array.new_float()
+var array<float> swingStrength = array.new_float()
+var array<float> swingScore = array.new_float()
+var array<float> swingLiquidity = array.new_float()
+var array<string> swingSession = array.new_string()
+var array<int> swingTrend = array.new_int()
+
+databaseSize() =>
+    array.size(swingIds)
+
+swingIndexFromId(int swingId) =>
+    int resultIndex = NO_INDEX
+    int size = array.size(swingIds)
+
+    if swingId > 0 and size > 0
+        for index = 0 to size - 1
+            int storedSwingId = array.get(swingIds, index)
+
+            if resultIndex == NO_INDEX and storedSwingId == swingId
+                resultIndex := index
+
+    resultIndex
+
+isValidSwingType(int swingType) =>
+    swingType == SWING_HIGH or swingType == SWING_LOW
+
+isValidSwingStatus(int statusValue) =>
+    statusValue == STATUS_PENDING or statusValue == STATUS_CONFIRMED or statusValue == STATUS_REPLACED or statusValue == STATUS_REJECTED
+
+debugAssert(bool condition, string message) =>
+    if showDebugLabels and not condition
+        runtime.error(message)
+
+databaseHasDuplicateIds() =>
+    bool hasDuplicate = false
+    int size = array.size(swingIds)
+
+    if size > 1
+        for leftIndex = 0 to size - 2
+            int leftId = array.get(swingIds, leftIndex)
+
+            for rightIndex = leftIndex + 1 to size - 1
+                int rightId = array.get(swingIds, rightIndex)
+
+                if leftId == rightId
+                    hasDuplicate := true
+
+    hasDuplicate
+
+databaseIsValid() =>
+    int size = array.size(swingIds)
+    int typesSize = array.size(swingTypes)
+    int pricesSize = array.size(swingPrices)
+    int barsSize = array.size(swingBars)
+    int statusesSize = array.size(swingStatuses)
+    int atrSize = array.size(swingATR)
+    int legLengthSize = array.size(swingLegLength)
+    int strengthSize = array.size(swingStrength)
+    int scoreSize = array.size(swingScore)
+    int liquiditySize = array.size(swingLiquidity)
+    int sessionSize = array.size(swingSession)
+    int trendSize = array.size(swingTrend)
+
+    bool valid = true
+    bool sizesMatch = typesSize == size and pricesSize == size and barsSize == size and statusesSize == size and atrSize == size and legLengthSize == size and strengthSize == size and scoreSize == size and liquiditySize == size and sessionSize == size and trendSize == size
+
+    if not sizesMatch
+        valid := false
+
+    if databaseHasDuplicateIds()
+        valid := false
+
+    int previousConfirmedType = SWING_NONE
+
+    if size > 0
+        for index = 0 to size - 1
+            int storedSwingId = array.get(swingIds, index)
+            int storedSwingType = array.get(swingTypes, index)
+            int storedStatus = array.get(swingStatuses, index)
+
+            if storedSwingId <= 0
+                valid := false
+
+            if not isValidSwingType(storedSwingType)
+                valid := false
+
+            if not isValidSwingStatus(storedStatus)
+                valid := false
+
+            if storedStatus == STATUS_CONFIRMED
+                if previousConfirmedType == storedSwingType
+                    valid := false
+
+                previousConfirmedType := storedSwingType
+
+    valid
+
+validateDatabaseInDebug(string message) =>
+    if showDebugLabels
+        debugAssert(databaseIsValid(), message)
+
+databaseLastSwing() =>
+    int size = array.size(swingIds)
+    bool exists = size > 0
+
+    int storedSwingId = NO_SWING_ID
+    int storedSwingType = SWING_NONE
+    float storedSwingPrice = na
+    int storedSwingBar = NO_INDEX
+    int storedStatus = STATUS_REJECTED
+
+    if exists
+        int lastIndex = size - 1
+        storedSwingId := array.get(swingIds, lastIndex)
+        storedSwingType := array.get(swingTypes, lastIndex)
+        storedSwingPrice := array.get(swingPrices, lastIndex)
+        storedSwingBar := array.get(swingBars, lastIndex)
+        storedStatus := array.get(swingStatuses, lastIndex)
+
+    [storedSwingId, storedSwingType, storedSwingPrice, storedSwingBar, storedStatus, exists]
+
+databaseLastConfirmedSwing() =>
+    int confirmedSwingId = NO_SWING_ID
+    int confirmedSwingType = SWING_NONE
+    float confirmedSwingPrice = na
+    int confirmedSwingBar = NO_INDEX
+    bool exists = false
+
+    int size = array.size(swingIds)
+
+    if size > 0
+        for offset = 0 to size - 1
+            int index = size - 1 - offset
+            int storedStatus = array.get(swingStatuses, index)
+
+            if not exists and storedStatus == STATUS_CONFIRMED
+                confirmedSwingId := array.get(swingIds, index)
+                confirmedSwingType := array.get(swingTypes, index)
+                confirmedSwingPrice := array.get(swingPrices, index)
+                confirmedSwingBar := array.get(swingBars, index)
+                exists := true
+
+    [confirmedSwingId, confirmedSwingType, confirmedSwingPrice, confirmedSwingBar, exists]
+
+pushReservedSwingFields() =>
+    array.push(swingATR, na)
+    array.push(swingLegLength, na)
+    array.push(swingStrength, na)
+    array.push(swingScore, na)
+    array.push(swingLiquidity, na)
+    array.push(swingSession, RESERVED_STRING_DEFAULT)
+    array.push(swingTrend, RESERVED_INT_DEFAULT)
+
+createSwing(int swingId, int swingType, float swingPrice, int swingBar) =>
+    debugAssert(swingId > 0, "Swing ID must be positive.")
+    debugAssert(isValidSwingType(swingType), "Invalid swing type.")
+
+    array.push(swingIds, swingId)
+    array.push(swingTypes, swingType)
+    array.push(swingPrices, swingPrice)
+    array.push(swingBars, swingBar)
+    array.push(swingStatuses, STATUS_PENDING)
+    pushReservedSwingFields()
+
+    swingId
+
+updateSwingStatus(int swingId, int newStatus) =>
+    debugAssert(isValidSwingStatus(newStatus), "Invalid swing status.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStatuses, swingIndex, newStatus)
+
+    exists
+
+getSwing(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedSwingType = SWING_NONE
+    float storedSwingPrice = na
+    int storedSwingBar = NO_INDEX
+    int storedStatus = STATUS_REJECTED
+
+    if exists
+        storedSwingType := array.get(swingTypes, swingIndex)
+        storedSwingPrice := array.get(swingPrices, swingIndex)
+        storedSwingBar := array.get(swingBars, swingIndex)
+        storedStatus := array.get(swingStatuses, swingIndex)
+
+    [storedSwingType, storedSwingPrice, storedSwingBar, storedStatus, exists]
+
+//====================================================================
+// ENGINE API
+//====================================================================
+
+startPendingSwing(int swingId, int swingType, float swingPrice, int swingBar) =>
+    createSwing(swingId, swingType, swingPrice, swingBar)
+
+confirmPendingSwing(int swingId) =>
+    bool updated = updateSwingStatus(swingId, STATUS_CONFIRMED)
+    validateDatabaseInDebug("Database integrity failed after confirmation.")
+    updated
+
+replacePendingSwing(int swingId, float replacementPrice, int replacementBar) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStatuses, swingIndex, STATUS_REPLACED)
+        array.set(swingPrices, swingIndex, replacementPrice)
+        array.set(swingBars, swingIndex, replacementBar)
+
+    validateDatabaseInDebug("Database integrity failed after replacement.")
+    exists
+
+rejectPendingSwing(int swingId) =>
+    bool exists = swingIndexFromId(swingId) != NO_INDEX
+    debugAssert(exists, "Rejected swing references a missing active swing.")
+    exists
+
+getActiveSwing(int swingId) =>
+    getSwing(swingId)
+
+getLastConfirmedSwing() =>
+    databaseLastConfirmedSwing()
+
+//====================================================================
+// REPLACEMENT ENGINE
+//====================================================================
+
+var int activePendingSwingType = SWING_NONE
+var int activePendingSwingId = NO_SWING_ID
+var int activePendingHighSwingId = NO_SWING_ID
+var int activePendingLowSwingId = NO_SWING_ID
+
+var array<int> currentEventTypes = array.new_int()
+var array<int> currentEventSwingTypes = array.new_int()
+var array<int> currentEventSwingIds = array.new_int()
+var array<float> currentEventPrices = array.new_float()
+var array<int> currentEventBars = array.new_int()
+
+var array<int> currentConfirmedSwingTypes = array.new_int()
+var array<int> currentConfirmedSwingIds = array.new_int()
+var array<float> currentConfirmedSwingPrices = array.new_float()
+var array<int> currentConfirmedSwingBars = array.new_int()
+
+resetCurrentBarEvents() =>
+    array.clear(currentEventTypes)
+    array.clear(currentEventSwingTypes)
+    array.clear(currentEventSwingIds)
+    array.clear(currentEventPrices)
+    array.clear(currentEventBars)
+    array.clear(currentConfirmedSwingTypes)
+    array.clear(currentConfirmedSwingIds)
+    array.clear(currentConfirmedSwingPrices)
+    array.clear(currentConfirmedSwingBars)
+
+recordCandidateEvent(int eventType, int swingType, int swingId, float swingPrice, int swingBar) =>
+    array.push(currentEventTypes, eventType)
+    array.push(currentEventSwingTypes, swingType)
+    array.push(currentEventSwingIds, swingId)
+    array.push(currentEventPrices, swingPrice)
+    array.push(currentEventBars, swingBar)
+
+recordConfirmedSwingEvent(int swingType, int swingId, float swingPrice, int swingBar) =>
+    array.push(currentConfirmedSwingTypes, swingType)
+    array.push(currentConfirmedSwingIds, swingId)
+    array.push(currentConfirmedSwingPrices, swingPrice)
+    array.push(currentConfirmedSwingBars, swingBar)
+
+isBetterReplacement(int swingType, float candidatePrice, float activePrice) =>
+    swingType == SWING_HIGH ? candidatePrice > activePrice : candidatePrice < activePrice
+
+activateNewPendingSwing(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    int newSwingId = startPendingSwing(swingId, candidateType, candidatePrice, candidateBar)
+    int updatedHighSwingId = candidateType == SWING_HIGH ? newSwingId : activePendingHighSwingId
+    int updatedLowSwingId = candidateType == SWING_LOW ? newSwingId : activePendingLowSwingId
+
+    recordCandidateEvent(EVENT_ACCEPTED, candidateType, newSwingId, candidatePrice, candidateBar)
+
+    [candidateType, newSwingId, updatedHighSwingId, updatedLowSwingId]
+
+processSameSideCandidate(int candidateType, float candidatePrice, int candidateBar) =>
+    [_, storedPrice, _, _, exists] = getActiveSwing(activePendingSwingId)
+
+    bool shouldReplace = exists and isBetterReplacement(candidateType, candidatePrice, storedPrice)
+    int eventType = shouldReplace ? EVENT_REPLACED : EVENT_REJECTED
+
+    if shouldReplace
+        replacePendingSwing(activePendingSwingId, candidatePrice, candidateBar)
+    else
+        rejectPendingSwing(activePendingSwingId)
+
+    recordCandidateEvent(eventType, candidateType, activePendingSwingId, candidatePrice, candidateBar)
+
+    [activePendingSwingType, activePendingSwingId, activePendingHighSwingId, activePendingLowSwingId]
+
+processOppositeCandidate(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    [storedType, storedPrice, storedBar, _, exists] = getActiveSwing(activePendingSwingId)
+
+    bool confirmed = exists and confirmPendingSwing(activePendingSwingId)
+
+    if confirmed
+        recordConfirmedSwingEvent(storedType, activePendingSwingId, storedPrice, storedBar)
+
+    [newActiveType, newActiveId, newHighId, newLowId] = activateNewPendingSwing(candidateType, candidatePrice, candidateBar, swingId)
+
+    [newActiveType, newActiveId, newHighId, newLowId]
+
+processCandidate(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    bool createdNewSwing = false
+
+    if activePendingSwingType == SWING_NONE
+        [firstType, firstId, firstHighId, firstLowId] = activateNewPendingSwing(candidateType, candidatePrice, candidateBar, swingId)
+        updatedActiveType := firstType
+        updatedActiveId := firstId
+        updatedHighId := firstHighId
+        updatedLowId := firstLowId
+        createdNewSwing := true
+
+    else if activePendingSwingType == candidateType
+        [sameType, sameId, sameHighId, sameLowId] = processSameSideCandidate(candidateType, candidatePrice, candidateBar)
+        updatedActiveType := sameType
+        updatedActiveId := sameId
+        updatedHighId := sameHighId
+        updatedLowId := sameLowId
+
+    else
+        [oppositeType, oppositeId, oppositeHighId, oppositeLowId] = processOppositeCandidate(candidateType, candidatePrice, candidateBar, swingId)
+        updatedActiveType := oppositeType
+        updatedActiveId := oppositeId
+        updatedHighId := oppositeHighId
+        updatedLowId := oppositeLowId
+        createdNewSwing := true
+
+    validateDatabaseInDebug("Database integrity failed after candidate processing.")
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, createdNewSwing]
+
+resetCurrentBarEvents()
+
+if hasCandidateHigh
+    [updatedTypeHigh, updatedIdHigh, updatedHighSwingIdHigh, updatedLowSwingIdHigh, createdHighSwing] = processCandidate(SWING_HIGH, candidateHighPrice, candidateHighBar, nextSwingId)
+
+    activePendingSwingType := updatedTypeHigh
+    activePendingSwingId := updatedIdHigh
+    activePendingHighSwingId := updatedHighSwingIdHigh
+    activePendingLowSwingId := updatedLowSwingIdHigh
+
+    if createdHighSwing
+        nextSwingId += 1
+
+if hasCandidateLow
+    [updatedTypeLow, updatedIdLow, updatedHighSwingIdLow, updatedLowSwingIdLow, createdLowSwing] = processCandidate(SWING_LOW, candidateLowPrice, candidateLowBar, nextSwingId)
+
+    activePendingSwingType := updatedTypeLow
+    activePendingSwingId := updatedIdLow
+    activePendingHighSwingId := updatedHighSwingIdLow
+    activePendingLowSwingId := updatedLowSwingIdLow
+
+    if createdLowSwing
+        nextSwingId += 1
+
+//====================================================================
+// VISUALIZATION
+//====================================================================
+
+isDeveloperMode() =>
+    displayMode == DISPLAY_DEVELOPER
+
+isTestMode() =>
+    displayMode == DISPLAY_TEST
+
+drawDeveloperDebugLabel(int eventType, int swingType, int swingId, float swingPrice, int swingBar) =>
+    if showDebugLabels and isDeveloperMode()
+        string sideText = swingType == SWING_HIGH ? "High" : "Low"
+        string eventText = eventType == EVENT_ACCEPTED ? "Accepted" : eventType == EVENT_REPLACED ? "Replaced" : "Rejected"
+        string labelText = eventText + " " + sideText + " #" + str.tostring(swingId)
+        color labelColor = eventType == EVENT_ACCEPTED ? acceptedColor : eventType == EVENT_REPLACED ? replacedColor : rejectedColor
+        labelStyle = swingType == SWING_HIGH ? label.style_label_down : label.style_label_up
+
+        label.new(swingBar, swingPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = labelStyle, color = labelColor, textcolor = color.white, size = size.tiny)
+
+drawConfirmedSwingLabel(int swingType, int swingId, float swingPrice, int swingBar) =>
+    if showConfirmedSwings and (isDeveloperMode() or isTestMode())
+        string swingText = swingType == SWING_HIGH ? "H" : "L"
+        string labelText = isDeveloperMode() ? swingText + " #" + str.tostring(swingId) : swingText
+        labelStyle = swingType == SWING_HIGH ? label.style_label_down : label.style_label_up
+
+        label.new(swingBar, swingPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = labelStyle, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+
+int confirmedCount = array.size(currentConfirmedSwingIds)
+
+if confirmedCount > 0
+    for index = 0 to confirmedCount - 1
+        int confirmedType = array.get(currentConfirmedSwingTypes, index)
+        int confirmedId = array.get(currentConfirmedSwingIds, index)
+        float confirmedPrice = array.get(currentConfirmedSwingPrices, index)
+        int confirmedBar = array.get(currentConfirmedSwingBars, index)
+
+        drawConfirmedSwingLabel(confirmedType, confirmedId, confirmedPrice, confirmedBar)
+
+int eventCount = array.size(currentEventTypes)
+
+if eventCount > 0
+    for index = 0 to eventCount - 1
+        int eventType = array.get(currentEventTypes, index)
+        int eventSwingType = array.get(currentEventSwingTypes, index)
+        int eventSwingId = array.get(currentEventSwingIds, index)
+        float eventPrice = array.get(currentEventPrices, index)
+        int eventBar = array.get(currentEventBars, index)
+
+        drawDeveloperDebugLabel(eventType, eventSwingType, eventSwingId, eventPrice, eventBar)
+
+plotshape(hasCandidateHigh and isDeveloperMode(), title = "Candidate High", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 75), size = size.tiny, offset = -pivotRightBars)
+
+plotshape(hasCandidateLow and isDeveloperMode(), title = "Candidate Low", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 75), size = size.tiny, offset = -pivotRightBars)
