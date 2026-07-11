@@ -1,0 +1,919 @@
+//@version=6
+indicator("Gold ICT Pro - Replacement Engine v1", overlay = true, max_labels_count = 500, max_lines_count = 100)
+
+//====================================================================
+// CONFIGURATION
+//====================================================================
+
+// Swing Types
+const int SWING_NONE = 0
+const int SWING_HIGH = 1
+const int SWING_LOW = -1
+
+// Swing Status
+const int STATUS_PENDING = 0
+const int STATUS_CONFIRMED = 1
+const int STATUS_REPLACED = 2
+const int STATUS_REJECTED = 3
+
+// Engine Events
+const int EVENT_ACCEPTED = 1
+const int EVENT_REPLACED = 2
+const int EVENT_REJECTED = 3
+
+// Display Modes
+const string DISPLAY_DEVELOPER = "Developer"
+const string DISPLAY_TEST = "Test"
+const string DISPLAY_TRADER = "Trader"
+
+// Reserved Defaults
+const int NO_INDEX = -1
+const int NO_SWING_ID = 0
+const int RESERVED_INT_DEFAULT = 0
+const string RESERVED_STRING_DEFAULT = ""
+
+// Structure Labels (Reserved - Sprint 2.1.5)
+// Populated by a future Market Structure sprint. Not used yet.
+const int STRUCTURE_NONE = 0
+const int STRUCTURE_HH = 1
+const int STRUCTURE_HL = 2
+const int STRUCTURE_LH = 3
+const int STRUCTURE_LL = 4
+
+// Break Types (Reserved - Sprint 2.1.5)
+// Populated by a future BOS/CHoCH sprint. Not used yet.
+const int BREAK_NONE = 0
+const int BREAK_BOS = 1
+const int BREAK_CHOCH = 2
+
+// Importance Tiers (Reserved - Sprint 2.1.5)
+// Populated by a future Swing Importance sprint. Not used yet.
+const int IMPORTANCE_MINOR = 0
+const int IMPORTANCE_INTERMEDIATE = 1
+const int IMPORTANCE_MAJOR = 2
+
+// Minimum Leg Threshold Modes (Sprint 2.2 - approved revision)
+// Fixed: existing fixed Minimum Leg Points logic (default, preserves
+//        prior stable behaviour exactly).
+// Adaptive ATR: ATR Length x ATR Multiplier, with deterministic
+//        fallback to Fixed during ATR warm-up (see Clarification 2).
+// Manual Override: development/replay-testing mode only, NOT a
+//        production trading mode (see Clarification 1). Uses
+//        manualLegPoints exclusively, ignoring Fixed and Adaptive ATR.
+const string THRESHOLD_MODE_FIXED = "Fixed"
+const string THRESHOLD_MODE_ADAPTIVE_ATR = "Adaptive ATR"
+const string THRESHOLD_MODE_MANUAL_OVERRIDE = "Manual Override"
+
+//====================================================================
+// INPUTS
+//====================================================================
+
+pivotLeftBars = input.int(3, "Candidate Left Bars", minval = 1)
+pivotRightBars = input.int(3, "Candidate Right Bars", minval = 1)
+
+minimumLegPoints = input.float(0.0, "Minimum Leg Points", minval = 0.0, step = 0.1)
+
+// Minimum Leg Threshold - Sprint 2.2 (approved revision)
+// Manual Override is a development/replay-testing mode only, NOT a
+// production trading mode. Default remains Fixed to preserve prior
+// stable behaviour exactly (regression requirement).
+thresholdMode = input.string(THRESHOLD_MODE_FIXED, "Minimum Leg Threshold Mode", options = [THRESHOLD_MODE_FIXED, THRESHOLD_MODE_ADAPTIVE_ATR, THRESHOLD_MODE_MANUAL_OVERRIDE])
+atrLength = input.int(14, "ATR Length", minval = 1)
+atrMultiplier = input.float(1.0, "ATR Multiplier", minval = 0.0, step = 0.1)
+manualLegPoints = input.float(0.0, "Manual Leg Points (Override Mode Only)", minval = 0.0, step = 0.1)
+
+displayMode = input.string(DISPLAY_DEVELOPER, "Display Mode", options = [DISPLAY_DEVELOPER, DISPLAY_TEST, DISPLAY_TRADER])
+
+showDebugLabels = input.bool(true, "Debug Mode")
+showConfirmedSwings = input.bool(true, "Show Confirmed Swings")
+
+acceptedColor = input.color(color.new(color.lime, 0), "Accepted Swing Color")
+replacedColor = input.color(color.new(color.orange, 0), "Replaced Swing Color")
+rejectedColor = input.color(color.new(color.red, 0), "Rejected Swing Color")
+
+//====================================================================
+// CANDIDATE ENGINE
+// Candidate detection is unchanged.
+//====================================================================
+
+candidateHighPrice = ta.pivothigh(high, pivotLeftBars, pivotRightBars)
+candidateLowPrice = ta.pivotlow(low, pivotLeftBars, pivotRightBars)
+
+hasCandidateHigh = not na(candidateHighPrice)
+hasCandidateLow = not na(candidateLowPrice)
+
+candidateHighBar = bar_index - pivotRightBars
+candidateLowBar = bar_index - pivotRightBars
+
+//====================================================================
+// ATR ADAPTIVE FILTER (Sprint 2.2)
+// Computes the adaptive leg distance used by the Minimum Leg Filter
+// when Use Adaptive ATR Filter is enabled. When disabled, the existing
+// fixed Minimum Leg Points value is used exactly as before (see
+// passesMinimumLegFilter in the Minimum Leg Filter section).
+// Computed unconditionally at top-level scope every bar - required for
+// ta.atr() history-buffer correctness and to preserve non-repainting,
+// replay-consistent behaviour identical to the rest of the engine.
+//====================================================================
+
+currentATRValue = ta.atr(atrLength)
+adaptiveLegDistance = currentATRValue * atrMultiplier
+
+//====================================================================
+// SWING DATABASE
+//====================================================================
+
+var int nextSwingId = 1
+
+var array<int> swingIds = array.new_int()
+var array<int> swingTypes = array.new_int()
+var array<float> swingPrices = array.new_float()
+var array<int> swingBars = array.new_int()
+var array<int> swingStatuses = array.new_int()
+
+var array<float> swingATR = array.new_float()
+var array<float> swingLegLength = array.new_float()
+var array<float> swingStrength = array.new_float()
+var array<float> swingScore = array.new_float()
+var array<float> swingLiquidity = array.new_float()
+var array<string> swingSession = array.new_string()
+var array<int> swingTrend = array.new_int()
+
+// Reserved fields (Sprint 2.1.5) - Future-Proofing Database Expansion
+// These fields are structurally prepared for upcoming roadmap features.
+// They are populated with default/reserved values ONLY. No trading logic
+// reads or writes meaningful values into these fields in this sprint.
+var array<int> swingStructureLabel = array.new_int()   // HH / HL / LH / LL classification (future Market Structure sprint)
+var array<int> swingBrokenBar = array.new_int()        // Bar index where this swing's level was broken (future BOS/CHoCH sprint)
+var array<int> swingBreakType = array.new_int()        // NONE / BOS / CHoCH (future BOS/CHoCH sprint)
+var array<bool> swingSweptStatus = array.new_bool()    // Whether a liquidity sweep has occurred (future Liquidity Sweep sprint)
+var array<int> swingSweptBar = array.new_int()         // Bar index of the liquidity sweep (future Liquidity Sweep sprint)
+var array<int> swingImportance = array.new_int()       // Minor / Intermediate / Major (future Swing Importance sprint)
+
+databaseSize() =>
+    array.size(swingIds)
+
+swingIndexFromId(int swingId) =>
+    int resultIndex = NO_INDEX
+    int size = array.size(swingIds)
+
+    if swingId > 0 and size > 0
+        for index = 0 to size - 1
+            int storedSwingId = array.get(swingIds, index)
+
+            if resultIndex == NO_INDEX and storedSwingId == swingId
+                resultIndex := index
+
+    resultIndex
+
+isValidSwingType(int swingType) =>
+    swingType == SWING_HIGH or swingType == SWING_LOW
+
+isValidSwingStatus(int statusValue) =>
+    statusValue == STATUS_PENDING or statusValue == STATUS_CONFIRMED or statusValue == STATUS_REPLACED or statusValue == STATUS_REJECTED
+
+// Reserved field validators (Sprint 2.1.5) - mirror the existing
+// isValidSwingType / isValidSwingStatus pattern. These only validate
+// that stored values are within the defined enum range; they do not
+// introduce any new trading logic.
+isValidStructureLabel(int structureLabel) =>
+    structureLabel == STRUCTURE_NONE or structureLabel == STRUCTURE_HH or structureLabel == STRUCTURE_HL or structureLabel == STRUCTURE_LH or structureLabel == STRUCTURE_LL
+
+isValidBreakType(int breakType) =>
+    breakType == BREAK_NONE or breakType == BREAK_BOS or breakType == BREAK_CHOCH
+
+isValidImportance(int importanceValue) =>
+    importanceValue == IMPORTANCE_MINOR or importanceValue == IMPORTANCE_INTERMEDIATE or importanceValue == IMPORTANCE_MAJOR
+
+debugAssert(bool condition, string message) =>
+    if showDebugLabels and not condition
+        runtime.error(message)
+
+databaseHasDuplicateIds() =>
+    bool hasDuplicate = false
+    int size = array.size(swingIds)
+
+    if size > 1
+        for leftIndex = 0 to size - 2
+            int leftId = array.get(swingIds, leftIndex)
+
+            for rightIndex = leftIndex + 1 to size - 1
+                int rightId = array.get(swingIds, rightIndex)
+
+                if leftId == rightId
+                    hasDuplicate := true
+
+    hasDuplicate
+
+databaseIsValid() =>
+    int size = array.size(swingIds)
+    int typesSize = array.size(swingTypes)
+    int pricesSize = array.size(swingPrices)
+    int barsSize = array.size(swingBars)
+    int statusesSize = array.size(swingStatuses)
+    int atrSize = array.size(swingATR)
+    int legLengthSize = array.size(swingLegLength)
+    int strengthSize = array.size(swingStrength)
+    int scoreSize = array.size(swingScore)
+    int liquiditySize = array.size(swingLiquidity)
+    int sessionSize = array.size(swingSession)
+    int trendSize = array.size(swingTrend)
+
+    // Reserved field sizes (Sprint 2.1.5)
+    int structureLabelSize = array.size(swingStructureLabel)
+    int brokenBarSize = array.size(swingBrokenBar)
+    int breakTypeSize = array.size(swingBreakType)
+    int sweptStatusSize = array.size(swingSweptStatus)
+    int sweptBarSize = array.size(swingSweptBar)
+    int importanceSize = array.size(swingImportance)
+
+    bool valid = true
+    bool sizesMatch = typesSize == size and pricesSize == size and barsSize == size and statusesSize == size and atrSize == size and legLengthSize == size and strengthSize == size and scoreSize == size and liquiditySize == size and sessionSize == size and trendSize == size and structureLabelSize == size and brokenBarSize == size and breakTypeSize == size and sweptStatusSize == size and sweptBarSize == size and importanceSize == size
+
+    if not sizesMatch
+        valid := false
+
+    if databaseHasDuplicateIds()
+        valid := false
+
+    int previousConfirmedType = SWING_NONE
+
+    if size > 0
+        for index = 0 to size - 1
+            int storedSwingId = array.get(swingIds, index)
+            int storedSwingType = array.get(swingTypes, index)
+            int storedStatus = array.get(swingStatuses, index)
+
+            if storedSwingId <= 0
+                valid := false
+
+            if not isValidSwingType(storedSwingType)
+                valid := false
+
+            if not isValidSwingStatus(storedStatus)
+                valid := false
+
+            // Reserved field range validation (Sprint 2.1.5)
+            int storedStructureLabel = array.get(swingStructureLabel, index)
+            int storedBreakType = array.get(swingBreakType, index)
+            int storedImportance = array.get(swingImportance, index)
+
+            if not isValidStructureLabel(storedStructureLabel)
+                valid := false
+
+            if not isValidBreakType(storedBreakType)
+                valid := false
+
+            if not isValidImportance(storedImportance)
+                valid := false
+
+            if storedStatus == STATUS_CONFIRMED
+                if previousConfirmedType == storedSwingType
+                    valid := false
+
+                previousConfirmedType := storedSwingType
+
+    valid
+
+validateDatabaseInDebug(string message) =>
+    if showDebugLabels
+        debugAssert(databaseIsValid(), message)
+
+databaseLastSwing() =>
+    int size = array.size(swingIds)
+    bool exists = size > 0
+
+    int storedSwingId = NO_SWING_ID
+    int storedSwingType = SWING_NONE
+    float storedSwingPrice = na
+    int storedSwingBar = NO_INDEX
+    int storedStatus = STATUS_REJECTED
+
+    if exists
+        int lastIndex = size - 1
+        storedSwingId := array.get(swingIds, lastIndex)
+        storedSwingType := array.get(swingTypes, lastIndex)
+        storedSwingPrice := array.get(swingPrices, lastIndex)
+        storedSwingBar := array.get(swingBars, lastIndex)
+        storedStatus := array.get(swingStatuses, lastIndex)
+
+    [storedSwingId, storedSwingType, storedSwingPrice, storedSwingBar, storedStatus, exists]
+
+databaseLastConfirmedSwing() =>
+    int confirmedSwingId = NO_SWING_ID
+    int confirmedSwingType = SWING_NONE
+    float confirmedSwingPrice = na
+    int confirmedSwingBar = NO_INDEX
+    bool exists = false
+
+    int size = array.size(swingIds)
+
+    if size > 0
+        for offset = 0 to size - 1
+            int index = size - 1 - offset
+            int storedStatus = array.get(swingStatuses, index)
+
+            if not exists and storedStatus == STATUS_CONFIRMED
+                confirmedSwingId := array.get(swingIds, index)
+                confirmedSwingType := array.get(swingTypes, index)
+                confirmedSwingPrice := array.get(swingPrices, index)
+                confirmedSwingBar := array.get(swingBars, index)
+                exists := true
+
+    [confirmedSwingId, confirmedSwingType, confirmedSwingPrice, confirmedSwingBar, exists]
+
+pushReservedSwingFields() =>
+    array.push(swingATR, na)
+    array.push(swingLegLength, na)
+    array.push(swingStrength, na)
+    array.push(swingScore, na)
+    array.push(swingLiquidity, na)
+    array.push(swingSession, RESERVED_STRING_DEFAULT)
+    array.push(swingTrend, RESERVED_INT_DEFAULT)
+
+    // Reserved field defaults (Sprint 2.1.5)
+    // These are structural placeholders only - no trading logic populates
+    // them yet. Defaults are chosen to be unambiguous "not yet evaluated"
+    // sentinels, consistent with NO_INDEX / RESERVED_INT_DEFAULT usage
+    // elsewhere in the database.
+    array.push(swingStructureLabel, STRUCTURE_NONE)
+    array.push(swingBrokenBar, NO_INDEX)
+    array.push(swingBreakType, BREAK_NONE)
+    array.push(swingSweptStatus, false)
+    array.push(swingSweptBar, NO_INDEX)
+    array.push(swingImportance, IMPORTANCE_MINOR)
+
+createSwing(int swingId, int swingType, float swingPrice, int swingBar) =>
+    debugAssert(swingId > 0, "Swing ID must be positive.")
+    debugAssert(isValidSwingType(swingType), "Invalid swing type.")
+
+    array.push(swingIds, swingId)
+    array.push(swingTypes, swingType)
+    array.push(swingPrices, swingPrice)
+    array.push(swingBars, swingBar)
+    array.push(swingStatuses, STATUS_PENDING)
+    pushReservedSwingFields()
+
+    swingId
+
+//--------------------------------------------------------------------
+// RESERVED FIELD ACCESSORS (Sprint 2.1.6)
+// Getter/setter API for the reserved fields introduced in Sprint 2.1.5.
+// These exist so future sprints never call array.get()/array.set()
+// directly on these columns. NOT USED anywhere yet - no engine logic,
+// visualization, or other function calls these. Pure dormant API.
+//--------------------------------------------------------------------
+
+setSwingStructureLabel(int swingId, int structureLabel) =>
+    debugAssert(isValidStructureLabel(structureLabel), "Invalid structure label.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStructureLabel, swingIndex, structureLabel)
+
+    exists
+
+getSwingStructureLabel(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedStructureLabel = STRUCTURE_NONE
+
+    if exists
+        storedStructureLabel := array.get(swingStructureLabel, swingIndex)
+
+    [storedStructureLabel, exists]
+
+setSwingBrokenBar(int swingId, int brokenBar) =>
+    debugAssert(brokenBar >= 0 or brokenBar == NO_INDEX, "Broken bar must be a valid bar index or NO_INDEX.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingBrokenBar, swingIndex, brokenBar)
+
+    exists
+
+getSwingBrokenBar(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedBrokenBar = NO_INDEX
+
+    if exists
+        storedBrokenBar := array.get(swingBrokenBar, swingIndex)
+
+    [storedBrokenBar, exists]
+
+setSwingBreakType(int swingId, int breakType) =>
+    debugAssert(isValidBreakType(breakType), "Invalid break type.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingBreakType, swingIndex, breakType)
+
+    exists
+
+getSwingBreakType(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedBreakType = BREAK_NONE
+
+    if exists
+        storedBreakType := array.get(swingBreakType, swingIndex)
+
+    [storedBreakType, exists]
+
+setSwingSweptStatus(int swingId, bool sweptStatus) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingSweptStatus, swingIndex, sweptStatus)
+
+    exists
+
+getSwingSweptStatus(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    bool storedSweptStatus = false
+
+    if exists
+        storedSweptStatus := array.get(swingSweptStatus, swingIndex)
+
+    [storedSweptStatus, exists]
+
+setSwingSweptBar(int swingId, int sweptBar) =>
+    debugAssert(sweptBar >= 0 or sweptBar == NO_INDEX, "Swept bar must be a valid bar index or NO_INDEX.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingSweptBar, swingIndex, sweptBar)
+
+    exists
+
+getSwingSweptBar(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedSweptBar = NO_INDEX
+
+    if exists
+        storedSweptBar := array.get(swingSweptBar, swingIndex)
+
+    [storedSweptBar, exists]
+
+setSwingImportance(int swingId, int importanceValue) =>
+    debugAssert(isValidImportance(importanceValue), "Invalid importance value.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingImportance, swingIndex, importanceValue)
+
+    exists
+
+getSwingImportance(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedImportance = IMPORTANCE_MINOR
+
+    if exists
+        storedImportance := array.get(swingImportance, swingIndex)
+
+    [storedImportance, exists]
+
+updateSwingStatus(int swingId, int newStatus) =>
+    debugAssert(isValidSwingStatus(newStatus), "Invalid swing status.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStatuses, swingIndex, newStatus)
+
+    exists
+
+getSwing(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedSwingType = SWING_NONE
+    float storedSwingPrice = na
+    int storedSwingBar = NO_INDEX
+    int storedStatus = STATUS_REJECTED
+
+    if exists
+        storedSwingType := array.get(swingTypes, swingIndex)
+        storedSwingPrice := array.get(swingPrices, swingIndex)
+        storedSwingBar := array.get(swingBars, swingIndex)
+        storedStatus := array.get(swingStatuses, swingIndex)
+
+    [storedSwingType, storedSwingPrice, storedSwingBar, storedStatus, exists]
+
+//====================================================================
+// ENGINE API
+//====================================================================
+
+startPendingSwing(int swingId, int swingType, float swingPrice, int swingBar) =>
+    createSwing(swingId, swingType, swingPrice, swingBar)
+
+// finalizeConfirmedSwing() - Sprint 2.2 (architectural refinement)
+// Dedicated confirmation-time metadata finalization function.
+// confirmPendingSwing() is responsible ONLY for the state transition
+// (PENDING -> CONFIRMED). This function is responsible ONLY for
+// populating metadata that becomes meaningful/permanent at the moment
+// a swing is confirmed. This separation keeps confirmPendingSwing()
+// stable as a pure state-transition function - every future sprint that
+// needs to populate confirmation-time metadata (Swing Strength,
+// Structure Label, Importance, Session, etc.) extends THIS function
+// only, never confirmPendingSwing() itself.
+//
+// Currently populates:
+//   - swingATR (ATR reading captured at the moment of confirmation,
+//     since pending swings may still be replaced and would not
+//     necessarily reflect the swing's final, permanent price/bar)
+//
+// Reserved for future sprints (not implemented yet):
+//   - Swing Strength
+//   - Structure Label (HH/HL/LH/LL)
+//   - Importance
+//   - Session
+finalizeConfirmedSwing(int swingId) =>
+    int confirmedSwingIndex = swingIndexFromId(swingId)
+
+    if confirmedSwingIndex != NO_INDEX
+        array.set(swingATR, confirmedSwingIndex, currentATRValue)
+
+confirmPendingSwing(int swingId) =>
+    bool updated = updateSwingStatus(swingId, STATUS_CONFIRMED)
+
+    if updated
+        finalizeConfirmedSwing(swingId)
+
+    validateDatabaseInDebug("Database integrity failed after confirmation.")
+    updated
+
+replacePendingSwing(int swingId, float replacementPrice, int replacementBar) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingPrices, swingIndex, replacementPrice)
+        array.set(swingBars, swingIndex, replacementBar)
+        array.set(swingStatuses, swingIndex, STATUS_PENDING)
+
+    validateDatabaseInDebug("Database integrity failed after replacement.")
+    exists
+
+rejectPendingSwing(int swingId) =>
+    bool exists = swingIndexFromId(swingId) != NO_INDEX
+    debugAssert(exists, "Rejected swing references a missing active swing.")
+    exists
+
+archivePendingSwing(int swingId) =>
+    bool updated = updateSwingStatus(swingId, STATUS_REJECTED)
+    validateDatabaseInDebug("Database integrity failed after archive.")
+    updated
+
+getActiveSwing(int swingId) =>
+    getSwing(swingId)
+
+getLastConfirmedSwing() =>
+    databaseLastConfirmedSwing()
+
+//====================================================================
+// MINIMUM LEG FILTER
+// Evaluates the transition swing against the last confirmed swing.
+// Same-side replacement candidates are never blocked by this filter.
+//====================================================================
+
+legDistance(float transitionSwingPrice, float confirmedSwingPrice) =>
+    math.abs(transitionSwingPrice - confirmedSwingPrice)
+
+// resolveMinimumLegThreshold() - Sprint 2.2 (approved revision)
+// Dedicated threshold resolver. This function alone decides which
+// strategy produces the active threshold; passesMinimumLegFilter() below
+// has no knowledge of how the threshold is produced - its only
+// responsibility remains Distance >= Threshold.
+//
+// Modes:
+//   Fixed           -> minimumLegPoints (unchanged prior behaviour)
+//   Adaptive ATR     -> adaptiveLegDistance, EXCEPT during ATR warm-up
+//                       (currentATRValue is na), where it deterministically
+//                       falls back to minimumLegPoints (Clarification 2).
+//                       This guarantees the indicator never crashes,
+//                       produces undefined behaviour, or silently passes
+//                       all swings because ATR is unavailable.
+//   Manual Override  -> manualLegPoints only. Development/replay-testing
+//                       mode only - NOT a production trading mode
+//                       (Clarification 1). Fixed and Adaptive ATR are
+//                       both ignored while this mode is selected.
+resolveMinimumLegThreshold() =>
+    float resolvedThreshold = minimumLegPoints
+
+    if thresholdMode == THRESHOLD_MODE_MANUAL_OVERRIDE
+        resolvedThreshold := manualLegPoints
+    else if thresholdMode == THRESHOLD_MODE_ADAPTIVE_ATR
+        resolvedThreshold := na(currentATRValue) ? minimumLegPoints : adaptiveLegDistance
+
+    resolvedThreshold
+
+passesMinimumLegFilter(float transitionSwingPrice) =>
+    [_, _, lastConfirmedPrice, _, hasConfirmedSwing] = getLastConfirmedSwing()
+    bool passesFilter = true
+
+    if hasConfirmedSwing
+        float distanceFromLastConfirmed = legDistance(transitionSwingPrice, lastConfirmedPrice)
+        float activeMinimumLegThreshold = resolveMinimumLegThreshold()
+        passesFilter := distanceFromLastConfirmed >= activeMinimumLegThreshold
+
+    passesFilter
+
+//====================================================================
+// REPLACEMENT ENGINE
+//====================================================================
+
+var int activePendingSwingType = SWING_NONE
+var int activePendingSwingId = NO_SWING_ID
+var int activePendingHighSwingId = NO_SWING_ID
+var int activePendingLowSwingId = NO_SWING_ID
+var int activeTransitionSwingId = NO_SWING_ID
+
+var array<int> currentEventTypes = array.new_int()
+var array<int> currentEventSwingTypes = array.new_int()
+var array<int> currentEventSwingIds = array.new_int()
+var array<float> currentEventPrices = array.new_float()
+var array<int> currentEventBars = array.new_int()
+
+var array<int> currentConfirmedSwingTypes = array.new_int()
+var array<int> currentConfirmedSwingIds = array.new_int()
+var array<float> currentConfirmedSwingPrices = array.new_float()
+var array<int> currentConfirmedSwingBars = array.new_int()
+
+resetCurrentBarEvents() =>
+    array.clear(currentEventTypes)
+    array.clear(currentEventSwingTypes)
+    array.clear(currentEventSwingIds)
+    array.clear(currentEventPrices)
+    array.clear(currentEventBars)
+    array.clear(currentConfirmedSwingTypes)
+    array.clear(currentConfirmedSwingIds)
+    array.clear(currentConfirmedSwingPrices)
+    array.clear(currentConfirmedSwingBars)
+
+recordCandidateEvent(int eventType, int swingType, int swingId, float swingPrice, int swingBar) =>
+    array.push(currentEventTypes, eventType)
+    array.push(currentEventSwingTypes, swingType)
+    array.push(currentEventSwingIds, swingId)
+    array.push(currentEventPrices, swingPrice)
+    array.push(currentEventBars, swingBar)
+
+recordConfirmedSwingEvent(int swingType, int swingId, float swingPrice, int swingBar) =>
+    array.push(currentConfirmedSwingTypes, swingType)
+    array.push(currentConfirmedSwingIds, swingId)
+    array.push(currentConfirmedSwingPrices, swingPrice)
+    array.push(currentConfirmedSwingBars, swingBar)
+
+isBetterReplacement(int swingType, float candidatePrice, float activePrice) =>
+    swingType == SWING_HIGH ? candidatePrice > activePrice : candidatePrice < activePrice
+
+activateNewPendingSwing(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    int newSwingId = startPendingSwing(swingId, candidateType, candidatePrice, candidateBar)
+    int updatedHighSwingId = candidateType == SWING_HIGH ? newSwingId : activePendingHighSwingId
+    int updatedLowSwingId = candidateType == SWING_LOW ? newSwingId : activePendingLowSwingId
+
+    recordCandidateEvent(EVENT_ACCEPTED, candidateType, newSwingId, candidatePrice, candidateBar)
+
+    [candidateType, newSwingId, updatedHighSwingId, updatedLowSwingId]
+
+processSameSideCandidate(int candidateType, float candidatePrice, int candidateBar) =>
+    [_, storedPrice, _, _, exists] = getActiveSwing(activePendingSwingId)
+    [transitionType, transitionPrice, transitionBar, _, transitionExists] = getSwing(activeTransitionSwingId)
+
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    int updatedTransitionId = activeTransitionSwingId
+    bool createdSwingRecord = false
+
+    bool shouldReplace = exists and isBetterReplacement(candidateType, candidatePrice, storedPrice)
+    int eventType = shouldReplace ? EVENT_REPLACED : EVENT_REJECTED
+
+    if shouldReplace
+        replacePendingSwing(activePendingSwingId, candidatePrice, candidateBar)
+
+        if transitionExists and transitionBar <= candidateBar
+            archivePendingSwing(activeTransitionSwingId)
+            updatedTransitionId := NO_SWING_ID
+        else if transitionExists and passesMinimumLegFilter(transitionPrice)
+            bool confirmed = confirmPendingSwing(activePendingSwingId)
+
+            if confirmed
+                recordConfirmedSwingEvent(candidateType, activePendingSwingId, candidatePrice, candidateBar)
+
+            updatedActiveType := transitionType
+            updatedActiveId := activeTransitionSwingId
+            updatedHighId := transitionType == SWING_HIGH ? activeTransitionSwingId : activePendingHighSwingId
+            updatedLowId := transitionType == SWING_LOW ? activeTransitionSwingId : activePendingLowSwingId
+            updatedTransitionId := NO_SWING_ID
+    else
+        rejectPendingSwing(activePendingSwingId)
+
+    recordCandidateEvent(eventType, candidateType, activePendingSwingId, candidatePrice, candidateBar)
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, updatedTransitionId, createdSwingRecord]
+
+processOppositeCandidate(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    [storedType, storedPrice, storedBar, _, exists] = getActiveSwing(activePendingSwingId)
+    [transitionType, transitionPrice, transitionBar, _, transitionExists] = getSwing(activeTransitionSwingId)
+
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    int updatedTransitionId = activeTransitionSwingId
+    bool createdSwingRecord = false
+
+    int eventType = EVENT_ACCEPTED
+    int eventSwingId = swingId
+
+    bool transitionMatchesCandidate = transitionExists and transitionType == candidateType
+
+    if not transitionMatchesCandidate
+        if transitionExists
+            archivePendingSwing(activeTransitionSwingId)
+
+        int newTransitionId = startPendingSwing(swingId, candidateType, candidatePrice, candidateBar)
+
+        updatedTransitionId := newTransitionId
+        transitionType := candidateType
+        transitionPrice := candidatePrice
+        transitionBar := candidateBar
+        transitionExists := true
+
+        eventType := EVENT_ACCEPTED
+        eventSwingId := newTransitionId
+        createdSwingRecord := true
+    else
+        eventSwingId := activeTransitionSwingId
+
+        if isBetterReplacement(candidateType, candidatePrice, transitionPrice)
+            replacePendingSwing(activeTransitionSwingId, candidatePrice, candidateBar)
+
+            transitionPrice := candidatePrice
+            transitionBar := candidateBar
+            eventType := EVENT_REPLACED
+        else
+            eventType := EVENT_REJECTED
+
+    recordCandidateEvent(eventType, candidateType, eventSwingId, candidatePrice, candidateBar)
+
+    bool canConfirmPendingSwing = exists and transitionExists and passesMinimumLegFilter(transitionPrice)
+
+    if canConfirmPendingSwing
+        bool confirmed = confirmPendingSwing(activePendingSwingId)
+
+        if confirmed
+            recordConfirmedSwingEvent(storedType, activePendingSwingId, storedPrice, storedBar)
+
+        updatedActiveType := transitionType
+        updatedActiveId := updatedTransitionId
+        updatedHighId := transitionType == SWING_HIGH ? updatedTransitionId : activePendingHighSwingId
+        updatedLowId := transitionType == SWING_LOW ? updatedTransitionId : activePendingLowSwingId
+        updatedTransitionId := NO_SWING_ID
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, updatedTransitionId, createdSwingRecord]
+
+processCandidate(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    int updatedTransitionId = activeTransitionSwingId
+    bool createdSwingRecord = false
+
+    if activePendingSwingType == SWING_NONE
+        [firstType, firstId, firstHighId, firstLowId] = activateNewPendingSwing(candidateType, candidatePrice, candidateBar, swingId)
+
+        updatedActiveType := firstType
+        updatedActiveId := firstId
+        updatedHighId := firstHighId
+        updatedLowId := firstLowId
+        updatedTransitionId := NO_SWING_ID
+        createdSwingRecord := true
+
+    else if activePendingSwingType == candidateType
+        [sameType, sameId, sameHighId, sameLowId, sameTransitionId, sameCreated] = processSameSideCandidate(candidateType, candidatePrice, candidateBar)
+
+        updatedActiveType := sameType
+        updatedActiveId := sameId
+        updatedHighId := sameHighId
+        updatedLowId := sameLowId
+        updatedTransitionId := sameTransitionId
+        createdSwingRecord := sameCreated
+
+    else
+        [oppositeType, oppositeId, oppositeHighId, oppositeLowId, oppositeTransitionId, oppositeCreated] = processOppositeCandidate(candidateType, candidatePrice, candidateBar, swingId)
+
+        updatedActiveType := oppositeType
+        updatedActiveId := oppositeId
+        updatedHighId := oppositeHighId
+        updatedLowId := oppositeLowId
+        updatedTransitionId := oppositeTransitionId
+        createdSwingRecord := oppositeCreated
+
+    validateDatabaseInDebug("Database integrity failed after candidate processing.")
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, updatedTransitionId, createdSwingRecord]
+
+resetCurrentBarEvents()
+
+if hasCandidateHigh
+    [updatedTypeHigh, updatedIdHigh, updatedHighSwingIdHigh, updatedLowSwingIdHigh, updatedTransitionIdHigh, createdHighSwing] = processCandidate(SWING_HIGH, candidateHighPrice, candidateHighBar, nextSwingId)
+
+    activePendingSwingType := updatedTypeHigh
+    activePendingSwingId := updatedIdHigh
+    activePendingHighSwingId := updatedHighSwingIdHigh
+    activePendingLowSwingId := updatedLowSwingIdHigh
+    activeTransitionSwingId := updatedTransitionIdHigh
+
+    if createdHighSwing
+        nextSwingId += 1
+
+if hasCandidateLow
+    [updatedTypeLow, updatedIdLow, updatedHighSwingIdLow, updatedLowSwingIdLow, updatedTransitionIdLow, createdLowSwing] = processCandidate(SWING_LOW, candidateLowPrice, candidateLowBar, nextSwingId)
+
+    activePendingSwingType := updatedTypeLow
+    activePendingSwingId := updatedIdLow
+    activePendingHighSwingId := updatedHighSwingIdLow
+    activePendingLowSwingId := updatedLowSwingIdLow
+    activeTransitionSwingId := updatedTransitionIdLow
+
+    if createdLowSwing
+        nextSwingId += 1
+
+//====================================================================
+// VISUALIZATION
+//====================================================================
+
+isDeveloperMode() =>
+    displayMode == DISPLAY_DEVELOPER
+
+isTestMode() =>
+    displayMode == DISPLAY_TEST
+
+drawDeveloperDebugLabel(int eventType, int swingType, int swingId, float swingPrice, int swingBar) =>
+    if showDebugLabels and isDeveloperMode()
+        string sideText = swingType == SWING_HIGH ? "High" : "Low"
+        string eventText = eventType == EVENT_ACCEPTED ? "Accepted" : eventType == EVENT_REPLACED ? "Replaced" : "Rejected"
+        string labelText = eventText + " " + sideText + " #" + str.tostring(swingId)
+        color labelColor = eventType == EVENT_ACCEPTED ? acceptedColor : eventType == EVENT_REPLACED ? replacedColor : rejectedColor
+
+        label.new(swingBar, swingPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = swingType == SWING_HIGH ? label.style_label_down : label.style_label_up, color = labelColor, textcolor = color.white, size = size.tiny)
+
+drawConfirmedSwingLabel(int swingType, int swingId, float swingPrice, int swingBar) =>
+    if showConfirmedSwings and (isDeveloperMode() or isTestMode())
+        string swingText = swingType == SWING_HIGH ? "H" : "L"
+        string labelText = isDeveloperMode() ? swingText + " #" + str.tostring(swingId) : swingText
+
+        label.new(swingBar, swingPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = swingType == SWING_HIGH ? label.style_label_down : label.style_label_up, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+
+int confirmedCount = array.size(currentConfirmedSwingIds)
+
+if confirmedCount > 0
+    for index = 0 to confirmedCount - 1
+        int confirmedType = array.get(currentConfirmedSwingTypes, index)
+        int confirmedId = array.get(currentConfirmedSwingIds, index)
+        float confirmedPrice = array.get(currentConfirmedSwingPrices, index)
+        int confirmedBar = array.get(currentConfirmedSwingBars, index)
+
+        drawConfirmedSwingLabel(confirmedType, confirmedId, confirmedPrice, confirmedBar)
+
+int eventCount = array.size(currentEventTypes)
+
+if eventCount > 0
+    for index = 0 to eventCount - 1
+        int eventType = array.get(currentEventTypes, index)
+        int eventSwingType = array.get(currentEventSwingTypes, index)
+        int eventSwingId = array.get(currentEventSwingIds, index)
+        float eventPrice = array.get(currentEventPrices, index)
+        int eventBar = array.get(currentEventBars, index)
+
+        drawDeveloperDebugLabel(eventType, eventSwingType, eventSwingId, eventPrice, eventBar)
+
+plotshape(hasCandidateHigh and isDeveloperMode(), title = "Candidate High", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 75), size = size.tiny, offset = -pivotRightBars)
+
+plotshape(hasCandidateLow and isDeveloperMode(), title = "Candidate Low", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 75), size = size.tiny, offset = -pivotRightBars)
