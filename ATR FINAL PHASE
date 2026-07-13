@@ -1,0 +1,1440 @@
+//@version=6
+indicator("Gold ICT Pro - Replacement Engine v1", overlay = true, max_labels_count = 500, max_lines_count = 100)
+
+//====================================================================
+// CONFIGURATION
+//====================================================================
+
+// Swing Types
+const int SWING_NONE = 0
+const int SWING_HIGH = 1
+const int SWING_LOW = -1
+
+// Swing Status
+const int STATUS_PENDING = 0
+const int STATUS_CONFIRMED = 1
+const int STATUS_REPLACED = 2
+const int STATUS_REJECTED = 3
+
+// Engine Events
+const int EVENT_ACCEPTED = 1
+const int EVENT_REPLACED = 2
+const int EVENT_REJECTED = 3
+
+// Display Modes
+const string DISPLAY_DEVELOPER = "Developer"
+const string DISPLAY_TEST = "Test"
+const string DISPLAY_TRADER = "Trader"
+
+// Minimum Leg Threshold Modes (Sprint 2.2)
+const string THRESHOLD_FIXED = "Fixed"
+const string THRESHOLD_ADAPTIVE_ATR = "Adaptive ATR"
+const string THRESHOLD_MANUAL_OVERRIDE = "Manual Override"
+
+// Reserved Defaults
+const int NO_INDEX = -1
+const int NO_SWING_ID = 0
+const int RESERVED_INT_DEFAULT = 0
+const string RESERVED_STRING_DEFAULT = ""
+
+// Structure Labels (Reserved - Sprint 2.1.5)
+// Populated by a future Market Structure sprint. Not used yet.
+const int STRUCTURE_NONE = 0
+const int STRUCTURE_HH = 1
+const int STRUCTURE_HL = 2
+const int STRUCTURE_LH = 3
+const int STRUCTURE_LL = 4
+
+// Break Types (Reserved - Sprint 2.1.5)
+// Populated by a future BOS/CHoCH sprint. Not used yet.
+const int BREAK_NONE = 0
+const int BREAK_BOS = 1
+const int BREAK_CHOCH = 2
+
+// Importance Tiers (Reserved - Sprint 2.1.5)
+// Populated by a future Swing Importance sprint. Not used yet.
+const int IMPORTANCE_MINOR = 0
+const int IMPORTANCE_INTERMEDIATE = 1
+const int IMPORTANCE_MAJOR = 2
+
+//====================================================================
+// INPUTS
+//====================================================================
+
+pivotLeftBars = input.int(3, "Candidate Left Bars", minval = 1)
+pivotRightBars = input.int(3, "Candidate Right Bars", minval = 1)
+
+minimumLegPoints = input.float(0.0, "Minimum Leg Points (Fixed)", minval = 0.0, step = 0.1)
+
+// Sprint 2.2 - Adaptive Minimum Leg Filter inputs
+thresholdMode = input.string(THRESHOLD_FIXED, "Minimum Leg Threshold Mode", options = [THRESHOLD_FIXED, THRESHOLD_ADAPTIVE_ATR, THRESHOLD_MANUAL_OVERRIDE])
+atrLength = input.int(14, "ATR Length (Adaptive Mode)", minval = 1)
+atrMultiplier = input.float(1.0, "ATR Multiplier (Adaptive Mode)", minval = 0.0, step = 0.1)
+manualLegPoints = input.float(0.0, "Manual Override Leg Points (Dev/Test Only)", minval = 0.0, step = 0.1)
+
+displayMode = input.string(DISPLAY_DEVELOPER, "Display Mode", options = [DISPLAY_DEVELOPER, DISPLAY_TEST, DISPLAY_TRADER])
+
+showDebugLabels = input.bool(true, "Debug Mode")
+showConfirmedSwings = input.bool(true, "Show Confirmed Swings")
+
+acceptedColor = input.color(color.new(color.lime, 0), "Accepted Swing Color")
+replacedColor = input.color(color.new(color.orange, 0), "Replaced Swing Color")
+rejectedColor = input.color(color.new(color.red, 0), "Rejected Swing Color")
+
+//====================================================================
+// SHARED MATH UTILITIES (Sprint 2.3 - Tier 1)
+//
+// Pure, swing-agnostic math primitives. These functions know nothing
+// about swings, the Swing Database, or engine state - they operate
+// only on the values passed to them as parameters. This is what makes
+// them reusable by any future module (BOS, CHoCH, Liquidity, Order
+// Blocks, FVG), not just the Swing Strength system built on top of
+// them in later patches of this sprint.
+//
+// Tier 1 must NEVER:
+//   - access the Swing Database
+//   - access arrays of any kind
+//   - access swing IDs
+//   - access engine state (activePendingSwingType, activeTransitionSwingId, etc.)
+//   - access Candidate Detection
+//   - access Replacement Logic
+//   - access Confirmation Logic
+//   - access Visualization
+//
+// Tier 1 must always remain:
+//   - Pure: output depends only on the values passed in as parameters
+//   - Deterministic: same inputs always produce the same output
+//   - Stateless: no var/global state read or written
+//   - Replay safe: no series/bar-context dependency of any kind
+//   - Reusable by any future module, not just Swing Strength
+//   - Free of runtime errors on zero, na, or otherwise degenerate inputs
+//
+// This section intentionally contains NO Swing Strength logic, NO
+// normalization/saturation curves, and NO calls into the database.
+// That begins in a later patch.
+//====================================================================
+
+// safeDivide - the single shared guard against division-by-zero and
+// na-denominator across every ratio/velocity primitive below.
+//
+// fallbackValue defaults to na, preserving the original behaviour for
+// every existing caller in this file without any call-site changes -
+// "undefined" stays honestly represented as na unless a caller
+// explicitly decides otherwise. That decision deliberately belongs to
+// the caller (Tier 2, or a future module), never to this function -
+// safeDivide itself still makes no modeling assumptions of its own.
+safeDivide(float numerator, float denominator, float fallbackValue = na) =>
+    float result = fallbackValue
+
+    if not na(denominator) and denominator != 0
+        result := numerator / denominator
+
+    result
+
+// deriveDistance - absolute price distance between two levels.
+// No division involved, so no zero-denominator edge case exists here.
+// na inputs propagate na naturally through math.abs(), which is
+// already safe (does not error on na).
+deriveDistance(float priceA, float priceB) =>
+    math.abs(priceA - priceB)
+
+// deriveBarsElapsed - absolute bar separation between two bar indices.
+// Centralizes trivial-but-ubiquitous arithmetic that every future
+// module (Strength, BOS timing, OB formation windows, FVG age) would
+// otherwise reimplement independently. No division, no na/zero edge
+// case beyond standard na propagation through math.abs().
+deriveBarsElapsed(int barA, int barB) =>
+    math.abs(barA - barB)
+
+// deriveVelocity - price distance per bar elapsed. Guards barsElapsed
+// == 0 (and na) via safeDivide, rather than dividing directly - this
+// is a real edge case, not a hypothetical one: a swing formed and
+// confirmed within a single bar of separation would otherwise divide
+// by zero.
+deriveVelocity(float distance, int barsElapsed) =>
+    safeDivide(distance, barsElapsed)
+
+// deriveBodyDominanceRatio - how much of the candle's range the body
+// occupies. Guards candleRange == 0 (a doji-shaped or zero-range
+// pivot candle) via safeDivide. Bounded [0,1] under normal inputs by
+// construction of its callers (body length can never exceed range) -
+// this function does not itself clamp, since clamping is a modeling
+// decision, not a math-primitive concern, and is out of scope here.
+deriveBodyDominanceRatio(float bodyLength, float candleRange) =>
+    safeDivide(bodyLength, candleRange)
+
+// deriveWickRejectionRatio - how much of the candle's range is wick
+// beyond the body at the extreme. Same zero-range guard, same
+// no-clamping rationale as deriveBodyDominanceRatio above.
+deriveWickRejectionRatio(float extremeWick, float candleRange) =>
+    safeDivide(extremeWick, candleRange)
+
+//====================================================================
+// CANDIDATE ENGINE
+// Candidate detection is unchanged.
+//====================================================================
+
+candidateHighPrice = ta.pivothigh(high, pivotLeftBars, pivotRightBars)
+candidateLowPrice = ta.pivotlow(low, pivotLeftBars, pivotRightBars)
+
+hasCandidateHigh = not na(candidateHighPrice)
+hasCandidateLow = not na(candidateLowPrice)
+
+candidateHighBar = bar_index - pivotRightBars
+candidateLowBar = bar_index - pivotRightBars
+
+//====================================================================
+// ADAPTIVE THRESHOLD ENGINE (Sprint 2.2)
+// currentATR is computed once per bar, at global scope, from closed-bar
+// data only (ta.atr is non-repainting, non-lookahead). Both the high
+// and low candidate processing paths on the same bar read this single
+// value, guaranteeing they can never diverge within a bar.
+//
+// This section does NOT alter the decision pipeline. It only produces
+// a value later consumed by resolveMinimumLegThreshold() in the Minimum
+// Leg Filter section below.
+//====================================================================
+
+currentATR = ta.atr(atrLength)
+
+//====================================================================
+// SWING DATABASE
+//====================================================================
+
+var int nextSwingId = 1
+
+var array<int> swingIds = array.new_int()
+var array<int> swingTypes = array.new_int()
+var array<float> swingPrices = array.new_float()
+var array<int> swingBars = array.new_int()
+var array<int> swingStatuses = array.new_int()
+
+var array<float> swingATR = array.new_float()
+var array<float> swingLegLength = array.new_float()
+var array<float> swingStrength = array.new_float()
+var array<float> swingScore = array.new_float()
+var array<float> swingLiquidity = array.new_float()
+var array<string> swingSession = array.new_string()
+var array<int> swingTrend = array.new_int()
+
+// Reserved fields (Sprint 2.1.5) - Future-Proofing Database Expansion
+// These fields are structurally prepared for upcoming roadmap features.
+// They are populated with default/reserved values ONLY. No trading logic
+// reads or writes meaningful values into these fields in this sprint.
+var array<int> swingStructureLabel = array.new_int()   // HH / HL / LH / LL classification (future Market Structure sprint)
+var array<int> swingBrokenBar = array.new_int()        // Bar index where this swing's level was broken (future BOS/CHoCH sprint)
+var array<int> swingBreakType = array.new_int()        // NONE / BOS / CHoCH (future BOS/CHoCH sprint)
+var array<bool> swingSweptStatus = array.new_bool()    // Whether a liquidity sweep has occurred (future Liquidity Sweep sprint)
+var array<int> swingSweptBar = array.new_int()         // Bar index of the liquidity sweep (future Liquidity Sweep sprint)
+var array<int> swingImportance = array.new_int()       // Minor / Intermediate / Major (future Swing Importance sprint)
+
+// Formation Snapshot fields (Sprint 2.3)
+// Captured exclusively through captureFormationSnapshot() - the only
+// approved extension point for formation-time metadata (Architectural
+// Invariant 3). Mutable while a swing is pending (re-captured on
+// replacement), frozen forever the instant the swing is confirmed -
+// the same lifecycle already proven for swingPrices/swingBars.
+var array<float> swingFormationATR = array.new_float()        // ATR at the pivot bar itself (fixed offset, not confirmation-time ATR)
+var array<float> swingCandleRange = array.new_float()         // High - Low of the pivot candle
+var array<float> swingCandleBody = array.new_float()          // |Close - Open| of the pivot candle
+var array<float> swingCandleExtremeWick = array.new_float()   // Distance from the candle's extreme to the nearer of open/close
+
+databaseSize() =>
+    array.size(swingIds)
+
+swingIndexFromId(int swingId) =>
+    int resultIndex = NO_INDEX
+    int size = array.size(swingIds)
+
+    if swingId > 0 and size > 0
+        for index = 0 to size - 1
+            int storedSwingId = array.get(swingIds, index)
+
+            if resultIndex == NO_INDEX and storedSwingId == swingId
+                resultIndex := index
+
+    resultIndex
+
+isValidSwingType(int swingType) =>
+    swingType == SWING_HIGH or swingType == SWING_LOW
+
+isValidSwingStatus(int statusValue) =>
+    statusValue == STATUS_PENDING or statusValue == STATUS_CONFIRMED or statusValue == STATUS_REPLACED or statusValue == STATUS_REJECTED
+
+// Reserved field validators (Sprint 2.1.5) - mirror the existing
+// isValidSwingType / isValidSwingStatus pattern. These only validate
+// that stored values are within the defined enum range; they do not
+// introduce any new trading logic.
+isValidStructureLabel(int structureLabel) =>
+    structureLabel == STRUCTURE_NONE or structureLabel == STRUCTURE_HH or structureLabel == STRUCTURE_HL or structureLabel == STRUCTURE_LH or structureLabel == STRUCTURE_LL
+
+isValidBreakType(int breakType) =>
+    breakType == BREAK_NONE or breakType == BREAK_BOS or breakType == BREAK_CHOCH
+
+isValidImportance(int importanceValue) =>
+    importanceValue == IMPORTANCE_MINOR or importanceValue == IMPORTANCE_INTERMEDIATE or importanceValue == IMPORTANCE_MAJOR
+
+debugAssert(bool condition, string message) =>
+    if showDebugLabels and not condition
+        runtime.error(message)
+
+databaseHasDuplicateIds() =>
+    bool hasDuplicate = false
+    int size = array.size(swingIds)
+
+    if size > 1
+        for leftIndex = 0 to size - 2
+            int leftId = array.get(swingIds, leftIndex)
+
+            for rightIndex = leftIndex + 1 to size - 1
+                int rightId = array.get(swingIds, rightIndex)
+
+                if leftId == rightId
+                    hasDuplicate := true
+
+    hasDuplicate
+
+databaseIsValid() =>
+    int size = array.size(swingIds)
+    int typesSize = array.size(swingTypes)
+    int pricesSize = array.size(swingPrices)
+    int barsSize = array.size(swingBars)
+    int statusesSize = array.size(swingStatuses)
+    int atrSize = array.size(swingATR)
+    int legLengthSize = array.size(swingLegLength)
+    int strengthSize = array.size(swingStrength)
+    int scoreSize = array.size(swingScore)
+    int liquiditySize = array.size(swingLiquidity)
+    int sessionSize = array.size(swingSession)
+    int trendSize = array.size(swingTrend)
+
+    // Reserved field sizes (Sprint 2.1.5)
+    int structureLabelSize = array.size(swingStructureLabel)
+    int brokenBarSize = array.size(swingBrokenBar)
+    int breakTypeSize = array.size(swingBreakType)
+    int sweptStatusSize = array.size(swingSweptStatus)
+    int sweptBarSize = array.size(swingSweptBar)
+    int importanceSize = array.size(swingImportance)
+
+    // Formation Snapshot field sizes (Sprint 2.3)
+    int formationATRSize = array.size(swingFormationATR)
+    int candleRangeSize = array.size(swingCandleRange)
+    int candleBodySize = array.size(swingCandleBody)
+    int candleExtremeWickSize = array.size(swingCandleExtremeWick)
+
+    bool valid = true
+    bool sizesMatch = typesSize == size and pricesSize == size and barsSize == size and statusesSize == size and atrSize == size and legLengthSize == size and strengthSize == size and scoreSize == size and liquiditySize == size and sessionSize == size and trendSize == size and structureLabelSize == size and brokenBarSize == size and breakTypeSize == size and sweptStatusSize == size and sweptBarSize == size and importanceSize == size and formationATRSize == size and candleRangeSize == size and candleBodySize == size and candleExtremeWickSize == size
+
+    if not sizesMatch
+        valid := false
+
+    if databaseHasDuplicateIds()
+        valid := false
+
+    int previousConfirmedType = SWING_NONE
+
+    if size > 0
+        for index = 0 to size - 1
+            int storedSwingId = array.get(swingIds, index)
+            int storedSwingType = array.get(swingTypes, index)
+            int storedStatus = array.get(swingStatuses, index)
+
+            if storedSwingId <= 0
+                valid := false
+
+            if not isValidSwingType(storedSwingType)
+                valid := false
+
+            if not isValidSwingStatus(storedStatus)
+                valid := false
+
+            // Reserved field range validation (Sprint 2.1.5)
+            int storedStructureLabel = array.get(swingStructureLabel, index)
+            int storedBreakType = array.get(swingBreakType, index)
+            int storedImportance = array.get(swingImportance, index)
+
+            if not isValidStructureLabel(storedStructureLabel)
+                valid := false
+
+            if not isValidBreakType(storedBreakType)
+                valid := false
+
+            if not isValidImportance(storedImportance)
+                valid := false
+
+            if storedStatus == STATUS_CONFIRMED
+                if previousConfirmedType == storedSwingType
+                    valid := false
+
+                previousConfirmedType := storedSwingType
+
+    valid
+
+validateDatabaseInDebug(string message) =>
+    if showDebugLabels
+        debugAssert(databaseIsValid(), message)
+
+databaseLastSwing() =>
+    int size = array.size(swingIds)
+    bool exists = size > 0
+
+    int storedSwingId = NO_SWING_ID
+    int storedSwingType = SWING_NONE
+    float storedSwingPrice = na
+    int storedSwingBar = NO_INDEX
+    int storedStatus = STATUS_REJECTED
+
+    if exists
+        int lastIndex = size - 1
+        storedSwingId := array.get(swingIds, lastIndex)
+        storedSwingType := array.get(swingTypes, lastIndex)
+        storedSwingPrice := array.get(swingPrices, lastIndex)
+        storedSwingBar := array.get(swingBars, lastIndex)
+        storedStatus := array.get(swingStatuses, lastIndex)
+
+    [storedSwingId, storedSwingType, storedSwingPrice, storedSwingBar, storedStatus, exists]
+
+databaseLastConfirmedSwing() =>
+    int confirmedSwingId = NO_SWING_ID
+    int confirmedSwingType = SWING_NONE
+    float confirmedSwingPrice = na
+    int confirmedSwingBar = NO_INDEX
+    bool exists = false
+
+    int size = array.size(swingIds)
+
+    if size > 0
+        for offset = 0 to size - 1
+            int index = size - 1 - offset
+            int storedStatus = array.get(swingStatuses, index)
+
+            if not exists and storedStatus == STATUS_CONFIRMED
+                confirmedSwingId := array.get(swingIds, index)
+                confirmedSwingType := array.get(swingTypes, index)
+                confirmedSwingPrice := array.get(swingPrices, index)
+                confirmedSwingBar := array.get(swingBars, index)
+                exists := true
+
+    [confirmedSwingId, confirmedSwingType, confirmedSwingPrice, confirmedSwingBar, exists]
+
+pushReservedSwingFields() =>
+    array.push(swingATR, na)
+    array.push(swingLegLength, na)
+    array.push(swingStrength, na)
+    array.push(swingScore, na)
+    array.push(swingLiquidity, na)
+    array.push(swingSession, RESERVED_STRING_DEFAULT)
+    array.push(swingTrend, RESERVED_INT_DEFAULT)
+
+    // Reserved field defaults (Sprint 2.1.5)
+    // These are structural placeholders only - no trading logic populates
+    // them yet. Defaults are chosen to be unambiguous "not yet evaluated"
+    // sentinels, consistent with NO_INDEX / RESERVED_INT_DEFAULT usage
+    // elsewhere in the database.
+    array.push(swingStructureLabel, STRUCTURE_NONE)
+    array.push(swingBrokenBar, NO_INDEX)
+    array.push(swingBreakType, BREAK_NONE)
+    array.push(swingSweptStatus, false)
+    array.push(swingSweptBar, NO_INDEX)
+    array.push(swingImportance, IMPORTANCE_MINOR)
+
+    // Formation Snapshot defaults (Sprint 2.3)
+    // Overwritten immediately by captureFormationSnapshot() below; pushed
+    // here only so every array stays size-parity-correct at every point,
+    // consistent with how every other field in this function is defaulted.
+    array.push(swingFormationATR, na)
+    array.push(swingCandleRange, na)
+    array.push(swingCandleBody, na)
+    array.push(swingCandleExtremeWick, na)
+
+// Formation Snapshot capture (Sprint 2.3)
+// This is the ONLY approved extension point for formation-time metadata
+// (Architectural Invariant 3). Called from createSwing() and
+// replacePendingSwing() only. No other function may write these fields -
+// deliberately no public setter accessors exist for them (see the
+// read-only accessor pair further below), so this function is the sole
+// write path by construction, not just by convention.
+//
+// Uses pivotRightBars - a "simple int" input, valid as a compile-time-
+// known historical offset - to read the pivot candle's own OHLC and ATR.
+// This is the same fixed-offset mechanism candidateHighBar/candidateLowBar
+// already rely on, and is what avoids the variable-offset/max_bars_back
+// problem ruled out during design review.
+captureFormationSnapshot(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool captured = swingIndex != NO_INDEX
+
+    if captured
+        int storedSwingType = array.get(swingTypes, swingIndex)
+
+        float pivotHigh = high[pivotRightBars]
+        float pivotLow = low[pivotRightBars]
+        float pivotOpen = open[pivotRightBars]
+        float pivotClose = close[pivotRightBars]
+        float pivotATR = currentATR[pivotRightBars]
+
+        float candleRange = pivotHigh - pivotLow
+        float candleBody = math.abs(pivotClose - pivotOpen)
+        float extremeWick = storedSwingType == SWING_HIGH ? pivotHigh - math.max(pivotOpen, pivotClose) : math.min(pivotOpen, pivotClose) - pivotLow
+
+        array.set(swingFormationATR, swingIndex, pivotATR)
+        array.set(swingCandleRange, swingIndex, candleRange)
+        array.set(swingCandleBody, swingIndex, candleBody)
+        array.set(swingCandleExtremeWick, swingIndex, extremeWick)
+
+    captured
+
+createSwing(int swingId, int swingType, float swingPrice, int swingBar) =>
+    debugAssert(swingId > 0, "Swing ID must be positive.")
+    debugAssert(isValidSwingType(swingType), "Invalid swing type.")
+
+    array.push(swingIds, swingId)
+    array.push(swingTypes, swingType)
+    array.push(swingPrices, swingPrice)
+    array.push(swingBars, swingBar)
+    array.push(swingStatuses, STATUS_PENDING)
+    pushReservedSwingFields()
+    captureFormationSnapshot(swingId)
+
+    swingId
+
+//--------------------------------------------------------------------
+// RESERVED FIELD ACCESSORS (Sprint 2.1.6)
+// Getter/setter API for the reserved fields introduced in Sprint 2.1.5.
+// These exist so future sprints never call array.get()/array.set()
+// directly on these columns. NOT USED anywhere yet - no engine logic,
+// visualization, or other function calls these. Pure dormant API.
+//--------------------------------------------------------------------
+
+setSwingStructureLabel(int swingId, int structureLabel) =>
+    debugAssert(isValidStructureLabel(structureLabel), "Invalid structure label.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStructureLabel, swingIndex, structureLabel)
+
+    exists
+
+getSwingStructureLabel(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedStructureLabel = STRUCTURE_NONE
+
+    if exists
+        storedStructureLabel := array.get(swingStructureLabel, swingIndex)
+
+    [storedStructureLabel, exists]
+
+setSwingBrokenBar(int swingId, int brokenBar) =>
+    debugAssert(brokenBar >= 0 or brokenBar == NO_INDEX, "Broken bar must be a valid bar index or NO_INDEX.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingBrokenBar, swingIndex, brokenBar)
+
+    exists
+
+getSwingBrokenBar(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedBrokenBar = NO_INDEX
+
+    if exists
+        storedBrokenBar := array.get(swingBrokenBar, swingIndex)
+
+    [storedBrokenBar, exists]
+
+setSwingBreakType(int swingId, int breakType) =>
+    debugAssert(isValidBreakType(breakType), "Invalid break type.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingBreakType, swingIndex, breakType)
+
+    exists
+
+getSwingBreakType(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedBreakType = BREAK_NONE
+
+    if exists
+        storedBreakType := array.get(swingBreakType, swingIndex)
+
+    [storedBreakType, exists]
+
+setSwingSweptStatus(int swingId, bool sweptStatus) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingSweptStatus, swingIndex, sweptStatus)
+
+    exists
+
+getSwingSweptStatus(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    bool storedSweptStatus = false
+
+    if exists
+        storedSweptStatus := array.get(swingSweptStatus, swingIndex)
+
+    [storedSweptStatus, exists]
+
+setSwingSweptBar(int swingId, int sweptBar) =>
+    debugAssert(sweptBar >= 0 or sweptBar == NO_INDEX, "Swept bar must be a valid bar index or NO_INDEX.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingSweptBar, swingIndex, sweptBar)
+
+    exists
+
+getSwingSweptBar(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedSweptBar = NO_INDEX
+
+    if exists
+        storedSweptBar := array.get(swingSweptBar, swingIndex)
+
+    [storedSweptBar, exists]
+
+setSwingImportance(int swingId, int importanceValue) =>
+    debugAssert(isValidImportance(importanceValue), "Invalid importance value.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingImportance, swingIndex, importanceValue)
+
+    exists
+
+getSwingImportance(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedImportance = IMPORTANCE_MINOR
+
+    if exists
+        storedImportance := array.get(swingImportance, swingIndex)
+
+    [storedImportance, exists]
+
+//--------------------------------------------------------------------
+// ACTIVE FIELD ACCESSORS (Sprint 2.2)
+// swingATR is NOT a reserved/dormant field - it is actively populated
+// by this sprint, at confirmation time only. Accessor pair added here
+// following the exact same get/set pattern as the reserved fields
+// above, so no caller ever touches array.get()/array.set() directly.
+//--------------------------------------------------------------------
+
+setSwingATR(int swingId, float atrValue) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingATR, swingIndex, atrValue)
+
+    exists
+
+getSwingATR(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    float storedATR = na
+
+    if exists
+        storedATR := array.get(swingATR, swingIndex)
+
+    [storedATR, exists]
+
+// setSwingStrength / getSwingStrength (Sprint 2.3 - Patch 4)
+// Written exactly once, from finalizeConfirmedSwing(), the instant a
+// swing confirms. Historical Immutability (frozen decision): nothing
+// in this codebase calls setSwingStrength() a second time for an
+// already-confirmed swing.
+setSwingStrength(int swingId, float strengthValue) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStrength, swingIndex, strengthValue)
+
+    exists
+
+getSwingStrength(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    float storedStrength = na
+
+    if exists
+        storedStrength := array.get(swingStrength, swingIndex)
+
+    [storedStrength, exists]
+
+//--------------------------------------------------------------------
+// FORMATION SNAPSHOT ACCESSORS (Sprint 2.3) - READ ONLY
+// swingFormationATR / swingCandleRange / swingCandleBody /
+// swingCandleExtremeWick are written exclusively by
+// captureFormationSnapshot() (Architectural Invariant 3). Deliberately
+// no setter accessors exist here - captureFormationSnapshot() is the
+// sole write path by construction, not just by convention. Getters are
+// provided for future consumption (Sprint 2.3 Strength calculation,
+// and any later module needing formation-time context).
+//--------------------------------------------------------------------
+
+getSwingFormationATR(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    float storedValue = na
+
+    if exists
+        storedValue := array.get(swingFormationATR, swingIndex)
+
+    [storedValue, exists]
+
+getSwingCandleRange(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    float storedValue = na
+
+    if exists
+        storedValue := array.get(swingCandleRange, swingIndex)
+
+    [storedValue, exists]
+
+getSwingCandleBody(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    float storedValue = na
+
+    if exists
+        storedValue := array.get(swingCandleBody, swingIndex)
+
+    [storedValue, exists]
+
+getSwingCandleExtremeWick(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    float storedValue = na
+
+    if exists
+        storedValue := array.get(swingCandleExtremeWick, swingIndex)
+
+    [storedValue, exists]
+
+updateSwingStatus(int swingId, int newStatus) =>
+    debugAssert(isValidSwingStatus(newStatus), "Invalid swing status.")
+
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingStatuses, swingIndex, newStatus)
+
+    exists
+
+getSwing(int swingId) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    int storedSwingType = SWING_NONE
+    float storedSwingPrice = na
+    int storedSwingBar = NO_INDEX
+    int storedStatus = STATUS_REJECTED
+
+    if exists
+        storedSwingType := array.get(swingTypes, swingIndex)
+        storedSwingPrice := array.get(swingPrices, swingIndex)
+        storedSwingBar := array.get(swingBars, swingIndex)
+        storedStatus := array.get(swingStatuses, swingIndex)
+
+    [storedSwingType, storedSwingPrice, storedSwingBar, storedStatus, exists]
+
+//====================================================================
+// SWING STRENGTH SYSTEM (Sprint 2.3 - Tier 2: Normalized Scores)
+//
+// Relocated here in Patch 4 (was previously between MINIMUM LEG
+// FILTER and REPLACEMENT ENGINE). This move is mechanical, not a
+// design change: computeSwingStrength() (Tier 3, added below) must be
+// database-lookup-free per the approved Patch 4 wiring policy, which
+// makes it - like Tier 1 and Tier 2 - pure and swing-agnostic in the
+// sense of touching no array/database state. That means it has no
+// dependency on anything in ENGINE API, and ENGINE API's
+// finalizeConfirmedSwing() now needs to call it - so this whole
+// section must be defined before ENGINE API, satisfying Pine's
+// define-before-use requirement. No function body in this relocated
+// section was altered by the move.
+//
+// This section is Strength-specific and calibrated - unlike Tier 1
+// (SHARED MATH UTILITIES), which is deliberately opinion-free, Tier 2
+// "owns" Strength's specific interpretation of what a good leg,
+// efficient move, or clean rejection candle looks like, via the named
+// calibration constants below.
+//
+// A future module wanting its own interpretation of the same raw
+// measurement (e.g. a different displacement threshold for Order
+// Blocks) applies its own saturation curve to Tier 1's raw output
+// directly - it does NOT reuse these functions or these constants.
+//
+// Tier 2 must NEVER:
+//   - access the Swing Database
+//   - access swing IDs
+//   - access engine state
+//   - write to any database field
+//   - compute a composite score (that is Tier 3, below)
+//
+// Tier 2 must always remain:
+//   - Deterministic, replay safe, non-repainting
+//   - Built only from Tier 1 primitives - no unguarded division
+//   - Bounded [0.0, 1.0] whenever its inputs are defined and satisfy
+//     their documented (non-negative) contract
+//   - Explicit (na) when an input is undefined, never a fabricated
+//     fallback number
+//
+// Calibration Policy: the constants below are Calibration Version 1 -
+// approved engineering baselines, not empirically optimized values.
+// They may be revised only through a dedicated calibration review
+// (per project Calibration Policy), never as part of an architecture
+// change.
+//====================================================================
+
+// Saturation constants - control how quickly each ratio-based score
+// approaches 1.0. Each K is the input value at which its score equals
+// exactly 0.5 (the saturation curve's inflection reference point).
+STRENGTH_LEG_DISTANCE_SATURATION_K = 3.0     // a 3x-ATR leg scores 0.5
+STRENGTH_LEG_EFFICIENCY_SATURATION_K = 0.30  // a 0.3 ATR/bar velocity scores 0.5
+
+// Candle Structure component weights - must sum to 1.0 for
+// normalizeCandleStructureScore's convex-combination bound to hold.
+STRENGTH_CANDLE_WICK_COMPONENT_WEIGHT = 0.60
+STRENGTH_CANDLE_BODY_COMPONENT_WEIGHT = 0.40
+
+// normalizeLegDistanceScore
+// -------------------------
+// raw ratio = legDistance / formationATR        (ATR-multiples of leg size)
+// score     = ratio / (ratio + K)                (saturating curve)
+//
+// Proof this is bounded [0,1] whenever the inputs are defined and
+// legDistance >= 0, formationATR > 0 (both hold by construction of
+// their upstream sources - deriveDistance() and swingFormationATR,
+// an ATR reading, are never negative):
+//   - ratio = legDistance / formationATR >= 0, since a non-negative
+//     numerator divided by a positive denominator is non-negative.
+//   - K (STRENGTH_LEG_DISTANCE_SATURATION_K) is a fixed positive
+//     constant (3.0), so (ratio + K) > 0 always - strictly greater
+//     than zero, never merely non-negative. This is what makes the
+//     final division safe without needing to special-case ratio == 0.
+//   - Lower bound: ratio == 0 => score = 0 / (0 + K) = 0.
+//   - Upper bound: as ratio -> infinity, ratio / (ratio + K) -> 1,
+//     but never reaches or exceeds 1, since ratio < ratio + K for any
+//     K > 0. The score is therefore always strictly < 1, asymptotic
+//     rather than clipped - no explicit clamp is required to enforce
+//     the upper bound; it is a structural property of the formula.
+//
+// Proof of monotonicity (larger legDistance never produces a smaller
+// score): let f(r) = r / (r + K). Its derivative with respect to r is
+// f'(r) = K / (r + K)^2, which is strictly positive for all r >= 0
+// and K > 0 (a positive constant divided by a square, which is always
+// positive). A strictly positive derivative means f is strictly
+// increasing - a larger raw ratio can never produce an equal or
+// smaller score. This holds independent of the specific K value
+// chosen, which is why recalibrating K (Calibration Policy) can
+// change the score's steepness without ever breaking monotonicity.
+//
+// If formationATR is na or 0, safeDivide's guard returns na for
+// ratio, and na propagates through the second safeDivide call
+// (denominator na is caught by its own guard) - the function returns
+// na explicitly rather than a fabricated number, exactly matching the
+// "undefined stays explicit" requirement.
+normalizeLegDistanceScore(float legDistance, float formationATR) =>
+    float ratio = safeDivide(legDistance, formationATR)
+    safeDivide(ratio, ratio + STRENGTH_LEG_DISTANCE_SATURATION_K)
+
+// normalizeLegEfficiencyScore
+// ---------------------------
+// Identical saturating shape and identical proof structure to
+// normalizeLegDistanceScore above, applied to velocity instead of
+// raw distance: raw ratio = legVelocity / formationATR (ATR-multiples
+// of speed per bar), saturated the same way with its own K
+// (STRENGTH_LEG_EFFICIENCY_SATURATION_K). Bounded-[0,1] and
+// monotonicity proofs are identical by substitution - both rely only
+// on K being a fixed positive constant and the numerator being
+// non-negative by construction (legVelocity is a distance-per-bar
+// derived from deriveVelocity(), which is never negative given
+// deriveDistance()'s and deriveBarsElapsed()'s non-negative outputs).
+normalizeLegEfficiencyScore(float legVelocity, float formationATR) =>
+    float ratio = safeDivide(legVelocity, formationATR)
+    safeDivide(ratio, ratio + STRENGTH_LEG_EFFICIENCY_SATURATION_K)
+
+// normalizeCandleStructureScore
+// ------------------------------
+// score = (wickRatio * WICK_WEIGHT) + (bodyRatio * BODY_WEIGHT)
+//
+// This is a convex combination, not a saturation curve - both inputs
+// arrive already bounded [0,1] (Tier 1's deriveWickRejectionRatio()
+// and deriveBodyDominanceRatio() guarantee this whenever candleRange
+// > 0, since a wick or body length can never exceed the candle's own
+// range by construction of how they are measured in
+// captureFormationSnapshot()).
+//
+// Proof this is bounded [0,1]: for any convex combination
+// w1*x1 + w2*x2 where x1, x2 in [0,1], w1 >= 0, w2 >= 0, and
+// w1 + w2 == 1:
+//   - Minimum: both weights are non-negative and both inputs are
+//     bounded below by 0, so the sum can never go below
+//     0*w1 + 0*w2 = 0.
+//   - Maximum: since w1 + w2 == 1, the maximum possible value of the
+//     sum is achieved when both x1 and x2 equal their upper bound of
+//     1, giving 1*w1 + 1*w2 = w1 + w2 = 1. No input combination can
+//     exceed this, because increasing either x_i beyond 1 is outside
+//     its documented contract - the bound holds precisely because
+//     both inputs satisfy [0,1], not because this function clamps.
+// This is why "no clamping is required if the inputs satisfy their
+// documented bounds" is a provable statement here, not an assumption:
+// the [0,1] output range is a direct algebraic consequence of the
+// [0,1] input range and the weights summing to exactly 1.0 - remove
+// either precondition and the guarantee no longer holds.
+//
+// Monotonicity: the partial derivative with respect to either input
+// is simply its own fixed weight (a positive constant), so the score
+// is monotonically non-decreasing in both wickRatio and bodyRatio
+// independently - a stronger, more directly evident property here
+// than in the saturation functions above, since the relationship is
+// linear rather than asymptotic.
+//
+// If either input is na (Tier 1's zero-candle-range guard), na
+// propagates through both the multiplication and the addition -
+// consistent with the "explicit na, never fabricated" requirement.
+//
+// Weight-sum integrity: mirrors the top-level Strength weight-sum
+// safeguard below (Tier 3) - gated behind Developer Mode, same
+// documented limitation as that check, pending Sprint 2.8's Engine
+// Integrity System.
+normalizeCandleStructureScore(float wickRatio, float bodyRatio) =>
+    debugAssert(math.abs((STRENGTH_CANDLE_WICK_COMPONENT_WEIGHT + STRENGTH_CANDLE_BODY_COMPONENT_WEIGHT) - 1.0) < 0.0001, "Candle Structure component weights must sum to 1.0.")
+
+    (wickRatio * STRENGTH_CANDLE_WICK_COMPONENT_WEIGHT) + (bodyRatio * STRENGTH_CANDLE_BODY_COMPONENT_WEIGHT)
+
+//--------------------------------------------------------------------
+// TIER 3 - COMPOSITE (Sprint 2.3 - Patch 4)
+//
+// Composite weights - Calibration Version 1, frozen. 40% Leg
+// Distance, 30% Leg Efficiency, 30% Candle Structure. Future changes
+// require a formal calibration review (Calibration Policy) - never an
+// ad-hoc edit here.
+//--------------------------------------------------------------------
+
+STRENGTH_WEIGHT_LEG_DISTANCE = 0.40
+STRENGTH_WEIGHT_LEG_EFFICIENCY = 0.30
+STRENGTH_WEIGHT_CANDLE_STRUCTURE = 0.30
+
+// computeSwingStrength
+// ---------------------
+// The Tier 1 -> Tier 2 -> Tier 3 orchestrator for a single swing's
+// Strength. Deliberately takes every needed value as an explicit
+// parameter and performs ZERO database lookups internally, per the
+// approved Patch 4 wiring policy - this function is pure, exactly
+// like Tier 1 and Tier 2, even though it is Strength-specific.
+// Gathering the raw values from the database is the caller's
+// responsibility (finalizeConfirmedSwing(), below in ENGINE API).
+//
+// First Confirmed Swing (Question 3, frozen decision): if no previous
+// confirmed swing exists, there is no valid reference to measure this
+// swing's leg against. Returns na explicitly - no synthetic
+// reference, no default score.
+//
+// Missing Data Policy (Question 4, frozen decision): full na
+// propagation. If any one of the three Tier 2 scores is na (e.g. a
+// zero-range pivot candle, or formationATR still na during ATR
+// warm-up), the composite is na - not renormalized among the
+// remaining components, not substituted. Pine's native na arithmetic
+// already enforces this without extra branching: na multiplied by a
+// weight is na, and na added to any value is na, so the single
+// weighted-sum expression below is correct by construction whenever
+// any component is na - no explicit na-checking branch is needed
+// beyond the first-confirmed-swing guard.
+//
+// Historical Immutability (Question 5, frozen decision): this
+// function is called exactly once per swing, from
+// finalizeConfirmedSwing(), which itself is only ever called once per
+// swing (at confirmation). Nothing in this codebase calls
+// computeSwingStrength() a second time for an already-confirmed
+// swing - the stored result is permanent by construction of its
+// single call site, not by a runtime guard.
+computeSwingStrength(bool previousConfirmedExists, float previousConfirmedPrice, int previousConfirmedBar, float thisPrice, int thisBar, float formationATR, float candleRange, float candleBody, float candleExtremeWick) =>
+    debugAssert(math.abs((STRENGTH_WEIGHT_LEG_DISTANCE + STRENGTH_WEIGHT_LEG_EFFICIENCY + STRENGTH_WEIGHT_CANDLE_STRUCTURE) - 1.0) < 0.0001, "Swing Strength composite weights must sum to 1.0.")
+
+    float strength = na
+
+    if previousConfirmedExists
+        float legDistance = deriveDistance(thisPrice, previousConfirmedPrice)
+        int barsElapsed = deriveBarsElapsed(thisBar, previousConfirmedBar)
+        float legVelocity = deriveVelocity(legDistance, barsElapsed)
+
+        float wickRatio = deriveWickRejectionRatio(candleExtremeWick, candleRange)
+        float bodyRatio = deriveBodyDominanceRatio(candleBody, candleRange)
+
+        float distanceScore = normalizeLegDistanceScore(legDistance, formationATR)
+        float efficiencyScore = normalizeLegEfficiencyScore(legVelocity, formationATR)
+        float candleScore = normalizeCandleStructureScore(wickRatio, bodyRatio)
+
+        strength := (distanceScore * STRENGTH_WEIGHT_LEG_DISTANCE) + (efficiencyScore * STRENGTH_WEIGHT_LEG_EFFICIENCY) + (candleScore * STRENGTH_WEIGHT_CANDLE_STRUCTURE)
+
+    strength
+
+//====================================================================
+// ENGINE API
+//====================================================================
+
+startPendingSwing(int swingId, int swingType, float swingPrice, int swingBar) =>
+    createSwing(swingId, swingType, swingPrice, swingBar)
+
+confirmPendingSwing(int swingId) =>
+    bool updated = updateSwingStatus(swingId, STATUS_CONFIRMED)
+    validateDatabaseInDebug("Database integrity failed after confirmation.")
+    updated
+
+// finalizeConfirmedSwing - the single approved extension point for
+// confirmation-time metadata (mirrors captureFormationSnapshot()'s role
+// as the sole extension point for formation-time metadata). Called by
+// the Replacement Engine exactly once, immediately after a swing has
+// been successfully confirmed - never before, never more than once per
+// swing, consistent with "Swing Strength is calculated exactly once."
+//
+// Patch 4: now also computes and writes swingStrength. This is the
+// one function in the Strength pipeline allowed to touch the
+// database - it gathers this swing's own stored formation fields via
+// the read-only accessors, plus the previousConfirmed* reference
+// passed in explicitly by the caller (captured before this swing's
+// own status flipped to CONFIRMED - see processSameSideCandidate()/
+// processOppositeCandidate() for the ordering fix), then hands fully
+// resolved values to computeSwingStrength(), which itself performs no
+// database access at all (approved Patch 4 wiring policy).
+//
+// Future patches extend this function body only - Swing Importance,
+// Structure Label, and any other confirmation-time field all get
+// added here, not scattered back into the Replacement Engine. (Note:
+// BOS/CHoCH/Liquidity-Sweep fields do NOT belong here - those are
+// post-confirmation events requiring their own future extension
+// point, per the Sprint 2.3 architecture review.)
+finalizeConfirmedSwing(int swingId, float atrValue, float previousConfirmedPrice, int previousConfirmedBar, bool previousConfirmedExists) =>
+    setSwingATR(swingId, atrValue)
+
+    [_, thisPrice, thisBar, _, _] = getSwing(swingId)
+    [formationATR, _] = getSwingFormationATR(swingId)
+    [candleRange, _] = getSwingCandleRange(swingId)
+    [candleBody, _] = getSwingCandleBody(swingId)
+    [candleExtremeWick, _] = getSwingCandleExtremeWick(swingId)
+
+    float strength = computeSwingStrength(previousConfirmedExists, previousConfirmedPrice, previousConfirmedBar, thisPrice, thisBar, formationATR, candleRange, candleBody, candleExtremeWick)
+
+    setSwingStrength(swingId, strength)
+
+replacePendingSwing(int swingId, float replacementPrice, int replacementBar) =>
+    int swingIndex = swingIndexFromId(swingId)
+    bool exists = swingIndex != NO_INDEX
+
+    if exists
+        array.set(swingPrices, swingIndex, replacementPrice)
+        array.set(swingBars, swingIndex, replacementBar)
+        array.set(swingStatuses, swingIndex, STATUS_PENDING)
+
+        // Sprint 2.3: formation data tracks the replacement, not the
+        // original candidate - by the time this swing is confirmed, "the
+        // swing" IS the replaced version, mirroring how price/bar already
+        // update here rather than staying anchored to the first candidate.
+        captureFormationSnapshot(swingId)
+
+    validateDatabaseInDebug("Database integrity failed after replacement.")
+    exists
+
+rejectPendingSwing(int swingId) =>
+    bool exists = swingIndexFromId(swingId) != NO_INDEX
+    debugAssert(exists, "Rejected swing references a missing active swing.")
+    exists
+
+archivePendingSwing(int swingId) =>
+    bool updated = updateSwingStatus(swingId, STATUS_REJECTED)
+    validateDatabaseInDebug("Database integrity failed after archive.")
+    updated
+
+getActiveSwing(int swingId) =>
+    getSwing(swingId)
+
+getLastConfirmedSwing() =>
+    databaseLastConfirmedSwing()
+
+//====================================================================
+// MINIMUM LEG FILTER
+// Evaluates the transition swing against the last confirmed swing.
+// Same-side replacement candidates are never blocked by this filter.
+//
+// Sprint 2.2: the filter's comparison logic (Distance >= Threshold)
+// is unchanged. It no longer knows or cares how the threshold is
+// produced - that responsibility is fully delegated to
+// resolveMinimumLegThreshold() below (Option B - dedicated Threshold
+// Provider, per approved design).
+//====================================================================
+
+legDistance(float transitionSwingPrice, float confirmedSwingPrice) =>
+    math.abs(transitionSwingPrice - confirmedSwingPrice)
+
+// Threshold Provider (Sprint 2.2)
+// Resolves the active Minimum Leg threshold based on thresholdMode.
+// This is the ONLY place that knows about Fixed / Adaptive ATR / Manual
+// Override. passesMinimumLegFilter() only ever sees the resulting float.
+resolveMinimumLegThreshold() =>
+    float threshold = minimumLegPoints
+
+    if thresholdMode == THRESHOLD_MANUAL_OVERRIDE
+        // Dev/Test only - ignores Fixed and Adaptive ATR entirely, per
+        // approved design. Not intended for production trading use.
+        threshold := manualLegPoints
+    else if thresholdMode == THRESHOLD_ADAPTIVE_ATR
+        // Deterministic startup guarantee: if ATR is unavailable (na,
+        // e.g. during warm-up before atrLength bars exist), fall back
+        // to the Fixed threshold rather than producing an undefined
+        // or overly permissive comparison.
+        threshold := na(currentATR) ? minimumLegPoints : math.max(minimumLegPoints, currentATR * atrMultiplier)
+    else
+        // THRESHOLD_FIXED (default) - identical to pre-Sprint-2.2 behaviour.
+        threshold := minimumLegPoints
+
+    threshold
+
+passesMinimumLegFilter(float transitionSwingPrice) =>
+    [_, _, lastConfirmedPrice, _, hasConfirmedSwing] = getLastConfirmedSwing()
+    bool passesFilter = true
+
+    if hasConfirmedSwing
+        float distanceFromLastConfirmed = legDistance(transitionSwingPrice, lastConfirmedPrice)
+        float activeThreshold = resolveMinimumLegThreshold()
+        passesFilter := distanceFromLastConfirmed >= activeThreshold
+
+    passesFilter
+
+//====================================================================
+// REPLACEMENT ENGINE
+//====================================================================
+
+var int activePendingSwingType = SWING_NONE
+var int activePendingSwingId = NO_SWING_ID
+var int activePendingHighSwingId = NO_SWING_ID
+var int activePendingLowSwingId = NO_SWING_ID
+var int activeTransitionSwingId = NO_SWING_ID
+
+var array<int> currentEventTypes = array.new_int()
+var array<int> currentEventSwingTypes = array.new_int()
+var array<int> currentEventSwingIds = array.new_int()
+var array<float> currentEventPrices = array.new_float()
+var array<int> currentEventBars = array.new_int()
+
+var array<int> currentConfirmedSwingTypes = array.new_int()
+var array<int> currentConfirmedSwingIds = array.new_int()
+var array<float> currentConfirmedSwingPrices = array.new_float()
+var array<int> currentConfirmedSwingBars = array.new_int()
+
+resetCurrentBarEvents() =>
+    array.clear(currentEventTypes)
+    array.clear(currentEventSwingTypes)
+    array.clear(currentEventSwingIds)
+    array.clear(currentEventPrices)
+    array.clear(currentEventBars)
+    array.clear(currentConfirmedSwingTypes)
+    array.clear(currentConfirmedSwingIds)
+    array.clear(currentConfirmedSwingPrices)
+    array.clear(currentConfirmedSwingBars)
+
+recordCandidateEvent(int eventType, int swingType, int swingId, float swingPrice, int swingBar) =>
+    array.push(currentEventTypes, eventType)
+    array.push(currentEventSwingTypes, swingType)
+    array.push(currentEventSwingIds, swingId)
+    array.push(currentEventPrices, swingPrice)
+    array.push(currentEventBars, swingBar)
+
+recordConfirmedSwingEvent(int swingType, int swingId, float swingPrice, int swingBar) =>
+    array.push(currentConfirmedSwingTypes, swingType)
+    array.push(currentConfirmedSwingIds, swingId)
+    array.push(currentConfirmedSwingPrices, swingPrice)
+    array.push(currentConfirmedSwingBars, swingBar)
+
+isBetterReplacement(int swingType, float candidatePrice, float activePrice) =>
+    swingType == SWING_HIGH ? candidatePrice > activePrice : candidatePrice < activePrice
+
+activateNewPendingSwing(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    int newSwingId = startPendingSwing(swingId, candidateType, candidatePrice, candidateBar)
+    int updatedHighSwingId = candidateType == SWING_HIGH ? newSwingId : activePendingHighSwingId
+    int updatedLowSwingId = candidateType == SWING_LOW ? newSwingId : activePendingLowSwingId
+
+    recordCandidateEvent(EVENT_ACCEPTED, candidateType, newSwingId, candidatePrice, candidateBar)
+
+    [candidateType, newSwingId, updatedHighSwingId, updatedLowSwingId]
+
+processSameSideCandidate(int candidateType, float candidatePrice, int candidateBar) =>
+    [_, storedPrice, _, _, exists] = getActiveSwing(activePendingSwingId)
+    [transitionType, transitionPrice, transitionBar, _, transitionExists] = getSwing(activeTransitionSwingId)
+
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    int updatedTransitionId = activeTransitionSwingId
+    bool createdSwingRecord = false
+
+    bool shouldReplace = exists and isBetterReplacement(candidateType, candidatePrice, storedPrice)
+    int eventType = shouldReplace ? EVENT_REPLACED : EVENT_REJECTED
+
+    if shouldReplace
+        replacePendingSwing(activePendingSwingId, candidatePrice, candidateBar)
+
+        if transitionExists and transitionBar <= candidateBar
+            archivePendingSwing(activeTransitionSwingId)
+            updatedTransitionId := NO_SWING_ID
+        else if transitionExists and passesMinimumLegFilter(transitionPrice)
+            // Sprint 2.3 (Revision 3 ordering fix): capture the previous
+            // confirmed swing's reference BEFORE confirmPendingSwing()
+            // flips this swing's own status to CONFIRMED. Calling
+            // getLastConfirmedSwing() after that flip would incorrectly
+            // return this swing itself as "the previous confirmed swing."
+            [_, _, prevConfirmedPrice, prevConfirmedBar, prevConfirmedExists] = getLastConfirmedSwing()
+            bool confirmed = confirmPendingSwing(activePendingSwingId)
+
+            if confirmed
+                // Sprint 2.3: confirmation-time metadata now goes through
+                // the single finalizeConfirmedSwing() extension point
+                // (relocated from an inline setSwingATR() call here in
+                // Sprint 2.2 - same field, same timing, same value).
+                // Patch 4: finalizeConfirmedSwing() now also computes
+                // and writes swingStrength, using the previous-confirmed
+                // reference captured above.
+                finalizeConfirmedSwing(activePendingSwingId, currentATR, prevConfirmedPrice, prevConfirmedBar, prevConfirmedExists)
+                recordConfirmedSwingEvent(candidateType, activePendingSwingId, candidatePrice, candidateBar)
+
+            updatedActiveType := transitionType
+            updatedActiveId := activeTransitionSwingId
+            updatedHighId := transitionType == SWING_HIGH ? activeTransitionSwingId : activePendingHighSwingId
+            updatedLowId := transitionType == SWING_LOW ? activeTransitionSwingId : activePendingLowSwingId
+            updatedTransitionId := NO_SWING_ID
+    else
+        rejectPendingSwing(activePendingSwingId)
+
+    recordCandidateEvent(eventType, candidateType, activePendingSwingId, candidatePrice, candidateBar)
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, updatedTransitionId, createdSwingRecord]
+
+processOppositeCandidate(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    [storedType, storedPrice, storedBar, _, exists] = getActiveSwing(activePendingSwingId)
+    [transitionType, transitionPrice, transitionBar, _, transitionExists] = getSwing(activeTransitionSwingId)
+
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    int updatedTransitionId = activeTransitionSwingId
+    bool createdSwingRecord = false
+
+    int eventType = EVENT_ACCEPTED
+    int eventSwingId = swingId
+
+    bool transitionMatchesCandidate = transitionExists and transitionType == candidateType
+
+    if not transitionMatchesCandidate
+        if transitionExists
+            archivePendingSwing(activeTransitionSwingId)
+
+        int newTransitionId = startPendingSwing(swingId, candidateType, candidatePrice, candidateBar)
+
+        updatedTransitionId := newTransitionId
+        transitionType := candidateType
+        transitionPrice := candidatePrice
+        transitionBar := candidateBar
+        transitionExists := true
+
+        eventType := EVENT_ACCEPTED
+        eventSwingId := newTransitionId
+        createdSwingRecord := true
+    else
+        eventSwingId := activeTransitionSwingId
+
+        if isBetterReplacement(candidateType, candidatePrice, transitionPrice)
+            replacePendingSwing(activeTransitionSwingId, candidatePrice, candidateBar)
+
+            transitionPrice := candidatePrice
+            transitionBar := candidateBar
+            eventType := EVENT_REPLACED
+        else
+            eventType := EVENT_REJECTED
+
+    recordCandidateEvent(eventType, candidateType, eventSwingId, candidatePrice, candidateBar)
+
+    bool canConfirmPendingSwing = exists and transitionExists and passesMinimumLegFilter(transitionPrice)
+
+    if canConfirmPendingSwing
+        // Sprint 2.3 (Revision 3 ordering fix): capture the previous
+        // confirmed swing's reference BEFORE confirmPendingSwing() flips
+        // this swing's own status to CONFIRMED - see identical rationale
+        // in processSameSideCandidate() above.
+        [_, _, prevConfirmedPrice, prevConfirmedBar, prevConfirmedExists] = getLastConfirmedSwing()
+        bool confirmed = confirmPendingSwing(activePendingSwingId)
+
+        if confirmed
+            // Sprint 2.3: confirmation-time metadata now goes through
+            // the single finalizeConfirmedSwing() extension point
+            // (relocated from an inline setSwingATR() call here in
+            // Sprint 2.2 - same field, same timing, same value).
+            // Patch 4: finalizeConfirmedSwing() now also computes and
+            // writes swingStrength, using the previous-confirmed
+            // reference captured above.
+            finalizeConfirmedSwing(activePendingSwingId, currentATR, prevConfirmedPrice, prevConfirmedBar, prevConfirmedExists)
+            recordConfirmedSwingEvent(storedType, activePendingSwingId, storedPrice, storedBar)
+
+        updatedActiveType := transitionType
+        updatedActiveId := updatedTransitionId
+        updatedHighId := transitionType == SWING_HIGH ? updatedTransitionId : activePendingHighSwingId
+        updatedLowId := transitionType == SWING_LOW ? updatedTransitionId : activePendingLowSwingId
+        updatedTransitionId := NO_SWING_ID
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, updatedTransitionId, createdSwingRecord]
+
+processCandidate(int candidateType, float candidatePrice, int candidateBar, int swingId) =>
+    int updatedActiveType = activePendingSwingType
+    int updatedActiveId = activePendingSwingId
+    int updatedHighId = activePendingHighSwingId
+    int updatedLowId = activePendingLowSwingId
+    int updatedTransitionId = activeTransitionSwingId
+    bool createdSwingRecord = false
+
+    if activePendingSwingType == SWING_NONE
+        [firstType, firstId, firstHighId, firstLowId] = activateNewPendingSwing(candidateType, candidatePrice, candidateBar, swingId)
+
+        updatedActiveType := firstType
+        updatedActiveId := firstId
+        updatedHighId := firstHighId
+        updatedLowId := firstLowId
+        updatedTransitionId := NO_SWING_ID
+        createdSwingRecord := true
+
+    else if activePendingSwingType == candidateType
+        [sameType, sameId, sameHighId, sameLowId, sameTransitionId, sameCreated] = processSameSideCandidate(candidateType, candidatePrice, candidateBar)
+
+        updatedActiveType := sameType
+        updatedActiveId := sameId
+        updatedHighId := sameHighId
+        updatedLowId := sameLowId
+        updatedTransitionId := sameTransitionId
+        createdSwingRecord := sameCreated
+
+    else
+        [oppositeType, oppositeId, oppositeHighId, oppositeLowId, oppositeTransitionId, oppositeCreated] = processOppositeCandidate(candidateType, candidatePrice, candidateBar, swingId)
+
+        updatedActiveType := oppositeType
+        updatedActiveId := oppositeId
+        updatedHighId := oppositeHighId
+        updatedLowId := oppositeLowId
+        updatedTransitionId := oppositeTransitionId
+        createdSwingRecord := oppositeCreated
+
+    validateDatabaseInDebug("Database integrity failed after candidate processing.")
+
+    [updatedActiveType, updatedActiveId, updatedHighId, updatedLowId, updatedTransitionId, createdSwingRecord]
+
+resetCurrentBarEvents()
+
+if hasCandidateHigh
+    [updatedTypeHigh, updatedIdHigh, updatedHighSwingIdHigh, updatedLowSwingIdHigh, updatedTransitionIdHigh, createdHighSwing] = processCandidate(SWING_HIGH, candidateHighPrice, candidateHighBar, nextSwingId)
+
+    activePendingSwingType := updatedTypeHigh
+    activePendingSwingId := updatedIdHigh
+    activePendingHighSwingId := updatedHighSwingIdHigh
+    activePendingLowSwingId := updatedLowSwingIdHigh
+    activeTransitionSwingId := updatedTransitionIdHigh
+
+    if createdHighSwing
+        nextSwingId += 1
+
+if hasCandidateLow
+    [updatedTypeLow, updatedIdLow, updatedHighSwingIdLow, updatedLowSwingIdLow, updatedTransitionIdLow, createdLowSwing] = processCandidate(SWING_LOW, candidateLowPrice, candidateLowBar, nextSwingId)
+
+    activePendingSwingType := updatedTypeLow
+    activePendingSwingId := updatedIdLow
+    activePendingHighSwingId := updatedHighSwingIdLow
+    activePendingLowSwingId := updatedLowSwingIdLow
+    activeTransitionSwingId := updatedTransitionIdLow
+
+    if createdLowSwing
+        nextSwingId += 1
+
+//====================================================================
+// VISUALIZATION
+//====================================================================
+
+isDeveloperMode() =>
+    displayMode == DISPLAY_DEVELOPER
+
+isTestMode() =>
+    displayMode == DISPLAY_TEST
+
+drawDeveloperDebugLabel(int eventType, int swingType, int swingId, float swingPrice, int swingBar) =>
+    if showDebugLabels and isDeveloperMode()
+        string sideText = swingType == SWING_HIGH ? "High" : "Low"
+        string eventText = eventType == EVENT_ACCEPTED ? "Accepted" : eventType == EVENT_REPLACED ? "Replaced" : "Rejected"
+        string labelText = eventText + " " + sideText + " #" + str.tostring(swingId)
+        color labelColor = eventType == EVENT_ACCEPTED ? acceptedColor : eventType == EVENT_REPLACED ? replacedColor : rejectedColor
+
+        label.new(swingBar, swingPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = swingType == SWING_HIGH ? label.style_label_down : label.style_label_up, color = labelColor, textcolor = color.white, size = size.tiny)
+
+drawConfirmedSwingLabel(int swingType, int swingId, float swingPrice, int swingBar) =>
+    if showConfirmedSwings and (isDeveloperMode() or isTestMode())
+        string swingText = swingType == SWING_HIGH ? "H" : "L"
+        string labelText = isDeveloperMode() ? swingText + " #" + str.tostring(swingId) : swingText
+
+        label.new(swingBar, swingPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = swingType == SWING_HIGH ? label.style_label_down : label.style_label_up, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+
+int confirmedCount = array.size(currentConfirmedSwingIds)
+
+if confirmedCount > 0
+    for index = 0 to confirmedCount - 1
+        int confirmedType = array.get(currentConfirmedSwingTypes, index)
+        int confirmedId = array.get(currentConfirmedSwingIds, index)
+        float confirmedPrice = array.get(currentConfirmedSwingPrices, index)
+        int confirmedBar = array.get(currentConfirmedSwingBars, index)
+
+        drawConfirmedSwingLabel(confirmedType, confirmedId, confirmedPrice, confirmedBar)
+
+int eventCount = array.size(currentEventTypes)
+
+if eventCount > 0
+    for index = 0 to eventCount - 1
+        int eventType = array.get(currentEventTypes, index)
+        int eventSwingType = array.get(currentEventSwingTypes, index)
+        int eventSwingId = array.get(currentEventSwingIds, index)
+        float eventPrice = array.get(currentEventPrices, index)
+        int eventBar = array.get(currentEventBars, index)
+
+        drawDeveloperDebugLabel(eventType, eventSwingType, eventSwingId, eventPrice, eventBar)
+
+plotshape(hasCandidateHigh and isDeveloperMode(), title = "Candidate High", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 75), size = size.tiny, offset = -pivotRightBars)
+
+plotshape(hasCandidateLow and isDeveloperMode(), title = "Candidate Low", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 75), size = size.tiny, offset = -pivotRightBars)
