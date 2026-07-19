@@ -1,0 +1,45 @@
+Structure Classification — Frozen Specification (Final)
+1. Purpose
+Determines which confirmed swings remain structurally relevant (unbroken) and maintains their lifecycle, independent of and downstream from swing confirmation itself.
+2. Lifecycle
+Two states: Active → Retired, terminal. No reactivation.
+3. Activation Rule
+Every swing reaching STATUS_CONFIRMED in the Swing Database becomes Active, unconditionally, on the same bar that confirmation is observed.
+4. Retirement Rule
+A swing retires when, and only when, price closes beyond its level in the invalidating direction (above the level for a confirmed high, below for a confirmed low). Wick-only interaction never retires a swing. Exact equality (close == level) is not a retirement event — strict inequality required, consistent with the same tie-break rule already frozen in BOS.
+5. Multiplicity
+Multiple concurrently active swings per side (high and low independently) are supported without restriction — this is a domain requirement, not an implementation convenience.
+6. Break Computation
+A shared, pure, stateless utility (deriveLevelCrossed) computes the crossing fact. Structure Classification is its first consumer. BOS's existing frozen implementation is left untouched — this utility is available for future consumers (Liquidity, CHoCH) but does not retroactively modify BOS.
+7. Ownership — swingStructureLabel
+Not owned by Structure Classification. Remains reserved for a separate, not-yet-scheduled extension to the Swing Database's finalizeConfirmedSwing().
+8. Direction
+Not persisted anywhere. Derived at read time from swingType (SWING_HIGH → "bullish", SWING_LOW → "bearish"), solely to preserve BOS's existing frozen string-based contract.
+9. Active-Set Cap (Question 6 — resolved for this implementation)
+No cap implemented. Draft v5 established no domain-derived cap exists; inventing an arbitrary number now would be an unjustified engineering assumption. The active set is allowed to grow unbounded in this version. This is a disclosed, intentional deferral — not an oversight — and should be revisited if real data shows problematic growth.
+10. Execution Order Within a Bar (Question 9 — resolved for this implementation)
+Activation runs first, then retirement scans the full set including anything just activated, using the same bar's close. This ensures a swing that confirms already-invalidated by that bar's price action retires immediately rather than lingering one extra bar as falsely "active."
+11. Complexity — Honest Disclosure
+The retirement scan is O(n) in total historical swing count, not O(k)-active-only, because entries are never removed from the underlying array (retired swings remain as permanent historical records, per the immutability principle). This mirrors an already-accepted, already-documented performance characteristic elsewhere in this project (the Swing Database's own swingIndexFromId is similarly O(n)) — not a new risk class, but worth tracking under the same future optimization umbrella if it matters at scale.
+12. Integration Point — Named Explicitly
+Activation detection consumes the Replacement Engine's existing per-bar currentConfirmedSwingIds/currentConfirmedSwingBars arrays (already built for visualization, cleared each bar via resetCurrentBarEvents()) — the actual, concrete mechanism by which this module learns "which swings confirmed this bar," rather than an abstract placeholder.
+13. Confirmed-Bar Field Resolution
+This module's own activatedBar is the bar on which this module observed confirmation — the true confirmation-bar index — distinct from the Swing Database's swingBar (the pivot's own bar). This resolves a gap flagged in the project's original architecture review (no field previously captured true confirmation-bar timing).
+14. Ordering Guarantee to BOS
+structcls_getActiveStructuralSwingIds() returns IDs in ascending swing_id / insertion order — deterministic, satisfying the cross-module ordering obligation recorded at Sprint 2.5's closeout.
+15. Known Follow-Up (not part of this implementation)
+bos_isLifecycleConfirmed()'s comparison (lifecycle_state == "Confirmed") will need a one-line update to compare against the Swing Database's actual STATUS_CONFIRMED int constant once real integration occurs — this is the exact representation-swap seam that adapter was designed to absorb, per its own frozen documentation. Not performed here, since it means editing already-frozen BOS code, out of scope for this deliverable.
+
+Now implementing against this specification.Created a file, ran a command, read a fileCreated a file, ran a command, read a fileSummary
+12 functions delivered: 1 shared Tier 1 utility (deriveLevelCrossed), 1 write-path orchestrator (structcls_processBar), 6 read accessors, 2 internal validation functions, matching the frozen spec item-by-item as annotated in the file header.
+Explicitly NOT done, by design:
+
+swingStructureLabel — untouched anywhere in this file, per the ownership correction.
+BOS's bos_isLifecycleConfirmed() — not edited, even though this module's structcls_getLifecycleState() returns an int rather than the string BOS's adapter currently expects. That one-line adapter change is named as a required follow-up, not performed here, since it means editing already-frozen BOS code.
+No cap on active-set size, no arbitrary K — deferred per §9, rather than inventing an unjustified number.
+No call site added to any host script main block — this remains a standalone module file, exactly as BOS was delivered before its own integration.
+
+Two things worth flagging honestly before you review this as a candidate for its own freeze:
+
+This is a first implementation, not yet through the Architecture Review / Audit steps this project's process requires before something gets called frozen — I've built it directly against the specification you asked me to freeze and implement in the same turn, which compresses steps 2–5 of your own 7-step workflow. If you want the same rigor applied to BOS's phases, this likely deserves its own review pass before being called stable.
+The retirement scan's O(n)-over-total-history cost (§11) is disclosed but unproven at scale — nothing in this deliverable tested it against anything, since there's no real getSwing()/currentConfirmedSwingIds data to run it against in isolation.
