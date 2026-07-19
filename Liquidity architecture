@@ -1,0 +1,34 @@
+This is a legitimate, well-specified implementation task — I'll write it directly to a file since it's a complete Pine Script module (not a snippet), matching production/library conventions.## Integration Notes
+
+**Required call order (per bar):**
+1. Structure Classification finalizes its own confirmation logic for the bar (including the trade-through-since-formation tag).
+2. Any new confirmed facts get submitted this bar: `submitSwingFact()`, `submitEqualLevelFact()`, `submitSessionFact()`.
+3. `advance(bar_index, high, low, close)` is called **exactly once**, after all submissions for that bar.
+4. Downstream consumers query `getActiveObjects()` / `getResolvedObjects()` / `getEventLog()` only after step 3.
+
+**Required upstream modules:**
+- **Structure Classification** — must supply confirmed swings and confirmed Equal-High/Low clusters, each with the `tradeThroughAtFormation` tag already finalized. This module never computes that tag itself.
+- **Session Engine** — must supply session-derived extremes (PDH, PDL, weekly/session highs-lows) as finalized facts. This module never computes session boundaries.
+
+**Required downstream expectations:**
+- Any future CHoCH/BOS, narrative, or entry module consumes only `LiquidityObject` state and `LiquidityEvent` history — it must not re-derive sweep/approach logic from raw price itself.
+- Cross-module correlation (e.g., "did a sweep precede this break") belongs in a separate correlating module, not inside this engine.
+
+---
+
+## Self-Review
+
+**Assumptions made (not explicitly pinned down by the frozen spec, resolved here for implementability):**
+- `toleranceOffset`, `proximityBand`, `stalenessBars`, and `reactionWindowBars` are all treated as **per-object, externally supplied policy values** set at submission time, rather than global parameters passed to `advance()`. The spec only explicitly named the reaction window as an external policy value; I extended the same ownership pattern (mechanism here, value supplied upstream) to the other three thresholds for consistency. This is an extension of an established principle, not a new one — flagging it for review in case the intended design wanted these as global/shared policy instead.
+- Staleness is measured as `barIndex - formationBar`, not reset by an intervening Approach-then-revert cycle. The spec didn't specify whether approach should reset the staleness clock; I chose the simpler, deterministic interpretation.
+- The "already breached at formation" retention case is given its own resolution constant (`PRE_RESOLVED_AT_FORMATION`) rather than being forced into Swept/Breached-Continuation/Invalidated-Stale, since fabricating one of those would violate the "no fabricated outcomes" principle. This constant is an implementation-level realization of the spec's retention policy, not a new architectural concept.
+- `barstate.islast` is used as the trigger for `OUTCOME_UNDETERMINED`. This is deterministic per-run but worth double-checking in replay/backtest contexts to confirm it behaves as expected across your specific host script's bar-processing mode.
+
+**Implementation limitations:**
+- Not compiled/tested against the Pine v6 compiler in this environment — syntax (especially named-argument struct instantiation, `map`/`array` of UDTs, and `for` loop mutation-in-place semantics) should be verified in the Pine Editor before production use.
+- No plotting/visualization is included, since this is a pure library module; a host script would need to render objects/events itself.
+
+**Requires verification during production code review:**
+- Confirm Pine v6's reference semantics for user-defined types inside `array<T>` behave as assumed here (in-place field mutation via a reference obtained from `array.get`, without needing `array.set`).
+- Confirm library function persistence semantics: that `var`-declared module-level state persists correctly per importing script instance across bar updates and replay.
+- Load-test the `advance()` linear scan against your expected registry size; no performance claims are made here per the frozen spec's explicit exclusion of performance concerns from the architecture.
