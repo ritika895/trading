@@ -1,0 +1,414 @@
+//@version=6
+indicator("Gold ICT Pro - Structure Classification Compiler Check", overlay = true)
+
+// =============================================================================
+// GOLD ICT PRO — STRUCTURE CLASSIFICATION
+// Phase 0 — Implementation [COMPLETE, first version]
+// Ref: Structure Classification Frozen Specification (Final)
+// Ref: Swing Database / Replacement Engine (frozen, this project) — upstream
+// Ref: BOS Engine (frozen, this project) — downstream consumer
+//
+// STATUS: First implementation against the frozen specification. Not yet
+// wired into the host script's main execution block (see "Host Script Call
+// Site" section below — reference only, not added).
+//
+// COMPILER FIX PASS NOTE: this file now includes a STUB DEPENDENCY BLOCK
+// (immediately below) purely so it compiles standalone in the Pine Editor
+// for verification. The stub block reproduces the REAL constant values
+// already frozen in the Swing Database (SWING_HIGH=1, SWING_LOW=-1,
+// STATUS_CONFIRMED=1, STATUS_REJECTED=3, NO_INDEX=-1) — not invented
+// values — but stubs getSwing() and currentConfirmedSwingIds with trivial
+// placeholders, since real data isn't needed to verify compilation.
+// DELETE THE ENTIRE STUB BLOCK before merging this file into the real
+// host script, which already defines all of these for real. The
+// "//@version=6" and indicator() lines above must also be removed before
+// merging, matching the same smoke-test convention already established
+// for the BOS Engine file.
+//
+// OWNERSHIP CORRECTION (frozen spec §7): swingStructureLabel (HH/HL/LH/LL)
+// is explicitly NOT owned or written by this module. It remains reserved
+// for a separate, not-yet-scheduled extension to the Swing Database's
+// finalizeConfirmedSwing(). This module contains no code referencing
+// swingStructureLabel at all.
+//
+// DIRECTION (frozen spec §8): not persisted anywhere in this module or the
+// Swing Database. Derived at read time from swingType, solely to satisfy
+// BOS's existing frozen string-based ("bullish"/"bearish") contract.
+//
+// ACTIVE-SET CAP (frozen spec §9): NOT IMPLEMENTED. No domain-derived cap
+// exists per this project's design review; an arbitrary numeric cap would
+// be an unjustified engineering assumption invented without basis. The
+// active set is allowed to grow unbounded in this version. This is a
+// disclosed, intentional deferral, not an oversight.
+//
+// EXECUTION ORDER WITHIN A BAR (frozen spec §10): activation runs first,
+// then retirement scans the full set including anything just activated on
+// this same bar. A swing that confirms already-invalidated by that bar's
+// close retires immediately rather than lingering one bar as falsely
+// "active."
+//
+// COMPLEXITY (frozen spec §11): the retirement scan is O(n) in TOTAL
+// historical swing count, not O(k)-active-only, because retired entries
+// remain in the array as permanent historical records (immutability
+// principle) rather than being removed. NOTE (carried from prior code
+// review, NOT fixed in this compiler-only pass): getSwing() is called
+// inside this loop, and getSwing() itself performs its own O(n) scan over
+// the Swing Database, making the true per-bar cost O(n_structcls x
+// n_swingdb), not O(n) as this line originally claimed. That is a logic/
+// performance issue, explicitly out of scope for this compiler fix pass
+// per current instructions — flagged here again so it isn't lost, not
+// silently corrected.
+//
+// INTEGRATION POINT (frozen spec §12): activation detection consumes the
+// Replacement Engine's EXISTING per-bar currentConfirmedSwingIds array
+// (already built for visualization, cleared each bar via
+// resetCurrentBarEvents()). This module does not duplicate confirmation-
+// detection logic — it reads the same per-bar event data the Replacement
+// Engine already produces. This is the concrete, named integration
+// dependency this module has on the Swing Database / Replacement Engine
+// sections of the host script.
+// [COMPILER FIX PASS CORRECTION]: the original header additionally listed
+// currentConfirmedSwingBars as a dependency. That was inaccurate —
+// currentConfirmedSwingBars is never referenced anywhere in this module's
+// code (activatedBar is populated from bar_idx, not from that array).
+// Removed from the dependency list below. Documentation-only correction;
+// no logic changed.
+//
+// CONFIRMED-BAR FIELD (frozen spec §13): this module's own activatedBar
+// is the bar on which THIS MODULE observed confirmation — the true
+// confirmation-bar index — distinct from the Swing Database's swingBar
+// (the pivot's own bar, set earlier). This resolves a gap flagged in this
+// project's original architecture review (no existing field previously
+// captured true confirmation-bar timing).
+//
+// ORDERING GUARANTEE TO BOS (frozen spec §14): structcls_getActive
+// StructuralSwingIds() returns IDs in ascending swing_id / insertion
+// order — deterministic, satisfying the cross-module ordering obligation
+// recorded at Sprint 2.5's closeout.
+//
+// KNOWN FOLLOW-UP, NOT PERFORMED HERE (frozen spec §15): BOS's
+// bos_isLifecycleConfirmed() currently compares against the string
+// literal "Confirmed". This module returns the Swing Database's actual
+// STATUS_CONFIRMED int constant from structcls_getLifecycleState(), not a
+// string. Wiring these together requires a one-line change inside BOS's
+// adapter function — the exact representation-swap seam that function was
+// deliberately designed to absorb, per its own frozen documentation. That
+// edit is NOT made in this file, since it means touching already-frozen
+// BOS code — explicitly out of scope for this deliverable.
+//
+// INTEGRATION ASSUMPTION: intended to be pasted into the existing
+// single-file indicator script, alongside Swing Detection / Swing
+// Database / Replacement Engine and the BOS Engine, using the
+// `structcls_` prefix as a namespace convention — matching the flat-
+// prefix pattern already proven by the BOS Engine (`bos_`), required
+// because Pine Script v6 does not support private, independently
+// compiled modules within one script.
+//
+// DEPENDENCIES on other sections of the host script (must already be
+// defined earlier in the file — see STUB DEPENDENCY BLOCK below for
+// standalone-compilation-only placeholders):
+//   - SWING_HIGH, SWING_LOW, STATUS_CONFIRMED, STATUS_REJECTED, NO_INDEX
+//     (Swing Database constants)
+//   - getSwing(int swingId) -> [type, price, bar, status, exists]
+//     (Swing Database public accessor)
+//   - currentConfirmedSwingIds (Replacement Engine per-bar event array)
+// =============================================================================
+
+
+// =============================================================================
+// STUB DEPENDENCY BLOCK — STANDALONE COMPILATION ONLY
+// DELETE THIS ENTIRE BLOCK when merging into the real host script, which
+// already defines all of these for real (Swing Database / Replacement
+// Engine sections). Constant VALUES below match the real, frozen Swing
+// Database exactly — not invented — only getSwing() and
+// currentConfirmedSwingIds are trivial placeholders, since no real data
+// is needed to verify this module compiles.
+// =============================================================================
+
+const int SWING_HIGH = 1
+const int SWING_LOW = -1
+const int STATUS_CONFIRMED = 1
+const int STATUS_REJECTED = 3
+const int NO_INDEX = -1
+
+var array<int> currentConfirmedSwingIds = array.new_int()
+
+getSwing(int swingId) =>
+    int stubType = SWING_HIGH
+    float stubPrice = na
+    int stubBar = NO_INDEX
+    int stubStatus = STATUS_REJECTED
+    bool stubExists = swingId < 0
+    [stubType, stubPrice, stubBar, stubStatus, stubExists]
+
+// =============================================================================
+// END STUB DEPENDENCY BLOCK
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Shared Tier 1 Utility — swing-agnostic, pure, stateless
+// (frozen spec §6)
+// -----------------------------------------------------------------------------
+// Computes whether closePrice has closed beyond level, in the invalidating
+// direction implied by swingType. This is the shared primitive both
+// Structure Classification (retirement) and, in the future, other
+// consumers (Liquidity, CHoCH) should use — a single source of truth for
+// "did price close through this level," decoupled from any one module's
+// interpretation of what that fact means.
+//
+// Does NOT modify or replace BOS's existing frozen
+// bos_evaluateBreak_CandleClose() — that function is left untouched by
+// design (frozen spec §6). This is a new, independent utility; BOS is not
+// wired to it in this deliverable.
+//
+// Tie-break: exact equality (closePrice == level) is NOT a cross — strict
+// inequality required, consistent with the same rule already frozen in
+// BOS (Edge Case E1).
+deriveLevelCrossed(float closePrice, float level, int swingType) =>
+    bool crossed = false
+    if swingType == SWING_HIGH
+        crossed := closePrice > level
+    else if swingType == SWING_LOW
+        crossed := closePrice < level
+    crossed
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Types / Constants
+// -----------------------------------------------------------------------------
+
+const int STRUCTCLS_STATE_ACTIVE  = 1
+const int STRUCTCLS_STATE_RETIRED = 2
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Persistent State (frozen spec §2, §5)
+// -----------------------------------------------------------------------------
+// Parallel arrays, not UDTs — consistent with this project's established
+// style (Swing Database, BOS's own bos_database structure). Every entry
+// ever activated remains permanently in these arrays (retired entries are
+// never removed), per the immutability principle already established
+// project-wide for confirmed historical records.
+
+var array<int> structcls_swingIds     = array.new_int()   // swing_id (Swing Database reference)
+var array<int> structcls_states       = array.new_int()   // STRUCTCLS_STATE_ACTIVE / STRUCTCLS_STATE_RETIRED
+var array<int> structcls_activatedBar = array.new_int()   // true confirmation-bar index (see file header)
+var array<int> structcls_retiredBar   = array.new_int()   // NO_INDEX until retired, then permanent
+
+// swing_id -> array index. Mirrors the identical pattern already
+// established and frozen in BOS (bos_swing_index) — O(1) lookup, presence
+// of a key also structurally guarantees no duplicate swing_id can ever be
+// pushed (see structcls_processBar), so no separate O(n^2) duplicate scan
+// is needed in validation, unlike the Swing Database's own check.
+var map<int, int> structcls_swingIndex = map.new<int, int>()
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Public Interface — Write Path (frozen spec §3, §4, §9, §10, §11, §12)
+// -----------------------------------------------------------------------------
+
+// Orchestrates the per-bar Structure Classification pipeline. Self-
+// contained: confirmed-bar gating happens inside this function, matching
+// the same self-protecting-API pattern already established in
+// bos_processBar() — correct regardless of caller discipline.
+//
+// ACTIVATION (frozen spec §3, §12): consumes the Replacement Engine's own
+// currentConfirmedSwingIds for this bar. Every swing_id present there that
+// is not already tracked becomes Active, unconditionally.
+//
+// RETIREMENT (frozen spec §4, §10): runs AFTER activation, over the FULL
+// tracked set (including anything just activated this bar). Uses
+// deriveLevelCrossed() against this bar's close. A swing already
+// invalidated by the very bar it confirmed on retires immediately rather
+// than lingering falsely Active for one extra bar.
+structcls_processBar(int bar_idx, float close_price) =>
+    if barstate.isconfirmed
+        // --- Activation ---
+        int confirmedCount = array.size(currentConfirmedSwingIds)
+
+        if confirmedCount > 0
+            for i = 0 to confirmedCount - 1
+                int newSwingId = array.get(currentConfirmedSwingIds, i)
+
+                if not map.contains(structcls_swingIndex, newSwingId)
+                    array.push(structcls_swingIds, newSwingId)
+                    array.push(structcls_states, STRUCTCLS_STATE_ACTIVE)
+                    array.push(structcls_activatedBar, bar_idx)
+                    array.push(structcls_retiredBar, NO_INDEX)
+                    map.put(structcls_swingIndex, newSwingId, array.size(structcls_swingIds) - 1)
+
+        // --- Retirement ---
+        // O(n) in total tracked swing count (frozen spec §11) — retired
+        // entries are never removed, so this scans every entry ever
+        // activated, not just currently-active ones.
+        int totalCount = array.size(structcls_swingIds)
+
+        if totalCount > 0
+            for i = 0 to totalCount - 1
+                if array.get(structcls_states, i) == STRUCTCLS_STATE_ACTIVE
+                    int activeSwingId = array.get(structcls_swingIds, i)
+                    [swingType, swingLevel, _, _, exists] = getSwing(activeSwingId)
+
+                    if exists and deriveLevelCrossed(close_price, swingLevel, swingType)
+                        array.set(structcls_states, i, STRUCTCLS_STATE_RETIRED)
+                        array.set(structcls_retiredBar, i, bar_idx)
+    na
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Public Interface — Read Path
+// -----------------------------------------------------------------------------
+// All accessors are read-only BY CONVENTION, matching the same
+// Pine-has-no-compiler-enforced-immutability caveat already documented for
+// BOS's own read accessors. Every value returned here is a primitive
+// (int/float/bool/string) — no live references, no UDTs, matching the
+// copy-not-reference discipline already established project-wide.
+
+// Returns the bounded set of currently active structural swing IDs, in
+// ascending swing_id / insertion order (frozen spec §14) — deterministic,
+// satisfying the cross-module ordering obligation owed to BOS.
+structcls_getActiveStructuralSwingIds() =>
+    array<int> result = array.new_int()
+    int total = array.size(structcls_swingIds)
+
+    if total > 0
+        for i = 0 to total - 1
+            if array.get(structcls_states, i) == STRUCTCLS_STATE_ACTIVE
+                array.push(result, array.get(structcls_swingIds, i))
+
+    result
+
+// Returns the swing's price level, sourced directly from the Swing
+// Database via the existing getSwing() accessor — no duplicated storage.
+structcls_getLevel(int swingId) =>
+    [_, price, _, _, exists] = getSwing(swingId)
+    exists ? price : na
+
+// Returns the true confirmation-bar index — the bar on which THIS MODULE
+// observed the swing's confirmation (frozen spec §13) — NOT the Swing
+// Database's swingBar (the pivot's own, earlier bar).
+structcls_getConfirmedBar(int swingId) =>
+    int result = NO_INDEX
+
+    if map.contains(structcls_swingIndex, swingId)
+        int idx = map.get(structcls_swingIndex, swingId)
+        result := array.get(structcls_activatedBar, idx)
+
+    result
+
+// Returns "bullish" / "bearish", derived at read time from the Swing
+// Database's swingType (frozen spec §8) — never persisted. Exists solely
+// to satisfy BOS's existing frozen string-based direction contract; not
+// a new independent concept.
+structcls_getDirection(int swingId) =>
+    [swingType, _, _, _, exists] = getSwing(swingId)
+    string result = ""
+
+    if exists
+        result := swingType == SWING_HIGH ? "bullish" : "bearish"
+
+    result
+
+// Pass-through of the Swing Database's own lifecycle status for this
+// swing_id — always STATUS_CONFIRMED for anything reachable through this
+// module in practice, per this module's own activation guarantee. Returns
+// the Swing Database's actual int constant, NOT a string — see file
+// header "KNOWN FOLLOW-UP" regarding BOS's adapter.
+structcls_getLifecycleState(int swingId) =>
+    [_, _, _, status, exists] = getSwing(swingId)
+    exists ? status : STATUS_REJECTED
+
+// Convenience membership check — true if swingId is currently Active.
+structcls_isStructurallyActive(int swingId) =>
+    bool result = false
+
+    if map.contains(structcls_swingIndex, swingId)
+        int idx = map.get(structcls_swingIndex, swingId)
+        result := array.get(structcls_states, idx) == STRUCTCLS_STATE_ACTIVE
+
+    result
+
+// Returns the bar_idx this swing was retired on, or NO_INDEX if it has
+// not been retired (or is not tracked at all). Exposed for debug/
+// visualization use, matching the same purpose already established for
+// the original interface reference document's equivalent accessor.
+structcls_getRetirementBar(int swingId) =>
+    int result = NO_INDEX
+
+    if map.contains(structcls_swingIndex, swingId)
+        int idx = map.get(structcls_swingIndex, swingId)
+        result := array.get(structcls_retiredBar, idx)
+
+    result
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Internal Validation
+// -----------------------------------------------------------------------------
+// Lightweight integrity check, matching the discipline already established
+// throughout this project. Not wired to any specific debug-mode input in
+// this module (Structure Classification has none of its own) — available
+// for the host script's own validation plumbing to call as needed.
+
+structcls_isValidState(int stateValue) =>
+    stateValue == STRUCTCLS_STATE_ACTIVE or stateValue == STRUCTCLS_STATE_RETIRED
+
+// No duplicate-ID scan is included here, unlike the Swing Database's own
+// O(n^2) check — duplicates are structurally impossible by construction,
+// since structcls_processBar() only ever pushes a new entry after an
+// explicit map.contains() guard (mirroring the identical, already-frozen
+// pattern in bos_recordBreak()). This is a deliberate, justified omission,
+// not an oversight.
+structcls_databaseIsValid() =>
+    bool valid = true
+    int size = array.size(structcls_swingIds)
+    int statesSize = array.size(structcls_states)
+    int activatedSize = array.size(structcls_activatedBar)
+    int retiredSize = array.size(structcls_retiredBar)
+
+    if statesSize != size or activatedSize != size or retiredSize != size
+        valid := false
+
+    if size > 0
+        for i = 0 to size - 1
+            if not structcls_isValidState(array.get(structcls_states, i))
+                valid := false
+
+    valid
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Host Script Call Site (NOT added — reference only)
+// -----------------------------------------------------------------------------
+// structcls_processBar() is self-contained (confirmed-bar gating happens
+// inside it), matching bos_processBar()'s own pattern. Required ordering,
+// per this project's already-established execution sequence (Swing
+// Database -> Structure Classification -> BOS):
+//
+//   [ Swing Database / Replacement Engine's own per-bar processing runs
+//     first, populating currentConfirmedSwingIds for this bar ]
+//
+//   structcls_processBar(bar_index, close)
+//
+//   bos_processBar(bar_index, close, na)
+//
+// This call site is NOT added yet — editing the host script's main
+// execution block is outside this file's scope, and requires the actual
+// merged single-file script to exist first.
+
+
+// -----------------------------------------------------------------------------
+// SECTION: Standalone Compilation Placeholder
+// -----------------------------------------------------------------------------
+// This module contains no plotting logic of its own (it is a pure data/
+// state module). A hidden, invisible plot is required so TradingView
+// accepts this file as a standalone indicator() for compiler verification.
+// display = display.none means nothing is drawn on the chart; no visual
+// debugging is introduced, no engine behavior is changed. When merged
+// into the real host script, this line is redundant with that script's
+// own existing plotshape() calls (Candidate Detection Engine) and can be
+// safely removed — but leaving it in is harmless either way, since it is
+// invisible and has no side effects.
+plot(close, display = display.none)
+
