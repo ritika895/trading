@@ -1,0 +1,852 @@
+// =============================================================================
+// LIQUIDITY ENGINE  (Patch Revision — Production Fixes Applied)
+// Pine Script v6 Library — Implementation of the Frozen Architecture
+// Specification (Final), ICT/SMC Liquidity Interpretation Module
+// =============================================================================
+//
+// PATCH NOTES (see accompanying changelog for full detail):
+//   - FIX (correctness): OUTCOME_UNDETERMINED no longer uses barstate.islast
+//     (which re-fires every realtime tick and can lock in a premature,
+//     repainting verdict). Now uses barstate.islastconfirmedhistory, which
+//     fires exactly once, only when no further historical data will arrive.
+//   - FIX (correctness): reinforcement of an Equal-Level cluster whose
+//     mapped object has already RESOLVED no longer mutates that terminal
+//     object. A new object is created for the new cluster occurrence and
+//     the reference map is repointed to it; the historical resolved object
+//     is left untouched, per the frozen "resolved objects are never reused"
+//     rule.
+//   - IMPROVEMENT (perf/maintainability): active objects are tracked in a
+//     dedicated live-id list so advance() and getActiveObjects() do not
+//     need to scan the entire (ever-growing) historical registry every bar.
+//   - IMPROVEMENT (robustness): query functions return CLONED
+//     LiquidityObject/LiquidityEvent instances, not live references into
+//     the internal registry, closing the foot-gun where a caller could
+//     mutate returned values and silently corrupt engine state.
+//   - IMPROVEMENT (policy flexibility): reactionWindowBars and
+//     stalenessBars accept 0 as a valid, intentional policy value
+//     (immediate resolution / no grace period), rather than hard-rejecting
+//     it via runtime.error.
+//   - FIX (compiler, CE10088): Pine v6 forbids a user-defined function from
+//     reassigning a variable declared at module/global scope. The object-id
+//     and event-id counters could not be incremented as globals inside
+//     f_createObject()/f_emitEvent().
+//   - FIX (compiler, CE10180): Pine v6 additionally forbids any EXPORTED
+//     function from depending — directly or transitively — on a module
+//     `var` global at all (not just reassigning it; referencing it in any
+//     way). submitSwingFact()/submitEqualLevelFact()/submitSessionFact()/
+//     advance()/getActiveObjects()/getResolvedObjects()/getObjectById()/
+//     objectExists()/getEventLog()/getEventsForObject() all transitively
+//     touched g_registry, g_idIndexMap, g_liveIds, g_equalLevelRefMap, and
+//     g_eventLog via internal helpers, which is exactly what CE10180
+//     disallows.
+//
+//     RESOLUTION: all persistent state (registry, id-index map, live-id
+//     list, equal-level reference map, event log, and BOTH id counters)
+//     is now bundled into one exported user-defined type,
+//     LiquidityEngineState. There is no longer any module-scope `var`
+//     holding engine state at all. The IMPORTING script owns an instance
+//     of this type (created once via the exported newState() constructor
+//     and held in its OWN `var`), and passes that instance as the first
+//     argument to every other exported function. Mutating the FIELDS of an
+//     object received as a function parameter is legal in Pine even inside
+//     exported functions, because it mutates a heap object through a
+//     reference the caller supplied — it is not a reassignment of any
+//     module-scope binding, so CE10180 does not apply to it.
+//
+//     This is also a strict improvement over the prior singleton design:
+//     a caller can now instantiate more than one independent
+//     LiquidityEngineState (e.g. one per symbol, timeframe, or config)
+//     within the same script, each with its own independent, correctly
+//     scoped id counters, registry, and event log — something a
+//     library-owned global singleton could never support. The
+//     function-local `var` counters from the CE10088 patch are removed:
+//     they would have caused nextObjectId/nextEventId to be silently
+//     SHARED across every LiquidityEngineState instance a caller created,
+//     which is exactly the bug this design eliminates. Counters are now
+//     ordinary fields on the state object, incremented via
+//     `state.nextObjectId += 1`, giving each instance its own count.
+//
+//     UNAVOIDABLE API NOTE: every exported function gains one new leading
+//     parameter, `LiquidityEngineState state`. This is the smallest change
+//     that satisfies the compiler; there is no Pine v6-legal way to keep
+//     engine state inside the library itself while any exported function
+//     touches it. No other parameter, return type, ordering, or semantic
+//     changed. No trading logic, resolution rule, or lifecycle transition
+//     changed.
+//   - FIX (compiler/runtime, empty-array loop direction): every bounded
+//     `for i = 0 to array.size(x) - 1` / `for i = array.size(x) - 1 to 0`
+//     loop relied on Pine's implicit step-direction inference (from/to
+//     compared once, at loop start). That inference is wrong whenever the
+//     target array is EMPTY: e.g. `for i = 0 to -1` infers a descending
+//     step (since 0 > -1) and executes 2 spurious out-of-bounds iterations
+//     instead of 0; `for i = -1 to 0` infers an ascending step and does
+//     the same. This affected advance(), getActiveObjects(),
+//     getResolvedObjects(), getEventLog(), and getEventsForObject() — all
+//     of which can legitimately run against an empty collection (e.g. the
+//     very first call, before any facts are submitted). Every such loop
+//     now specifies an explicit `by 1` or `by -1`, whose continuation test
+//     is defined by the step's own sign rather than by comparing
+//     endpoints, so the empty-collection case now correctly executes zero
+//     iterations. Runtime-correctness fix only; iteration order and
+//     per-element behavior are unchanged.
+//
+// All fixes and improvements below are internal implementation changes
+// only, plus the one unavoidable `state` parameter described above. No
+// architectural concept, lifecycle stage, resolution classification, event
+// type, or trading-logic behavior was added, removed, or altered in meaning.
+//
+// -----------------------------------------------------------------------------
+// 1. MODULE HEADER
+// -----------------------------------------------------------------------------
+//
+// PURPOSE
+//   Interpret already-confirmed structural facts (swings, equal-level
+//   clusters, session extremes) as inferred order-flow concentrations
+//   ("liquidity"), track their state over their lifetime, and report how
+//   they are resolved. This module answers exactly one question:
+//   "Where is liquidity inferred to rest, and what has happened to it?"
+//   It answers no other question.
+//
+// RESPONSIBILITIES
+//   - Instantiate liquidity objects from structural facts supplied by
+//     upstream modules (Structure Classification, Session Engine).
+//   - Classify each liquidity object by origin type.
+//   - Track each object through its lifecycle:
+//         Formed -> Active -> Approached -> Resolving -> Resolved
+//   - Detect interaction between live price and existing liquidity objects
+//     (approach, trigger, rejection/continuation, staleness).
+//   - Classify resolution outcome (Swept / Breached-Continuation /
+//     Invalidated-Stale / Outcome-Undetermined / Pre-Resolved-At-Formation).
+//   - Emit immutable liquidity events.
+//   - Retain resolved liquidity objects for historical/analytical query.
+//
+// NON-RESPONSIBILITIES
+//   - Does NOT detect swings, swing confirmation, or swing invalidation.
+//   - Does NOT detect Equal High/Low clustering.
+//   - Does NOT compute session boundaries or session-derived extremes.
+//   - Does NOT determine trend, bias, Change-of-Character, or
+//     Break-of-Structure.
+//   - Does NOT make entry, exit, or risk decisions.
+//   - Does NOT recompute or second-guess any upstream module's
+//     classification. All upstream facts are treated as finalized and
+//     immutable at the point they are submitted.
+//   - Does NOT fabricate an outcome when data is insufficient to confirm one.
+//
+// DEPENDENCIES
+//   Upstream (required, external, not implemented here):
+//     - Structure Classification module:
+//         supplies confirmed swing facts and confirmed Equal High/Low
+//         cluster facts, each carrying a finalized trade-through-since-
+//         formation tag.
+//     - Session Engine module:
+//         supplies confirmed session-derived extreme facts (PDH, PDL,
+//         weekly high/low, session high/low).
+//   This module performs NO detection of its own on raw price to produce
+//   these facts. It only consumes them via its public submission API.
+//
+// STATE OWNERSHIP (see CE10180 patch note above for the full rationale)
+//   The importing script creates and owns exactly one (or more, if it
+//   wants independent parallel engines) LiquidityEngineState instance(s):
+//
+//       var state = LiquidityEngineLib.newState()
+//
+//   and passes `state` as the first argument to every other exported
+//   function below. The library itself holds no persistent state.
+//
+// INTEGRATION ORDER (per bar, required call order)
+//   1. Upstream modules finalize their per-bar classification first.
+//   2. Any NEW confirmed structural facts for this bar are submitted via
+//      submitSwingFact() / submitEqualLevelFact() / submitSessionFact().
+//   3. advance() is called exactly once per bar to process interaction
+//      (approach / trigger / resolution) for all non-resolved objects
+//      against the current bar's high/low/close.
+//   4. Downstream modules query getActiveObjects() / getResolvedObjects() /
+//      getEventLog() only AFTER advance() has run for the current bar.
+//
+// PUBLIC API (see section 7 for full documentation)
+//   newState()                                   -> LiquidityEngineState
+//   submitSwingFact(state, ...)                  -> int objectId
+//   submitEqualLevelFact(state, ...)             -> int objectId
+//   submitSessionFact(state, ...)                -> int objectId
+//   advance(state, ...)                          -> void
+//   getActiveObjects(state)                      -> array<LiquidityObject>   (clones)
+//   getResolvedObjects(state)                    -> array<LiquidityObject>   (clones)
+//   getObjectById(state, id)                     -> LiquidityObject          (clone)
+//   objectExists(state, id)                      -> bool
+//   getEventLog(state)                           -> array<LiquidityEvent>    (clones)
+//   getEventsForObject(state, id)                -> array<LiquidityEvent>    (clones)
+//
+// REPLAY-SAFETY GUARANTEE
+//   All state transitions are driven exclusively by:
+//     (a) facts explicitly submitted by the caller, and
+//     (b) the current bar's high/low/close/bar_index.
+//   No transition depends on wall-clock time, execution order across
+//   unrelated objects, or any value not deterministically reproducible
+//   from the historical bar series. The OUTCOME_UNDETERMINED path uses
+//   barstate.islastconfirmedhistory specifically because it is the one
+//   barstate flag that is deterministic and reproducible across replay —
+//   it marks a fixed point in the historical series rather than a moving
+//   realtime condition. Replaying the same fact/price sequence always
+//   yields the same object states and the same event log, for a given
+//   state instance.
+//
+// NON-REPAINTING GUARANTEE
+//   - advance() must be called only with the currently closed/confirmed
+//     bar's high/low/close (i.e., on bar close, or on confirmed historical
+//     bars). This module performs no lookahead and does not reference
+//     future bars at any point.
+//   - Once an event is appended to the event log, it is never modified,
+//     reordered, or deleted. Once an object transitions to RESOLVED, it
+//     is terminal — no later bar, and no later fact submission (including
+//     Equal-Level reinforcement), can alter a past resolution outcome.
+//
+// LIFECYCLE SUMMARY
+//   FORMED      -> instantaneous creation state; immediately promoted to
+//                  ACTIVE unless the upstream fact indicates the level was
+//                  already traded through prior to submission, in which
+//                  case the object is instantiated directly as RESOLVED
+//                  (PRE_RESOLVED_AT_FORMATION), per retention policy.
+//   ACTIVE      -> object is live and being evaluated each bar for
+//                  proximity, trigger, and staleness.
+//   APPROACHED  -> price is within the configured proximity band but has
+//                  not yet triggered the level. Reversible back to ACTIVE.
+//   RESOLVING   -> internal sub-condition (not a separate externally
+//                  meaningful lifecycle stage per the frozen architecture)
+//                  representing "trigger has occurred, outcome pending"
+//                  while the reaction window elapses.
+//   RESOLVED    -> terminal state. Branches into exactly one resolution
+//                  classification: SWEPT, BREACHED_CONTINUATION,
+//                  INVALIDATED_STALE, OUTCOME_UNDETERMINED, or
+//                  PRE_RESOLVED_AT_FORMATION. Once reached, an object is
+//                  never mutated again by any code path in this module.
+//
+// =============================================================================
+
+//@version=6
+library("LiquidityEngine", overlay = true)
+
+// -----------------------------------------------------------------------------
+// 2. INTERNAL CONSTANTS
+// -----------------------------------------------------------------------------
+// Named constants only. No magic numbers or inline string literals are used
+// for classification values anywhere below this section.
+
+// --- Lifecycle state constants -----------------------------------------------
+const string STATE_FORMED     = "FORMED"
+const string STATE_ACTIVE     = "ACTIVE"
+const string STATE_APPROACHED = "APPROACHED"
+const string STATE_RESOLVING  = "RESOLVING"    // internal sub-condition
+const string STATE_RESOLVED   = "RESOLVED"
+
+// --- Resolution classification constants ------------------------------------
+const string RES_NONE                      = "NONE"
+const string RES_SWEPT                     = "SWEPT"
+const string RES_BREACHED_CONTINUATION     = "BREACHED_CONTINUATION"
+const string RES_INVALIDATED_STALE         = "INVALIDATED_STALE"
+const string RES_OUTCOME_UNDETERMINED      = "OUTCOME_UNDETERMINED"
+const string RES_PRE_RESOLVED_AT_FORMATION = "PRE_RESOLVED_AT_FORMATION"
+
+// --- Origin type constants ---------------------------------------------------
+const string ORIGIN_SWING       = "SWING"
+const string ORIGIN_EQUAL_LEVEL = "EQUAL_LEVEL"
+const string ORIGIN_SESSION     = "SESSION"
+const string ORIGIN_RANGE       = "RANGE"
+
+// --- Orientation constants ----------------------------------------------------
+// BUY_SIDE  : liquidity resting above a high (buy-stops / breakout buys)
+// SELL_SIDE : liquidity resting below a low  (sell-stops / breakout sells)
+const string ORIENTATION_BUY_SIDE  = "BUY_SIDE"
+const string ORIENTATION_SELL_SIDE = "SELL_SIDE"
+
+// --- Event type constants -----------------------------------------------------
+const string EVT_FORMED                = "FORMED"
+const string EVT_APPROACHED            = "APPROACHED"
+const string EVT_REINFORCED            = "REINFORCED"
+const string EVT_SWEPT                 = "SWEPT"
+const string EVT_BREACHED_CONTINUATION = "BREACHED_CONTINUATION"
+const string EVT_INVALIDATED           = "INVALIDATED"
+const string EVT_OUTCOME_UNDETERMINED  = "OUTCOME_UNDETERMINED"
+const string EVT_PRE_RESOLVED          = "PRE_RESOLVED"
+
+// --- Sentinel values ------------------------------------------------------------
+const int NO_BAR = -1   // sentinel for "not yet set" bar-index fields
+
+// =============================================================================
+// 3. TYPE DEFINITIONS
+// =============================================================================
+
+// A single liquidity object. One instance represents one tracked liquidity
+// pool, from formation through to terminal resolution. Instances are never
+// deleted; resolved instances are retained in the registry for historical
+// query (see Ownership Rules / Resolution Rules in the frozen spec).
+export type LiquidityObject
+    int    id                       // unique identifier, assigned at creation
+    string originType               // ORIGIN_* constant
+    string orientation              // ORIENTATION_* constant
+    float  level                    // reference price level
+    float  toleranceOffset          // price-unit tolerance beyond level required to trigger
+    float  proximityBand            // price-unit band defining "Approached" proximity
+    int    stalenessBars            // bars after formation, with no trigger, before Invalidated/Stale
+    int    reactionWindowBars       // externally supplied policy value; bars allowed to resolve after trigger
+    string lifecycleState           // STATE_* constant
+    string resolutionClass          // RES_* constant (RES_NONE until resolved)
+    int    formationBar             // bar_index at creation
+    int    triggerBar               // bar_index at which price exceeded the level (NO_BAR if not yet triggered)
+    int    resolutionBar            // bar_index at which the object reached RESOLVED (NO_BAR until resolved)
+    int    reinforcementCount       // number of confirmed additional touches (equal-level origin only)
+    bool   tradeThroughAtFormation  // upstream-supplied fact: was the level already exceeded at confirmation time
+    bool   approached                // current approach flag (true while in STATE_APPROACHED)
+    int    originRefId               // traceability reference to the originating upstream fact (never used for recomputation)
+
+// A single immutable liquidity event. Events are append-only and are never
+// edited or removed once emitted (see Event Model, frozen spec section 16).
+export type LiquidityEvent
+    int    eventId
+    string eventType          // EVT_* constant
+    int    objectId
+    int    barIndex
+    float  price
+    string resolutionClass    // RES_NONE when not applicable to this event type
+
+// PATCH (CE10180 fix): all persistent engine state, bundled into a single
+// exported type. There is exactly one of these per independent "engine"
+// the caller wants; the caller creates and owns it (see newState() below,
+// and the STATE OWNERSHIP note in section 1). No module-scope `var` holds
+// any of this data any longer — it all lives on instances of this type,
+// which are passed explicitly into every other exported function. This is
+// what makes it legal for those functions to read/mutate it: they are
+// mutating fields of a heap object received as a parameter, not
+// reassigning a script-global binding, so CE10180 does not apply.
+export type LiquidityEngineState
+    array<LiquidityObject> registry            // single source of truth for all objects, active and resolved; never has entries removed
+    map<int, int>           idIndexMap           // objectId -> index into registry
+    array<int>              liveIds              // ids of all currently non-RESOLVED objects (perf: avoids scanning full registry)
+    map<int, int>           equalLevelRefMap      // upstream Equal-High/Low originRefId -> the objectId CURRENTLY representing that cluster
+    array<LiquidityEvent>   eventLog             // immutable, append-only event log, in emission order
+    int                     nextObjectId          // monotonic counter; sole source of new object ids for THIS state instance
+    int                     nextEventId           // monotonic counter; sole source of new event ids for THIS state instance
+
+// =============================================================================
+// 4. PERSISTENT STORAGE
+// =============================================================================
+// PATCH (CE10180 fix): this module declares NO persistent module-scope
+// state of its own. Every field that used to be a `var` global here
+// (g_registry, g_idIndexMap, g_liveIds, g_equalLevelRefMap, g_eventLog,
+// and the two id counters) is now a field of LiquidityEngineState
+// (section 3), owned by the calling script as an explicit instance and
+// threaded through every function call. This section is retained, empty,
+// purely so the section numbering in this file matches the frozen
+// document structure — there is nothing to declare here anymore.
+
+// =============================================================================
+// 5. INTERNAL VALIDATION HELPERS
+// =============================================================================
+
+// Raises a runtime error if `condition` is false. Used at every public API
+// boundary to detect invalid states/inputs defensively rather than silently
+// producing an inconsistent registry. Pure — no state dependency, legal to
+// call from anywhere.
+f_assert(bool condition, string message) =>
+    if not condition
+        runtime.error("LiquidityEngine: " + message)
+
+// Validates that a string is one of the recognized origin-type constants.
+f_isValidOriginType(string originType) =>
+    originType == ORIGIN_SWING or originType == ORIGIN_EQUAL_LEVEL or originType == ORIGIN_SESSION or originType == ORIGIN_RANGE
+
+// Validates that a string is one of the recognized orientation constants.
+f_isValidOrientation(string orientation) =>
+    orientation == ORIENTATION_BUY_SIDE or orientation == ORIENTATION_SELL_SIDE
+
+// Validates that a string is one of the recognized lifecycle-state constants.
+// Used only internally, to guard transition logic against an impossible state.
+f_isValidLifecycleState(string state) =>
+    state == STATE_FORMED or state == STATE_ACTIVE or state == STATE_APPROACHED or state == STATE_RESOLVING or state == STATE_RESOLVED
+
+// =============================================================================
+// 6. INTERNAL HELPERS
+// =============================================================================
+
+// ---- Registry access -----------------------------------------------------------
+
+// Returns a direct (LIVE, mutable) reference to the object with the given
+// id within the given state, or `na` if the id is not present. Used only
+// internally by mutation paths. Public query functions must NOT return
+// this raw reference — they must return a clone (see f_cloneObject /
+// section 7).
+f_getObjectRef(LiquidityEngineState state, int objectId) =>
+    LiquidityObject result = na
+    if map.contains(state.idIndexMap, objectId)
+        idx = map.get(state.idIndexMap, objectId)
+        result := array.get(state.registry, idx)
+    result
+
+// Removes an id from the given state's live-id set. Called exactly once,
+// at the moment an object transitions to RESOLVED, from whichever
+// resolution path triggers it. Safe no-op if the id is not present
+// (defensive).
+f_removeFromLiveSet(LiquidityEngineState state, int objectId) =>
+    idx = array.indexof(state.liveIds, objectId)
+    if idx >= 0
+        array.remove(state.liveIds, idx)
+    true
+
+// ---- Cloning (query safety) -------------------------------------------------------
+
+// Returns a value-copy of a LiquidityObject, so that callers of public
+// query functions can never mutate internal engine state through a
+// returned reference. Pure — takes no state, since it only copies the
+// object handed to it.
+f_cloneObject(LiquidityObject obj) =>
+    LiquidityObject.new(
+         id                     = obj.id,
+         originType              = obj.originType,
+         orientation             = obj.orientation,
+         level                   = obj.level,
+         toleranceOffset         = obj.toleranceOffset,
+         proximityBand           = obj.proximityBand,
+         stalenessBars           = obj.stalenessBars,
+         reactionWindowBars      = obj.reactionWindowBars,
+         lifecycleState          = obj.lifecycleState,
+         resolutionClass         = obj.resolutionClass,
+         formationBar            = obj.formationBar,
+         triggerBar              = obj.triggerBar,
+         resolutionBar           = obj.resolutionBar,
+         reinforcementCount      = obj.reinforcementCount,
+         tradeThroughAtFormation = obj.tradeThroughAtFormation,
+         approached              = obj.approached,
+         originRefId             = obj.originRefId)
+
+// Returns a value-copy of a LiquidityEvent. Pure, same rationale as above.
+f_cloneEvent(LiquidityEvent evt) =>
+    LiquidityEvent.new(
+         eventId         = evt.eventId,
+         eventType       = evt.eventType,
+         objectId        = evt.objectId,
+         barIndex        = evt.barIndex,
+         price           = evt.price,
+         resolutionClass = evt.resolutionClass)
+
+// ---- Event emission --------------------------------------------------------------
+
+// Appends a new, immutable event to the given state's event log. This is
+// the ONLY function in the module permitted to write to a state's
+// eventLog, and it only ever appends — never edits or removes prior
+// entries.
+//
+// PATCH (CE10180 fix): the event-id counter is now state.nextEventId — a
+// field on the caller-owned state object — instead of either a module
+// global (CE10180) or a function-local var shared across all instances
+// (the CE10088-only fix's latent flaw). Incrementing it here mutates the
+// field of an object passed in as a parameter, which is legal even inside
+// code paths reachable from exported functions.
+f_emitEvent(LiquidityEngineState state, string eventType, int objectId, int barIndex, float price, string resolutionClass) =>
+    evt = LiquidityEvent.new(
+         eventId         = state.nextEventId,
+         eventType       = eventType,
+         objectId        = objectId,
+         barIndex        = barIndex,
+         price           = price,
+         resolutionClass = resolutionClass)
+    array.push(state.eventLog, evt)
+    state.nextEventId += 1
+    true
+
+// ---- Object creation ----------------------------------------------------------------
+
+// Creates a new liquidity object from a validated, finalized upstream fact,
+// within the given state. Handles the Formed -> Active immediate
+// transition, and the already-traded-through-at-formation retention
+// branch, exactly per the frozen spec's Q1/State-Transition-Rules
+// resolution.
+//
+// PATCH (policy flexibility): reactionWindowBars and stalenessBars accept
+// 0 as a valid, deliberate policy value:
+//   - reactionWindowBars == 0 means "resolve strictly on the trigger bar's
+//     close, no grace period" — a legitimate choice for tight/scalping
+//     contexts.
+//   - stalenessBars == 0 would mean "never allow untouched dwell time,
+//     invalidate immediately if not triggered same bar as formation" — an
+//     unusual but not incoherent policy choice, left to the caller.
+// Negative values remain rejected, since they are not meaningful in either
+// case.
+//
+// PATCH (CE10180 fix): the object-id counter is now state.nextObjectId —
+// see the rationale on f_emitEvent above; identical reasoning applies.
+f_createObject(LiquidityEngineState state, string originType, string orientation, float level, float toleranceOffset, float proximityBand, int stalenessBars, int reactionWindowBars, int formationBar, bool tradeThroughAtFormation, int originRefId) =>
+    f_assert(f_isValidOriginType(originType), "invalid originType supplied to f_createObject")
+    f_assert(f_isValidOrientation(orientation), "invalid orientation supplied to f_createObject")
+    f_assert(reactionWindowBars >= 0, "reactionWindowBars must be zero or a positive policy value")
+    f_assert(stalenessBars >= 0, "stalenessBars must be zero or a positive policy value")
+
+    newId = state.nextObjectId
+    state.nextObjectId += 1
+
+    obj = LiquidityObject.new(
+         id                     = newId,
+         originType              = originType,
+         orientation             = orientation,
+         level                   = level,
+         toleranceOffset         = toleranceOffset,
+         proximityBand           = proximityBand,
+         stalenessBars           = stalenessBars,
+         reactionWindowBars      = reactionWindowBars,
+         lifecycleState          = STATE_FORMED,
+         resolutionClass         = RES_NONE,
+         formationBar            = formationBar,
+         triggerBar              = NO_BAR,
+         resolutionBar           = NO_BAR,
+         reinforcementCount      = 0,
+         tradeThroughAtFormation = tradeThroughAtFormation,
+         approached              = false,
+         originRefId             = originRefId)
+
+    array.push(state.registry, obj)
+    map.put(state.idIndexMap, newId, array.size(state.registry) - 1)
+
+    f_emitEvent(state, EVT_FORMED, newId, formationBar, level, RES_NONE)
+
+    if tradeThroughAtFormation
+        // Retention policy: the level was already exceeded before this
+        // engine could begin tracking interaction against it. It is
+        // retained for historical completeness but MUST NOT be given a
+        // fabricated Swept/Breached-Continuation verdict, since the actual
+        // rejection/continuation behavior was never observed by this
+        // module. See frozen spec, State Transition Rules.
+        obj.lifecycleState := STATE_RESOLVED
+        obj.resolutionClass := RES_PRE_RESOLVED_AT_FORMATION
+        obj.resolutionBar := formationBar
+        f_emitEvent(state, EVT_PRE_RESOLVED, newId, formationBar, level, RES_PRE_RESOLVED_AT_FORMATION)
+        // Note: never added to state.liveIds — it is terminal from the
+        // instant of creation.
+    else
+        // Formed -> Active is immediate (frozen spec, State Transition Rules).
+        obj.lifecycleState := STATE_ACTIVE
+        array.push(state.liveIds, newId)
+
+    newId
+
+// ---- Interaction detection --------------------------------------------------------
+
+// Wick/extremity-based trigger test. Uses high/low, never close/body, per
+// the frozen Sweep Definition. Requires penetration strictly beyond the
+// level plus tolerance — mere contact does not trigger. Pure — no state
+// dependency.
+f_isTriggered(LiquidityObject obj, float high, float low) =>
+    obj.orientation == ORIENTATION_BUY_SIDE ? high > (obj.level + obj.toleranceOffset) : low < (obj.level - obj.toleranceOffset)
+
+// Proximity-band test for the Approached state. True when price has not yet
+// triggered the level but is within `proximityBand` price units of it.
+// Pure — no state dependency.
+f_isInProximityBand(LiquidityObject obj, float high, float low) =>
+    float distance = obj.orientation == ORIENTATION_BUY_SIDE ? (obj.level - high) : (low - obj.level)
+    distance >= 0.0 and distance <= obj.proximityBand
+
+// Rejection test used during the Resolving sub-condition: has price closed
+// back on the level's originating side. Pure — no state dependency.
+f_isRejected(LiquidityObject obj, float close) =>
+    obj.orientation == ORIENTATION_BUY_SIDE ? close < obj.level : close > obj.level
+
+// ---- Per-object per-bar processing --------------------------------------------------
+
+// Processes one object currently in ACTIVE or APPROACHED state for the
+// current bar: checks trigger first, then proximity-band transitions, then
+// staleness. Order matters and is fixed: a trigger always takes precedence
+// over a same-bar proximity or staleness evaluation.
+//
+// PATCH (CE10180 fix): now takes `state` explicitly, since it calls
+// f_emitEvent()/f_removeFromLiveSet(), both of which require it.
+f_processActiveOrApproached(LiquidityEngineState state, LiquidityObject obj, int barIndex, float high, float low, float close) =>
+    if f_isTriggered(obj, high, low)
+        obj.lifecycleState := STATE_RESOLVING
+        obj.triggerBar := barIndex
+        obj.approached := false
+        // No event emitted on trigger itself; per frozen spec, Resolving is
+        // an internal sub-condition, not an externally exposed event.
+        // Object remains in state.liveIds while RESOLVING — only true
+        // RESOLVED removes it (handled in f_processResolving / staleness
+        // branch below).
+    else
+        inBand = f_isInProximityBand(obj, high, low)
+        if inBand and not obj.approached
+            obj.approached := true
+            obj.lifecycleState := STATE_APPROACHED
+            f_emitEvent(state, EVT_APPROACHED, obj.id, barIndex, close, RES_NONE)
+        else if (not inBand) and obj.approached
+            // Reverts to Active: mere proximity without contact must not
+            // consume or invalidate the object (frozen spec, Transition Rules).
+            obj.approached := false
+            obj.lifecycleState := STATE_ACTIVE
+
+        // Staleness check applies whenever the object has not yet triggered.
+        if (barIndex - obj.formationBar) >= obj.stalenessBars
+            obj.lifecycleState := STATE_RESOLVED
+            obj.resolutionClass := RES_INVALIDATED_STALE
+            obj.resolutionBar := barIndex
+            f_emitEvent(state, EVT_INVALIDATED, obj.id, barIndex, close, RES_INVALIDATED_STALE)
+            f_removeFromLiveSet(state, obj.id)
+
+// Processes one object currently in the Resolving sub-condition: evaluates
+// rejection first (can resolve as SWEPT on any bar within the window,
+// including the trigger bar itself), then window exhaustion
+// (BREACHED_CONTINUATION), then, only once no further historical data will
+// arrive, OUTCOME_UNDETERMINED.
+//
+// PATCH (correctness): the "data has ended" check uses
+// barstate.islastconfirmedhistory instead of barstate.islast.
+// barstate.islast is true on every tick of the still-forming realtime bar
+// and re-evaluates repeatedly as that bar updates — using it here would
+// let an object be finalized as OUTCOME_UNDETERMINED prematurely, before
+// the reaction window has actually elapsed and before a rejection close
+// that arrives later on the same or a subsequent bar could be observed.
+// That is a repainting/non-determinism defect. barstate.islastconfirmedhistory
+// fires exactly once, on the final bar of confirmed historical data, before
+// any realtime bar exists — the correct, deterministic, replay-safe
+// semantic match for "no more data is coming."
+//
+// PATCH (CE10180 fix): now takes `state` explicitly, for the same reason
+// as f_processActiveOrApproached above.
+f_processResolving(LiquidityEngineState state, LiquidityObject obj, int barIndex, float close) =>
+    barsElapsed = barIndex - obj.triggerBar
+
+    if f_isRejected(obj, close)
+        obj.lifecycleState := STATE_RESOLVED
+        obj.resolutionClass := RES_SWEPT
+        obj.resolutionBar := barIndex
+        f_emitEvent(state, EVT_SWEPT, obj.id, barIndex, close, RES_SWEPT)
+        f_removeFromLiveSet(state, obj.id)
+    else if barsElapsed >= obj.reactionWindowBars
+        obj.lifecycleState := STATE_RESOLVED
+        obj.resolutionClass := RES_BREACHED_CONTINUATION
+        obj.resolutionBar := barIndex
+        f_emitEvent(state, EVT_BREACHED_CONTINUATION, obj.id, barIndex, close, RES_BREACHED_CONTINUATION)
+        f_removeFromLiveSet(state, obj.id)
+    else if barstate.islastconfirmedhistory
+        // Data ends before the reaction window elapses and before rejection
+        // was observed. Do not fabricate a verdict.
+        obj.lifecycleState := STATE_RESOLVED
+        obj.resolutionClass := RES_OUTCOME_UNDETERMINED
+        obj.resolutionBar := barIndex
+        f_emitEvent(state, EVT_OUTCOME_UNDETERMINED, obj.id, barIndex, close, RES_OUTCOME_UNDETERMINED)
+        f_removeFromLiveSet(state, obj.id)
+
+// =============================================================================
+// 7. PUBLIC API
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// newState
+// Creates and returns a brand-new, empty LiquidityEngineState. The calling
+// script must hold the result in its OWN `var` so it persists across bars:
+//
+//     var state = LiquidityEngineLib.newState()
+//
+// Every other exported function below takes such a state as its first
+// argument. A script may call newState() more than once to run several
+// fully independent liquidity engines side by side (e.g. per symbol, per
+// timeframe, or per policy configuration) — each with its own registry,
+// event log, and id counters.
+// -----------------------------------------------------------------------------
+export newState() =>
+    LiquidityEngineState.new(
+         registry          = array.new<LiquidityObject>(),
+         idIndexMap        = map.new<int, int>(),
+         liveIds           = array.new<int>(),
+         equalLevelRefMap  = map.new<int, int>(),
+         eventLog          = array.new<LiquidityEvent>(),
+         nextObjectId      = 0,
+         nextEventId       = 0)
+
+// -----------------------------------------------------------------------------
+// submitSwingFact
+// Submits a confirmed swing-point fact from Structure Classification.
+// Structure Classification must have already finalized and attached the
+// trade-through-since-formation tag before calling this function — this
+// module performs no independent check of that condition.
+//
+// Params:
+//   state                    - the caller-owned LiquidityEngineState to mutate
+//   orientation              - ORIENTATION_BUY_SIDE or ORIENTATION_SELL_SIDE
+//   level                    - the confirmed swing price
+//   toleranceOffset          - price-unit tolerance beyond level required to trigger a sweep
+//   proximityBand            - price-unit band defining the Approached zone
+//   stalenessBars            - bars after formation, untouched, before Invalidated/Stale (0 permitted)
+//   reactionWindowBars       - externally supplied policy value (0 permitted; mechanism owned here, value owned upstream)
+//   formationBar             - bar_index of confirmation
+//   tradeThroughAtFormation  - finalized upstream fact: was the level already exceeded at confirmation
+//   originRefId              - traceability reference to the originating swing fact
+//
+// Returns: the new liquidity object's id.
+// -----------------------------------------------------------------------------
+export submitSwingFact(LiquidityEngineState state, string orientation, float level, float toleranceOffset, float proximityBand, int stalenessBars, int reactionWindowBars, int formationBar, bool tradeThroughAtFormation, int originRefId) =>
+    f_createObject(state, ORIGIN_SWING, orientation, level, toleranceOffset, proximityBand, stalenessBars, reactionWindowBars, formationBar, tradeThroughAtFormation, originRefId)
+
+// -----------------------------------------------------------------------------
+// submitEqualLevelFact
+// Submits a confirmed Equal-High/Low cluster fact from Structure
+// Classification. If `originRefId` already maps to an existing liquidity
+// object AND that object is still live (not yet RESOLVED), the existing
+// object's reinforcement count is incremented and a REINFORCED event is
+// emitted (frozen spec section 14).
+//
+// PATCH (correctness): if the mapped object has already reached RESOLVED
+// (e.g., it was swept, and a later fact reports another touch at the same
+// originRefId — such as a retest after the sweep), it is NEVER mutated.
+// Per the frozen architecture's rule that "a resolved object is never
+// reused for new activity," a brand-new liquidity object is created for
+// this new cluster occurrence, and the reference map is repointed to it.
+// The original resolved object is left fully intact for historical query.
+//
+// Returns: the id of the (new or reinforced) liquidity object.
+// -----------------------------------------------------------------------------
+export submitEqualLevelFact(LiquidityEngineState state, string orientation, float level, float toleranceOffset, float proximityBand, int stalenessBars, int reactionWindowBars, int formationBar, bool tradeThroughAtFormation, int originRefId) =>
+    int  resultId       = na
+    bool reinforcedLive = false
+
+    if map.contains(state.equalLevelRefMap, originRefId)
+        int mappedId = map.get(state.equalLevelRefMap, originRefId)
+        mappedObj = f_getObjectRef(state, mappedId)
+        f_assert(not na(mappedObj), "equal-level ref map points to a missing object")
+        if mappedObj.lifecycleState != STATE_RESOLVED
+            mappedObj.reinforcementCount += 1
+            f_emitEvent(state, EVT_REINFORCED, mappedId, formationBar, level, RES_NONE)
+            resultId := mappedId
+            reinforcedLive := true
+        // else: mapped object is terminal — fall through to creation below.
+        // The resolved object is NOT touched.
+
+    if not reinforcedLive
+        resultId := f_createObject(state, ORIGIN_EQUAL_LEVEL, orientation, level, toleranceOffset, proximityBand, stalenessBars, reactionWindowBars, formationBar, tradeThroughAtFormation, originRefId)
+        map.put(state.equalLevelRefMap, originRefId, resultId)
+
+    resultId
+
+// -----------------------------------------------------------------------------
+// submitSessionFact
+// Submits a confirmed session-derived extreme fact from the Session Engine
+// (e.g., PDH, PDL, weekly high/low, session high/low). Uses the identical
+// lifecycle and resolution machinery as swing-based and equal-level
+// liquidity (frozen spec section 15) — no separate resolution vocabulary.
+//
+// Returns: the new liquidity object's id.
+// -----------------------------------------------------------------------------
+export submitSessionFact(LiquidityEngineState state, string orientation, float level, float toleranceOffset, float proximityBand, int stalenessBars, int reactionWindowBars, int formationBar, bool tradeThroughAtFormation, int originRefId) =>
+    f_createObject(state, ORIGIN_SESSION, orientation, level, toleranceOffset, proximityBand, stalenessBars, reactionWindowBars, formationBar, tradeThroughAtFormation, originRefId)
+
+// -----------------------------------------------------------------------------
+// advance
+// Processes interaction detection for the current bar against every
+// liquidity object in `state` not yet in the RESOLVED state. Must be
+// called exactly once per bar, after any new facts for that bar have been
+// submitted, and only with the current (closing/confirmed) bar's
+// high/low/close.
+//
+// PATCH (perf/maintainability): iterates the dedicated live-id set
+// (state.liveIds) instead of scanning the full historical registry, so
+// cost per bar is proportional to the number of currently-unresolved
+// objects, not to the total historical object count.
+//
+// FIX (empty-array loop direction): iterates with an explicit `by -1`.
+// Without an explicit step, Pine infers loop direction once by comparing
+// the from/to endpoints; when state.liveIds is empty this infers the
+// WRONG (ascending) direction and executes two out-of-bounds iterations
+// instead of zero. An explicit negative step makes the continuation test
+// depend on the step's own sign, so the empty case correctly runs zero
+// times.
+//
+// Each object is still evaluated independently, so simultaneous
+// multi-level triggers (a single bar exceeding several stacked liquidity
+// levels) continue to be handled correctly with no special-case logic.
+// -----------------------------------------------------------------------------
+export advance(LiquidityEngineState state, int barIndex, float high, float low, float close) =>
+    // Snapshot the live-id count before the loop. Objects may be removed
+    // from state.liveIds mid-iteration as they resolve; iterating downward
+    // avoids skipping an element after a removal shifts subsequent indices.
+    for i = array.size(state.liveIds) - 1 to 0 by -1
+        objId = array.get(state.liveIds, i)
+        obj = f_getObjectRef(state, objId)
+        if not na(obj)
+            if obj.lifecycleState == STATE_RESOLVING
+                f_processResolving(state, obj, barIndex, close)
+            else if obj.lifecycleState == STATE_ACTIVE or obj.lifecycleState == STATE_APPROACHED
+                f_processActiveOrApproached(state, obj, barIndex, high, low, close)
+    true
+
+// -----------------------------------------------------------------------------
+// getActiveObjects
+// Returns CLONES of all liquidity objects in `state` NOT in the RESOLVED
+// state (i.e., Active, Approached, or Resolving). Read-only query;
+// returned instances are copies and do not share state with the internal
+// registry.
+//
+// FIX (empty-array loop direction): explicit `by 1` — see advance() note.
+// -----------------------------------------------------------------------------
+export getActiveObjects(LiquidityEngineState state) =>
+    array<LiquidityObject> result = array.new<LiquidityObject>()
+    for i = 0 to array.size(state.liveIds) - 1 by 1
+        objId = array.get(state.liveIds, i)
+        obj = f_getObjectRef(state, objId)
+        if not na(obj)
+            array.push(result, f_cloneObject(obj))
+    result
+
+// -----------------------------------------------------------------------------
+// getResolvedObjects
+// Returns CLONES of all liquidity objects in `state` currently in the
+// RESOLVED state, retained for historical/analytical query per the
+// Resolution Rules.
+//
+// FIX (empty-array loop direction): explicit `by 1` — see advance() note.
+// -----------------------------------------------------------------------------
+export getResolvedObjects(LiquidityEngineState state) =>
+    array<LiquidityObject> result = array.new<LiquidityObject>()
+    for i = 0 to array.size(state.registry) - 1 by 1
+        obj = array.get(state.registry, i)
+        if obj.lifecycleState == STATE_RESOLVED
+            array.push(result, f_cloneObject(obj))
+    result
+
+// -----------------------------------------------------------------------------
+// getObjectById
+// Lookup helper. Returns a CLONE of the liquidity object with the given id
+// within `state`, or `na` if no such object exists.
+// -----------------------------------------------------------------------------
+export getObjectById(LiquidityEngineState state, int objectId) =>
+    obj = f_getObjectRef(state, objectId)
+    na(obj) ? na : f_cloneObject(obj)
+
+// -----------------------------------------------------------------------------
+// objectExists
+// Validation helper. Returns true if the given id refers to a currently
+// registered liquidity object within `state`.
+// -----------------------------------------------------------------------------
+export objectExists(LiquidityEngineState state, int objectId) =>
+    map.contains(state.idIndexMap, objectId)
+
+// -----------------------------------------------------------------------------
+// getEventLog
+// Returns CLONES of the complete, immutable, append-only liquidity event
+// log for `state`, in emission order.
+//
+// FIX (empty-array loop direction): explicit `by 1` — see advance() note.
+// -----------------------------------------------------------------------------
+export getEventLog(LiquidityEngineState state) =>
+    array<LiquidityEvent> result = array.new<LiquidityEvent>()
+    for i = 0 to array.size(state.eventLog) - 1 by 1
+        array.push(result, f_cloneEvent(array.get(state.eventLog, i)))
+    result
+
+// -----------------------------------------------------------------------------
+// getEventsForObject
+// Lookup helper. Returns CLONES of all events pertaining to a specific
+// liquidity object id within `state`, in emission order.
+//
+// FIX (empty-array loop direction): explicit `by 1` — see advance() note.
+// -----------------------------------------------------------------------------
+export getEventsForObject(LiquidityEngineState state, int objectId) =>
+    array<LiquidityEvent> result = array.new<LiquidityEvent>()
+    for i = 0 to array.size(state.eventLog) - 1 by 1
+        evt = array.get(state.eventLog, i)
+        if evt.objectId == objectId
+            array.push(result, f_cloneEvent(evt))
+    result
