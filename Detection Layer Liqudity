@@ -1,0 +1,280 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Gold ICT Pro
+//@version=6
+
+// =====================================================================================================================
+// GOLD ICT PRO — LIQUIDITY ENGINE (DETECTION LAYER VERIFICATION BUILD)
+// =====================================================================================================================
+// Verification build: Detection Layer ONLY, all downstream modules DISABLED.
+// Purpose: Confirm that ta.pivothigh() / ta.pivotlow() are working correctly and that
+// the Detection Layer is creating candidates. Every confirmed pivot gets a label.
+// Every Single-Swing candidate gets a horizontal line showing its price level.
+//
+// Once this build shows pivots and lines correctly, we enable the Registry and Lifecycle Manager.
+// =====================================================================================================================
+
+indicator("GICTP-LE Verify", shorttitle = "GICTPDBG", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// =====================================================================================================================
+// CONFIGURATION LAYER
+// =====================================================================================================================
+
+grp_detect = "Detection Layer"
+i_swingLeft            = input.int(5, "Swing pivot lookback (left)", minval = 1, group = grp_detect)
+i_swingRight           = input.int(5, "Swing pivot lookback (right)", minval = 1, group = grp_detect)
+i_eqTolerancePoints    = input.float(3.0, "Equal High/Low tolerance (points)", minval = 0.0, step = 0.1, group = grp_detect)
+i_eqLookbackPivots     = input.int(12, "Equal High/Low: pivots scanned back", minval = 2, maxval = 50, group = grp_detect)
+i_trendlineMinSlopeAbs = input.float(0.0001, "Trendline: minimum |slope| (price/bar)", minval = 0.0, group = grp_detect)
+
+grp_viz = "Visualization"
+i_showPivotLabels      = input.bool(true, "Show confirmed pivot labels", group = grp_viz)
+i_showSwingLines       = input.bool(true, "Show Single-Swing liquidity lines", group = grp_viz)
+i_labelSize            = input.string("tiny", "Label size", options = ["tiny", "small", "normal"], group = grp_viz)
+i_maxVisualizationItems = input.int(100, "Max pivot labels / swing lines to show", minval = 10, maxval = 500, group = grp_viz)
+
+// =====================================================================================================================
+// CORE DATA MODEL
+// =====================================================================================================================
+
+enum PoolType
+    eq_highs        = "Equal Highs"
+    eq_lows         = "Equal Lows"
+    swing_high      = "Single-Swing High"
+    swing_low       = "Single-Swing Low"
+    trendline_high  = "Trendline High"
+    trendline_low   = "Trendline Low"
+    session_high    = "Session High"
+    session_low     = "Session Low"
+
+// Minimal candidate type — no state machine, no registry, just detection output
+type DetectionCandidate
+    PoolType  poolType
+    bool      isResistanceSide
+    float     priceLevel
+    int       detectedBar
+
+// Detection context
+type DetectionContext
+    float  pivotHighPrice
+    int    pivotHighBar
+    bool   hasPivotHigh
+    float  pivotLowPrice
+    int    pivotLowBar
+    bool   hasPivotLow
+
+// Visualization item (label or line) tracker
+type VizItem
+    int    itemType      // 0 = label, 1 = line
+    label  lbl           // non-na only if itemType == 0
+    line   ln            // non-na only if itemType == 1
+
+// =====================================================================================================================
+// GLOBAL STATE — Detection Layer Output Only
+// =====================================================================================================================
+
+var array<DetectionCandidate> g_swingCandidatesThisBar = array.new<DetectionCandidate>()
+var array<DetectionCandidate> g_swingCandidatesAllTime = array.new<DetectionCandidate>()
+
+// Ring buffers for Equal Highs/Lows detection (unchanged from original)
+var array<float> g_recentPivotHighPx  = array.new<float>()
+var array<int>   g_recentPivotHighBar = array.new<int>()
+var array<bool>  g_recentPivotHighUsedEq = array.new<bool>()
+var array<float> g_recentPivotLowPx   = array.new<float>()
+var array<int>   g_recentPivotLowBar  = array.new<int>()
+var array<bool>  g_recentPivotLowUsedEq = array.new<bool>()
+
+// Trendline tracking (unchanged)
+var array<float> g_prevPivotHighPx  = array.new<float>(1, na)
+var array<int>   g_prevPivotHighBar = array.new<int>(1, na)
+var array<float> g_prevPivotLowPx   = array.new<float>(1, na)
+var array<int>   g_prevPivotLowBar  = array.new<int>(1, na)
+
+// Visualization item tracking (labels and lines only, not detection state)
+var array<VizItem> g_vizItems = array.new<VizItem>()
+
+// =====================================================================================================================
+// INGESTION ADAPTER — Build detection context from ta.pivothigh/ta.pivotlow
+// =====================================================================================================================
+
+f_buildDetectionContext() =>
+    float ph = ta.pivothigh(i_swingLeft, i_swingRight)
+    float pl = ta.pivotlow(i_swingLeft, i_swingRight)
+    bool hasPh = not na(ph)
+    bool hasPl = not na(pl)
+    int phBar = hasPh ? bar_index - i_swingRight : -1
+    int plBar = hasPl ? bar_index - i_swingRight : -1
+
+    DetectionContext.new(ph, phBar, hasPh, pl, plBar, hasPl)
+
+// =====================================================================================================================
+// DETECTION LAYER — Creates candidate objects (visualization only, no state machine)
+// =====================================================================================================================
+
+f_makeCandidate(PoolType t, bool isResistance, float priceLevel, int detectedBar) =>
+    DetectionCandidate.new(t, isResistance, priceLevel, detectedBar)
+
+f_trimRing(array<float> px, array<int> bars, array<bool> used, int maxLen) =>
+    while array.size(px) > maxLen
+        array.shift(px)
+        array.shift(bars)
+        array.shift(used)
+
+detect_equalHighsLows(DetectionContext ctx) =>
+    if ctx.hasPivotHigh
+        array.push(g_recentPivotHighPx, ctx.pivotHighPrice)
+        array.push(g_recentPivotHighBar, ctx.pivotHighBar)
+        array.push(g_recentPivotHighUsedEq, false)
+        f_trimRing(g_recentPivotHighPx, g_recentPivotHighBar, g_recentPivotHighUsedEq, i_eqLookbackPivots)
+        n = array.size(g_recentPivotHighPx)
+        if n >= 2
+            float curPx = array.get(g_recentPivotHighPx, n - 1)
+            for i = n - 2 to 0
+                if not array.get(g_recentPivotHighUsedEq, i)
+                    priorPx = array.get(g_recentPivotHighPx, i)
+                    if math.abs(curPx - priorPx) <= i_eqTolerancePoints
+                        array.set(g_recentPivotHighUsedEq, i, true)
+                        array.set(g_recentPivotHighUsedEq, n - 1, true)
+                        lvl = math.max(curPx, priorPx)
+                        // Note: Equal Highs candidates are NOT drawn in verification build
+                        break
+
+    if ctx.hasPivotLow
+        array.push(g_recentPivotLowPx, ctx.pivotLowPrice)
+        array.push(g_recentPivotLowBar, ctx.pivotLowBar)
+        array.push(g_recentPivotLowUsedEq, false)
+        f_trimRing(g_recentPivotLowPx, g_recentPivotLowBar, g_recentPivotLowUsedEq, i_eqLookbackPivots)
+        n = array.size(g_recentPivotLowPx)
+        if n >= 2
+            float curPx = array.get(g_recentPivotLowPx, n - 1)
+            for i = n - 2 to 0
+                if not array.get(g_recentPivotLowUsedEq, i)
+                    priorPx = array.get(g_recentPivotLowPx, i)
+                    if math.abs(curPx - priorPx) <= i_eqTolerancePoints
+                        array.set(g_recentPivotLowUsedEq, i, true)
+                        array.set(g_recentPivotLowUsedEq, n - 1, true)
+                        lvl = math.min(curPx, priorPx)
+                        // Note: Equal Lows candidates are NOT drawn in verification build
+                        break
+
+detect_singleSwing(DetectionContext ctx) =>
+    // Every fresh pivot is a Single-Swing candidate — this WILL be drawn
+    if ctx.hasPivotHigh
+        cand = f_makeCandidate(PoolType.swing_high, true, ctx.pivotHighPrice, ctx.pivotHighBar)
+        array.push(g_swingCandidatesThisBar, cand)
+        array.push(g_swingCandidatesAllTime, cand)
+    if ctx.hasPivotLow
+        cand = f_makeCandidate(PoolType.swing_low, false, ctx.pivotLowPrice, ctx.pivotLowBar)
+        array.push(g_swingCandidatesThisBar, cand)
+        array.push(g_swingCandidatesAllTime, cand)
+
+detect_trendlineLiquidity(DetectionContext ctx) =>
+    // Trendline logic unchanged, but NO visualization in verification build
+    if ctx.hasPivotHigh
+        float prevHighPx  = array.get(g_prevPivotHighPx, 0)
+        int   prevHighBar = array.get(g_prevPivotHighBar, 0)
+        if not na(prevHighPx)
+            dBar = ctx.pivotHighBar - prevHighBar
+            if dBar > 0
+                slope = (ctx.pivotHighPrice - prevHighPx) / dBar
+                if math.abs(slope) >= i_trendlineMinSlopeAbs
+                    // Trendline detected; reserved for future implementation
+                    _ = true
+        array.set(g_prevPivotHighPx, 0, ctx.pivotHighPrice)
+        array.set(g_prevPivotHighBar, 0, ctx.pivotHighBar)
+
+    if ctx.hasPivotLow
+        float prevLowPx  = array.get(g_prevPivotLowPx, 0)
+        int   prevLowBar = array.get(g_prevPivotLowBar, 0)
+        if not na(prevLowPx)
+            dBar = ctx.pivotLowBar - prevLowBar
+            if dBar > 0
+                slope = (ctx.pivotLowPrice - prevLowPx) / dBar
+                if math.abs(slope) >= i_trendlineMinSlopeAbs
+                    // Trendline detected; reserved for future implementation
+                    _ = true
+        array.set(g_prevPivotLowPx, 0, ctx.pivotLowPrice)
+        array.set(g_prevPivotLowBar, 0, ctx.pivotLowBar)
+
+// =====================================================================================================================
+// VISUALIZATION — Detection Layer Output Only (with retention policy)
+// =====================================================================================================================
+
+// Enforce max visualization items: delete oldest when limit exceeded
+f_enforceVisualizationLimit() =>
+    while array.size(g_vizItems) > i_maxVisualizationItems
+        oldest = array.shift(g_vizItems)
+        if oldest.itemType == 0 and not na(oldest.lbl)
+            label.delete(oldest.lbl)
+        else if oldest.itemType == 1 and not na(oldest.ln)
+            line.delete(oldest.ln)
+
+viz_renderPivots(DetectionContext ctx) =>
+    if i_showPivotLabels
+        if ctx.hasPivotHigh
+            lbl = label.new(ctx.pivotHighBar, ctx.pivotHighPrice, "PH: " + str.tostring(math.round(ctx.pivotHighPrice, 2)),
+                 style = label.style_label_down, color = color.new(color.red, 30), textcolor = color.white,
+                 size = i_labelSize == "tiny" ? size.tiny : (i_labelSize == "small" ? size.small : size.normal))
+            vizItem = VizItem.new(0, lbl, na)
+            array.push(g_vizItems, vizItem)
+        if ctx.hasPivotLow
+            lbl = label.new(ctx.pivotLowBar, ctx.pivotLowPrice, "PL: " + str.tostring(math.round(ctx.pivotLowPrice, 2)),
+                 style = label.style_label_up, color = color.new(color.lime, 30), textcolor = color.white,
+                 size = i_labelSize == "tiny" ? size.tiny : (i_labelSize == "small" ? size.small : size.normal))
+            vizItem = VizItem.new(0, lbl, na)
+            array.push(g_vizItems, vizItem)
+    f_enforceVisualizationLimit()
+
+viz_renderSwingLines() =>
+    if i_showSwingLines
+        for cand in g_swingCandidatesThisBar
+            if cand.poolType == PoolType.swing_high
+                // Draw red horizontal line for swing high
+                ln = line.new(cand.detectedBar, cand.priceLevel, bar_index, cand.priceLevel,
+                     color = color.new(color.red, 50), width = 1, style = line.style_dashed)
+                vizItem = VizItem.new(1, na, ln)
+                array.push(g_vizItems, vizItem)
+            else if cand.poolType == PoolType.swing_low
+                // Draw green horizontal line for swing low
+                ln = line.new(cand.detectedBar, cand.priceLevel, bar_index, cand.priceLevel,
+                     color = color.new(color.lime, 50), width = 1, style = line.style_dashed)
+                vizItem = VizItem.new(1, na, ln)
+                array.push(g_vizItems, vizItem)
+    f_enforceVisualizationLimit()
+
+// =====================================================================================================================
+// MAIN ORCHESTRATION — Detection Layer ONLY
+// =====================================================================================================================
+
+// Build detection context on every bar
+ctx = f_buildDetectionContext()
+
+// Process only on confirmed bars
+if barstate.isconfirmed
+    // Run detectors
+    detect_equalHighsLows(ctx)
+    detect_singleSwing(ctx)
+    detect_trendlineLiquidity(ctx)
+    
+    // Visualize output
+    viz_renderPivots(ctx)
+    viz_renderSwingLines()
+    
+    // Clear this-bar candidates for next bar
+    array.clear(g_swingCandidatesThisBar)
+
+// =====================================================================================================================
+// STATUS TABLE — Shows detection statistics
+// =====================================================================================================================
+
+var table g_statusTable = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    candCount = array.size(g_swingCandidatesAllTime)
+    table.cell(g_statusTable, 0, 0, "DETECTION VERIFY", bgcolor = color.new(color.navy, 0), text_color = color.white)
+    table.cell(g_statusTable, 1, 0, "", bgcolor = color.new(color.navy, 0))
+    table.cell(g_statusTable, 0, 1, "Total Swing Candidates", text_color = color.white)
+    table.cell(g_statusTable, 1, 1, str.tostring(candCount), text_color = candCount > 0 ? color.green : color.red)
+    table.cell(g_statusTable, 0, 2, "Registry Enabled", text_color = color.white)
+    table.cell(g_statusTable, 1, 2, "NO (DISABLED)", text_color = color.orange)
+    table.cell(g_statusTable, 0, 3, "Lifecycle Enabled", text_color = color.white)
+    table.cell(g_statusTable, 1, 3, "NO (DISABLED)", text_color = color.orange)
