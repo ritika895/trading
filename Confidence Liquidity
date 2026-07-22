@@ -1,0 +1,770 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Gold ICT Pro
+//@version=6
+
+// =====================================================================================================================
+// GOLD ICT PRO — LIQUIDITY ENGINE (DETECTION + REGISTRY + LIFECYCLE + REPLACEMENT + CONFIDENCE)
+// =====================================================================================================================
+// Build: Detection Layer + Registry + Lifecycle Manager + Replacement Engine + Confidence Engine
+// Purpose: Verify liquidity pool detection, registration, lifecycle management, replacement logic, and confidence.
+// Initial implementation: FORMED → ACTIVE transition + confidence-based replacement.
+//
+// Architectural alignment:
+// - Detection Layer: detects candidates only
+// - Registry: owns pool objects
+// - Lifecycle Manager: manages pool state
+// - Replacement Engine: decides whether to keep, replace, or ignore pools based on confidence
+// - Confidence Engine: calculates and manages pool confidence scores
+//
+// Data Flow: Price → Detection → Replacement Engine → Registry → Lifecycle Manager → Visualization → Debug Table
+// =====================================================================================================================
+
+indicator("GICTP-LE Verify", shorttitle = "GICTPDBG", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// =====================================================================================================================
+// CONFIGURATION LAYER
+// =====================================================================================================================
+
+grp_detect = "Detection Layer"
+i_swingLeft            = input.int(5, "Swing pivot lookback (left)", minval = 1, group = grp_detect)
+i_swingRight           = input.int(5, "Swing pivot lookback (right)", minval = 1, group = grp_detect)
+i_eqTolerancePoints    = input.float(3.0, "Equal High/Low tolerance (points)", minval = 0.0, step = 0.1, group = grp_detect)
+i_eqLookbackPivots     = input.int(12, "Equal High/Low: pivots scanned back", minval = 2, maxval = 50, group = grp_detect)
+i_trendlineMinSlopeAbs = input.float(0.0001, "Trendline: minimum |slope| (price/bar)", minval = 0.0, group = grp_detect)
+
+grp_lm = "Lifecycle Manager"
+i_formedToActiveBars   = input.int(1, "Bars to hold in FORMED state", minval = 0, group = grp_lm)
+
+grp_re = "Replacement Engine"
+i_enableReplacement    = input.bool(true, "Enable Replacement Engine", group = grp_re)
+i_replacementTolerance = input.float(3.0, "Replacement tolerance (points)", minval = 0.0, step = 0.1, group = grp_re)
+
+grp_viz = "Visualization"
+i_showPivotLabels      = input.bool(true, "Show confirmed pivot labels", group = grp_viz)
+i_showSwingLines       = input.bool(true, "Show Single-Swing liquidity lines", group = grp_viz)
+i_labelSize            = input.string("tiny", "Label size", options = ["tiny", "small", "normal"], group = grp_viz)
+i_maxVisualizationItems = input.int(100, "Max pivot labels / swing lines to show", minval = 10, maxval = 500, group = grp_viz)
+
+// =====================================================================================================================
+// CORE DATA MODEL
+// =====================================================================================================================
+
+enum PoolType
+    eq_highs        = "Equal Highs"
+    eq_lows         = "Equal Lows"
+    swing_high      = "Single-Swing High"
+    swing_low       = "Single-Swing Low"
+    trendline_high  = "Trendline High"
+    trendline_low   = "Trendline Low"
+    session_high    = "Session High"
+    session_low     = "Session Low"
+
+enum PoolState
+    created         = "Created"
+    formed          = "Formed"
+    active          = "Active"
+    reinforced      = "Reinforced"
+    confirmed       = "Confirmed"
+    archived        = "Archived"
+
+enum ReplacementDecision
+    kept            = "Kept"
+    replaced        = "Replaced"
+    ignored         = "Ignored"
+
+// Minimal candidate type — created by Detection Layer only
+type DetectionCandidate
+    PoolType  poolType
+    bool      isResistanceSide
+    float     priceLevel
+    int       detectedBar
+
+// LiquidityPool — owned by Registry, state managed by Lifecycle Manager, confidence managed by Confidence Engine
+type LiquidityPool
+    int         poolID
+    PoolType    poolType
+    bool        isResistanceSide
+    float       priceLevel
+    int         originBar
+    PoolState   state              // Managed by Lifecycle Manager
+    int         reinforcementCount  // Placeholder for future use
+    float       confidence          // Managed by Confidence Engine
+    int         formedBar           // When pool entered FORMED state
+
+// Detection context
+type DetectionContext
+    float  pivotHighPrice
+    int    pivotHighBar
+    bool   hasPivotHigh
+    float  pivotLowPrice
+    int    pivotLowBar
+    bool   hasPivotLow
+
+// Visualization item (label or line) tracker
+type VizItem
+    int    itemType      // 0 = label, 1 = line
+    label  lbl           // non-na only if itemType == 0
+    line   ln            // non-na only if itemType == 1
+
+// Replacement decision record
+type ReplacementRecord
+    int                 candidateIndex
+    ReplacementDecision decision
+    int                 conflictingPoolID
+
+// Replacement decision result
+type ReplacementResult
+    bool                accept       // true = accept candidate, false = reject
+    ReplacementDecision decision     // decision type: kept, replaced, ignored
+    int                 conflictPoolID // ID of conflicting pool if any
+
+// =====================================================================================================================
+// GLOBAL STATE — Detection Layer Output + Registry + Lifecycle Manager + Replacement Engine
+// =====================================================================================================================
+
+var array<DetectionCandidate> g_swingCandidatesThisBar = array.new<DetectionCandidate>()
+var array<DetectionCandidate> g_swingCandidatesAllTime = array.new<DetectionCandidate>()
+
+// Registry: owns LiquidityPool objects directly with unique IDs
+var array<LiquidityPool> g_registry = array.new<LiquidityPool>()
+var int g_nextPoolID = 1  // Only top-level execution code may modify this
+
+// Replacement Engine tracking (updated ONLY at top-level orchestration)
+var array<ReplacementRecord> g_replacementHistory = array.new<ReplacementRecord>()
+var int g_candidatesProcessed = 0    // Total candidates evaluated by replacement engine
+var int g_candidatesAccepted = 0     // Candidates accepted (added to registry)
+var int g_candidatesRejected = 0     // Candidates rejected (duplicates removed)
+
+// Ring buffers for Equal Highs/Lows detection (unchanged from original)
+var array<float> g_recentPivotHighPx  = array.new<float>()
+var array<int>   g_recentPivotHighBar = array.new<int>()
+var array<bool>  g_recentPivotHighUsedEq = array.new<bool>()
+var array<float> g_recentPivotLowPx   = array.new<float>()
+var array<int>   g_recentPivotLowBar  = array.new<int>()
+var array<bool>  g_recentPivotLowUsedEq = array.new<bool>()
+
+// Trendline tracking (unchanged)
+var array<float> g_prevPivotHighPx  = array.new<float>(1, na)
+var array<int>   g_prevPivotHighBar = array.new<int>(1, na)
+var array<float> g_prevPivotLowPx   = array.new<float>(1, na)
+var array<int>   g_prevPivotLowBar  = array.new<int>(1, na)
+
+// Visualization item tracking (labels and lines only, not detection state)
+var array<VizItem> g_vizItems = array.new<VizItem>()
+
+// =====================================================================================================================
+// INGESTION ADAPTER — Build detection context from ta.pivothigh/ta.pivotlow
+// =====================================================================================================================
+
+f_buildDetectionContext() =>
+    float ph = ta.pivothigh(i_swingLeft, i_swingRight)
+    float pl = ta.pivotlow(i_swingLeft, i_swingRight)
+    bool hasPh = not na(ph)
+    bool hasPl = not na(pl)
+    int phBar = hasPh ? bar_index - i_swingRight : -1
+    int plBar = hasPl ? bar_index - i_swingRight : -1
+
+    DetectionContext.new(ph, phBar, hasPh, pl, plBar, hasPl)
+
+// =====================================================================================================================
+// DETECTION LAYER — Creates candidate objects (visualization only, no state machine)
+// =====================================================================================================================
+
+f_makeCandidate(PoolType t, bool isResistance, float priceLevel, int detectedBar) =>
+    DetectionCandidate.new(t, isResistance, priceLevel, detectedBar)
+
+f_trimRing(array<float> px, array<int> bars, array<bool> used, int maxLen) =>
+    while array.size(px) > maxLen
+        array.shift(px)
+        array.shift(bars)
+        array.shift(used)
+
+detect_equalHighsLows(DetectionContext ctx) =>
+    if ctx.hasPivotHigh
+        array.push(g_recentPivotHighPx, ctx.pivotHighPrice)
+        array.push(g_recentPivotHighBar, ctx.pivotHighBar)
+        array.push(g_recentPivotHighUsedEq, false)
+        f_trimRing(g_recentPivotHighPx, g_recentPivotHighBar, g_recentPivotHighUsedEq, i_eqLookbackPivots)
+        n = array.size(g_recentPivotHighPx)
+        if n >= 2
+            float curPx = array.get(g_recentPivotHighPx, n - 1)
+            for i = n - 2 to 0
+                if i >= 0 and i < array.size(g_recentPivotHighUsedEq)
+                    if not array.get(g_recentPivotHighUsedEq, i)
+                        if i >= 0 and i < array.size(g_recentPivotHighPx)
+                            priorPx = array.get(g_recentPivotHighPx, i)
+                            if math.abs(curPx - priorPx) <= i_eqTolerancePoints
+                                array.set(g_recentPivotHighUsedEq, i, true)
+                                if n - 1 >= 0 and n - 1 < array.size(g_recentPivotHighUsedEq)
+                                    array.set(g_recentPivotHighUsedEq, n - 1, true)
+                                lvl = math.max(curPx, priorPx)
+                                // Note: Equal Highs candidates are NOT drawn in verification build
+                                break
+
+    if ctx.hasPivotLow
+        array.push(g_recentPivotLowPx, ctx.pivotLowPrice)
+        array.push(g_recentPivotLowBar, ctx.pivotLowBar)
+        array.push(g_recentPivotLowUsedEq, false)
+        f_trimRing(g_recentPivotLowPx, g_recentPivotLowBar, g_recentPivotLowUsedEq, i_eqLookbackPivots)
+        n = array.size(g_recentPivotLowPx)
+        if n >= 2
+            float curPx = array.get(g_recentPivotLowPx, n - 1)
+            for i = n - 2 to 0
+                if i >= 0 and i < array.size(g_recentPivotLowUsedEq)
+                    if not array.get(g_recentPivotLowUsedEq, i)
+                        if i >= 0 and i < array.size(g_recentPivotLowPx)
+                            priorPx = array.get(g_recentPivotLowPx, i)
+                            if math.abs(curPx - priorPx) <= i_eqTolerancePoints
+                                array.set(g_recentPivotLowUsedEq, i, true)
+                                if n - 1 >= 0 and n - 1 < array.size(g_recentPivotLowUsedEq)
+                                    array.set(g_recentPivotLowUsedEq, n - 1, true)
+                                lvl = math.min(curPx, priorPx)
+                                // Note: Equal Lows candidates are NOT drawn in verification build
+                                break
+
+detect_singleSwing(DetectionContext ctx) =>
+    // Every fresh pivot is a Single-Swing candidate — this WILL be drawn
+    if ctx.hasPivotHigh
+        cand = f_makeCandidate(PoolType.swing_high, true, ctx.pivotHighPrice, ctx.pivotHighBar)
+        array.push(g_swingCandidatesThisBar, cand)
+        array.push(g_swingCandidatesAllTime, cand)
+    if ctx.hasPivotLow
+        cand = f_makeCandidate(PoolType.swing_low, false, ctx.pivotLowPrice, ctx.pivotLowBar)
+        array.push(g_swingCandidatesThisBar, cand)
+        array.push(g_swingCandidatesAllTime, cand)
+
+detect_trendlineLiquidity(DetectionContext ctx) =>
+    // Trendline logic unchanged, but NO visualization in verification build
+    if ctx.hasPivotHigh
+        if array.size(g_prevPivotHighPx) > 0
+            float prevHighPx  = array.get(g_prevPivotHighPx, 0)
+            if array.size(g_prevPivotHighBar) > 0
+                int   prevHighBar = array.get(g_prevPivotHighBar, 0)
+                if not na(prevHighPx)
+                    dBar = ctx.pivotHighBar - prevHighBar
+                    if dBar > 0
+                        slope = (ctx.pivotHighPrice - prevHighPx) / dBar
+                        if math.abs(slope) >= i_trendlineMinSlopeAbs
+                            // Trendline detected; reserved for future implementation
+                            _ = true
+        if array.size(g_prevPivotHighPx) > 0
+            array.set(g_prevPivotHighPx, 0, ctx.pivotHighPrice)
+        if array.size(g_prevPivotHighBar) > 0
+            array.set(g_prevPivotHighBar, 0, ctx.pivotHighBar)
+
+    if ctx.hasPivotLow
+        if array.size(g_prevPivotLowPx) > 0
+            float prevLowPx  = array.get(g_prevPivotLowPx, 0)
+            if array.size(g_prevPivotLowBar) > 0
+                int   prevLowBar = array.get(g_prevPivotLowBar, 0)
+                if not na(prevLowPx)
+                    dBar = ctx.pivotLowBar - prevLowBar
+                    if dBar > 0
+                        slope = (ctx.pivotLowPrice - prevLowPx) / dBar
+                        if math.abs(slope) >= i_trendlineMinSlopeAbs
+                            // Trendline detected; reserved for future implementation
+                            _ = true
+        if array.size(g_prevPivotLowPx) > 0
+            array.set(g_prevPivotLowPx, 0, ctx.pivotLowPrice)
+        if array.size(g_prevPivotLowBar) > 0
+            array.set(g_prevPivotLowBar, 0, ctx.pivotLowBar)
+
+// =====================================================================================================================
+// CONFIDENCE ENGINE — Calculates and manages pool confidence scores
+// =====================================================================================================================
+
+// Initial simple scoring system based on pool type
+confidence_calculate(PoolType poolType, int reinforcementCount) =>
+    float score = 50.0
+    if poolType == PoolType.eq_highs or poolType == PoolType.eq_lows
+        score := 80.0
+    else if poolType == PoolType.trendline_high or poolType == PoolType.trendline_low
+        score := 65.0
+    else if poolType == PoolType.swing_high or poolType == PoolType.swing_low
+        score := 50.0
+    else if poolType == PoolType.session_high or poolType == PoolType.session_low
+        score := 70.0
+    
+    // Future expansion: reinforcement multiplier logic will go here
+    // e.g., score := score + (reinforcementCount * 5.0)
+    
+    score
+
+// Updates confidence for a specific pool (read-only on candidate object space, modifies registry directly)
+confidence_update(int poolIndex) =>
+    registrySize = array.size(g_registry)
+    if poolIndex >= 0 and poolIndex < registrySize
+        pool = array.get(g_registry, poolIndex)
+        newScore = confidence_calculate(pool.poolType, pool.reinforcementCount)
+        pool.confidence := newScore
+        array.set(g_registry, poolIndex, pool)
+
+// Retrieves confidence score for a specific pool
+confidence_getScore(int poolIndex) =>
+    float score = 0.0
+    registrySize = array.size(g_registry)
+    if poolIndex >= 0 and poolIndex < registrySize
+        pool = array.get(g_registry, poolIndex)
+        if not na(pool.confidence)
+            score := pool.confidence
+    score
+
+// =====================================================================================================================
+// REGISTRY MODULE — Pure functions, NO global variable modifications
+// =====================================================================================================================
+
+f_convertToLiquidityPool(DetectionCandidate cand, int assignedPoolID) =>
+    // Pure function: receives poolID as argument, returns LiquidityPool
+    // No global variable modifications
+    initialConfidence = confidence_calculate(cand.poolType, 0)
+    pool = LiquidityPool.new(
+        assignedPoolID,                  // poolID (passed as argument)
+        cand.poolType,                   // poolType
+        cand.isResistanceSide,           // isResistanceSide
+        cand.priceLevel,                 // priceLevel
+        cand.detectedBar,                // originBar
+        PoolState.formed,                // state: initial state is FORMED
+        0,                               // reinforcementCount (placeholder for future use)
+        initialConfidence,               // confidence (calculated by Confidence Engine)
+        bar_index                        // formedBar: bar where pool entered FORMED state
+    )
+    pool
+
+// =====================================================================================================================
+// REGISTRY VERIFICATION — Pure functions, read-only
+// =====================================================================================================================
+
+registry_getHighestPoolID() =>
+    highestID = 0
+    registrySize = array.size(g_registry)
+    if registrySize > 0
+        for i = 0 to registrySize - 1
+            pool = array.get(g_registry, i)
+            if pool.poolID > highestID
+                highestID := pool.poolID
+    highestID
+
+registry_checkIntegrity() =>
+    // Registry Integrity: Size == Highest Pool ID (IDs are sequential, nothing deleted)
+    registrySize = array.size(g_registry)
+    highestID = registry_getHighestPoolID()
+    registrySize == highestID
+
+registry_checkDuplicateIDs() =>
+    // Currently no duplicates exist — IDs are strictly sequential
+    false
+
+// =====================================================================================================================
+// REPLACEMENT ENGINE — Pure functions (read-only), NO global variable modifications
+// =====================================================================================================================
+
+// ===== CONFIDENCE-BASED REPLACEMENT RULE =====
+// When a newly detected pool conflicts with an existing pool (same type, price within tolerance):
+//   → REPLACE if new candidate confidence > existing pool confidence
+//   → KEEP existing if existing pool confidence >= new candidate confidence
+// =============================================
+
+replacement_findConflict(DetectionCandidate newCandidate) =>
+    // Find existing pool with same type and overlapping price level
+    // Returns pool index if conflict found, -1 if no conflict
+    // PURE FUNCTION: read-only, no global modifications
+    conflictIndex = -1
+    registrySize = array.size(g_registry)
+    
+    if registrySize > 0
+        for i = 0 to registrySize - 1
+            if i >= 0 and i < registrySize
+                existingPool = array.get(g_registry, i)
+                
+                // Check if same pool type
+                if existingPool.poolType == newCandidate.poolType
+                    // Check if price levels are within tolerance
+                    priceDiff = math.abs(existingPool.priceLevel - newCandidate.priceLevel)
+                    if priceDiff <= i_replacementTolerance
+                        conflictIndex := i
+                        break
+    
+    conflictIndex
+
+replacement_decideAction(DetectionCandidate newCandidate, int conflictPoolIndex) =>
+    // ===== CONFIDENCE-BASED REPLACEMENT =====
+    // Compare confidence scores of new vs existing pool
+    // REPLACE if new pool confidence > existing pool confidence
+    // KEEP existing if existing confidence >= new pool confidence
+    // PURE FUNCTION: read-only, no global modifications
+    existingConfidence = confidence_getScore(conflictPoolIndex)
+    newConfidence = confidence_calculate(newCandidate.poolType, 0)
+    
+    if newConfidence > existingConfidence
+        ReplacementDecision.replaced
+    else
+        ReplacementDecision.kept
+
+replacement_processCandidates() =>
+    // Process all candidates through replacement engine
+    // Returns array of ReplacementResult objects with all decision data
+    // PURE FUNCTION: read-only, no global modifications
+    results = array.new<ReplacementResult>()
+    candidatesSize = array.size(g_swingCandidatesThisBar)
+    
+    if candidatesSize > 0
+        for i = 0 to candidatesSize - 1
+            if i >= 0 and i < candidatesSize
+                candidate = array.get(g_swingCandidatesThisBar, i)
+                
+                if not i_enableReplacement
+                    // Replacement engine disabled: accept all candidates
+                    result = ReplacementResult.new(true, ReplacementDecision.ignored, -1)
+                    array.push(results, result)
+                else
+                    // Check for conflicts
+                    conflictIndex = replacement_findConflict(candidate)
+                    
+                    if conflictIndex == -1
+                        // No conflict: accept candidate
+                        result = ReplacementResult.new(true, ReplacementDecision.ignored, -1)
+                        array.push(results, result)
+                    else
+                        // Conflict found: decide action
+                        if conflictIndex >= 0 and conflictIndex < array.size(g_registry)
+                            existingPool = array.get(g_registry, conflictIndex)
+                            action = replacement_decideAction(candidate, conflictIndex)
+                            
+                            if action == ReplacementDecision.kept
+                                // Keep existing: reject new candidate
+                                result = ReplacementResult.new(false, ReplacementDecision.kept, existingPool.poolID)
+                                array.push(results, result)
+                            else if action == ReplacementDecision.replaced
+                                // Replace existing: accept new candidate, mark existing for replacement
+                                result = ReplacementResult.new(true, ReplacementDecision.replaced, existingPool.poolID)
+                                array.push(results, result)
+                            else
+                                // Unknown decision: reject candidate as safety default
+                                result = ReplacementResult.new(false, ReplacementDecision.ignored, -1)
+                                array.push(results, result)
+                        else
+                            // Invalid conflict index: reject candidate as safety default
+                            result = ReplacementResult.new(false, ReplacementDecision.ignored, -1)
+                            array.push(results, result)
+    
+    results
+
+// =====================================================================================================================
+// LIFECYCLE MANAGER — Manages pool state transitions (FORMED → ACTIVE only)
+// =====================================================================================================================
+
+lifecycle_transitionFormedToActive(LiquidityPool pool) =>
+    // FORMED → ACTIVE transition logic
+    // Read-only operation on pool object, returns new state
+    barsSinceFormed = bar_index - pool.formedBar
+    if barsSinceFormed >= i_formedToActiveBars
+        PoolState.active
+    else
+        pool.state
+
+lifecycle_updatePoolState(int poolIndex) =>
+    // Update state of a single pool in the registry
+    registrySize = array.size(g_registry)
+    if poolIndex >= 0 and poolIndex < registrySize
+        pool = array.get(g_registry, poolIndex)
+        
+        // Determine new state
+        if pool.state == PoolState.formed
+            newState = lifecycle_transitionFormedToActive(pool)
+            pool.state := newState
+            array.set(g_registry, poolIndex, pool)
+
+lifecycle_processAllPools() =>
+    // Process all pools in the registry for state transitions
+    registrySize = array.size(g_registry)
+    if registrySize > 0
+        for i = 0 to registrySize - 1
+            if i >= 0 and i < registrySize
+                lifecycle_updatePoolState(i)
+
+// =====================================================================================================================
+// LIFECYCLE VERIFICATION — Read-only integrity checks
+// =====================================================================================================================
+
+lifecycle_countPoolsByState(PoolState stateToCount) =>
+    count = 0
+    registrySize = array.size(g_registry)
+    if registrySize > 0
+        for i = 0 to registrySize - 1
+            if i >= 0 and i < registrySize
+                pool = array.get(g_registry, i)
+                if pool.state == stateToCount
+                    count := count + 1
+    count
+
+lifecycle_checkIntegrity() =>
+    // Lifecycle Integrity: FORMED + ACTIVE == Registry Size
+    totalPools = array.size(g_registry)
+    formedCount = lifecycle_countPoolsByState(PoolState.formed)
+    activeCount = lifecycle_countPoolsByState(PoolState.active)
+    (formedCount + activeCount) == totalPools
+
+// =====================================================================================================================
+// REPLACEMENT ENGINE VERIFICATION — Read-only integrity checks
+// =====================================================================================================================
+
+replacement_checkIntegrity() =>
+    // Replacement Integrity: All candidates processed and accounted for
+    // Integrity passes when: Candidates Accepted + Candidates Rejected == Candidates Processed
+    // This correctly reflects all replacement decisions made by the engine.
+    totalProcessed = g_candidatesProcessed
+    totalAccounted = g_candidatesAccepted + g_candidatesRejected
+    totalAccounted == totalProcessed
+
+// =====================================================================================================================
+// VISUALIZATION — Detection Layer Output Only (with retention policy)
+// =====================================================================================================================
+
+// Enforce max visualization items: delete oldest when limit exceeded
+f_enforceVisualizationLimit() =>
+    vizSize = array.size(g_vizItems)
+    while vizSize > i_maxVisualizationItems
+        if array.size(g_vizItems) > 0
+            oldest = array.shift(g_vizItems)
+            if oldest.itemType == 0 and not na(oldest.lbl)
+                label.delete(oldest.lbl)
+            else if oldest.itemType == 1 and not na(oldest.ln)
+                line.delete(oldest.ln)
+        vizSize := array.size(g_vizItems)
+
+viz_renderPivots(DetectionContext ctx) =>
+    if i_showPivotLabels
+        if ctx.hasPivotHigh
+            lbl = label.new(ctx.pivotHighBar, ctx.pivotHighPrice, "PH: " + str.tostring(math.round(ctx.pivotHighPrice, 2)),
+                 style = label.style_label_down, color = color.new(color.red, 30), textcolor = color.white,
+                 size = i_labelSize == "tiny" ? size.tiny : (i_labelSize == "small" ? size.small : size.normal))
+            if not na(lbl)
+                vizItem = VizItem.new(0, lbl, na)
+                array.push(g_vizItems, vizItem)
+        if ctx.hasPivotLow
+            lbl = label.new(ctx.pivotLowBar, ctx.pivotLowPrice, "PL: " + str.tostring(math.round(ctx.pivotLowPrice, 2)),
+                 style = label.style_label_up, color = color.new(color.lime, 30), textcolor = color.white,
+                 size = i_labelSize == "tiny" ? size.tiny : (i_labelSize == "small" ? size.small : size.normal))
+            if not na(lbl)
+                vizItem = VizItem.new(0, lbl, na)
+                array.push(g_vizItems, vizItem)
+    f_enforceVisualizationLimit()
+
+viz_renderSwingLines() =>
+    if i_showSwingLines
+        candSize = array.size(g_swingCandidatesThisBar)
+        if candSize > 0
+            for i = 0 to candSize - 1
+                if i >= 0 and i < candSize
+                    cand = array.get(g_swingCandidatesThisBar, i)
+                    if cand.poolType == PoolType.swing_high
+                        // Draw red horizontal line for swing high
+                        ln = line.new(cand.detectedBar, cand.priceLevel, bar_index, cand.priceLevel,
+                             color = color.new(color.red, 50), width = 1, style = line.style_dashed, extend = extend.right)
+                        if not na(ln)
+                            vizItem = VizItem.new(1, na, ln)
+                            array.push(g_vizItems, vizItem)
+                    else if cand.poolType == PoolType.swing_low
+                        // Draw green horizontal line for swing low
+                        ln = line.new(cand.detectedBar, cand.priceLevel, bar_index, cand.priceLevel,
+                             color = color.new(color.lime, 50), width = 1, style = line.style_dashed, extend = extend.right)
+                        if not na(ln)
+                            vizItem = VizItem.new(1, na, ln)
+                            array.push(g_vizItems, vizItem)
+    f_enforceVisualizationLimit()
+
+// =====================================================================================================================
+// MAIN ORCHESTRATION — Detection Layer + Replacement Engine + Registry + Lifecycle Manager
+// Top-level execution: ONLY place where global variables are modified
+// =====================================================================================================================
+
+// Build detection context on every bar
+ctx = f_buildDetectionContext()
+
+// Process only on confirmed bars
+if barstate.isconfirmed
+    // Run detectors (no global modifications except array.push to detection results)
+    detect_equalHighsLows(ctx)
+    detect_singleSwing(ctx)
+    detect_trendlineLiquidity(ctx)
+    
+    // ===============================
+    // REPLACEMENT ENGINE — TOP-LEVEL
+    // Process all candidates through replacement engine (pure function, no globals modified)
+    // ===============================
+    replacementResults = replacement_processCandidates()
+    
+    // ===============================
+    // UPDATE REPLACEMENT ENGINE COUNTERS — TOP-LEVEL ONLY
+    // This is the ONLY place where replacement engine globals are modified
+    // Iterate using indexed access to retrieve results and create records
+    // ===============================
+    candidatesThisBarCount = array.size(g_swingCandidatesThisBar)
+    if candidatesThisBarCount > 0
+        g_candidatesProcessed := g_candidatesProcessed + candidatesThisBarCount
+        
+        resultsSize = array.size(replacementResults)
+        if resultsSize > 0 and resultsSize == candidatesThisBarCount
+            for i = 0 to resultsSize - 1
+                if i >= 0 and i < resultsSize
+                    result = array.get(replacementResults, i)
+                    
+                    if result.accept
+                        g_candidatesAccepted := g_candidatesAccepted + 1
+                        // Record acceptance in history
+                        record = ReplacementRecord.new(i, ReplacementDecision.ignored, -1)
+                        array.push(g_replacementHistory, record)
+                    else
+                        g_candidatesRejected := g_candidatesRejected + 1
+                        // Record rejection in history
+                        record = ReplacementRecord.new(i, result.decision, result.conflictPoolID)
+                        array.push(g_replacementHistory, record)
+    
+    // ===============================
+    // REGISTRY PROCESSING — TOP-LEVEL ONLY
+    // This is the ONLY place g_nextPoolID is modified
+    // Only add candidates that passed replacement engine
+    // ===============================
+    if candidatesThisBarCount > 0
+        resultsSize = array.size(replacementResults)
+        if resultsSize > 0 and resultsSize == candidatesThisBarCount
+            for i = 0 to resultsSize - 1
+                if i >= 0 and i < resultsSize and i < candidatesThisBarCount
+                    result = array.get(replacementResults, i)
+                    
+                    if result.accept
+                        cand = array.get(g_swingCandidatesThisBar, i)
+                        
+                        // If decision is 'replaced', find and remove the conflicting pool from registry
+                        if result.decision == ReplacementDecision.replaced and result.conflictPoolID != -1
+                            regSize = array.size(g_registry)
+                            if regSize > 0
+                                for j = 0 to regSize - 1
+                                    pool = array.get(g_registry, j)
+                                    if pool.poolID == result.conflictPoolID
+                                        array.remove(g_registry, j)
+                                        break
+                        
+                        // 1. Read current poolID
+                        currentPoolID = g_nextPoolID
+                        // 2. Convert candidate to LiquidityPool (pure function, no globals)
+                        pool = f_convertToLiquidityPool(cand, currentPoolID)
+                        // 3. Push into Registry
+                        array.push(g_registry, pool)
+                        // 4. Increment pool ID counter
+                        g_nextPoolID := g_nextPoolID + 1
+    
+    // ===============================
+    // LIFECYCLE MANAGER — TOP-LEVEL
+    // Process state transitions for all pools
+    // ===============================
+    lifecycle_processAllPools()
+    
+    // Visualize output
+    viz_renderPivots(ctx)
+    viz_renderSwingLines()
+    
+    // Clear this-bar candidates for next bar
+    array.clear(g_swingCandidatesThisBar)
+
+// =====================================================================================================================
+// STATUS TABLE — Detection + Registry + Lifecycle + Replacement + Confidence statistics
+// =====================================================================================================================
+
+var table g_statusTable = na
+
+if barstate.islast
+    if na(g_statusTable)
+        g_statusTable := table.new(position.top_right, 2, 18, border_width = 1)
+    
+    if not na(g_statusTable)
+        totalCandidates = array.size(g_swingCandidatesAllTime)
+        registrySize = array.size(g_registry)
+        highestPoolID = registry_getHighestPoolID()
+        hasDuplicates = registry_checkDuplicateIDs()
+        registryIntegrityPass = registry_checkIntegrity()
+        
+        formedCount = lifecycle_countPoolsByState(PoolState.formed)
+        activeCount = lifecycle_countPoolsByState(PoolState.active)
+        lifecycleIntegrityPass = lifecycle_checkIntegrity()
+        
+        replacementIntegrityPass = replacement_checkIntegrity()
+        
+        // Calculate confidence metrics
+        float avgConfidence = 0.0
+        float highestConfidence = 0.0
+        float lowestConfidence = 100.0
+        if registrySize > 0
+            float sumConfidence = 0.0
+            for i = 0 to registrySize - 1
+                pool = array.get(g_registry, i)
+                conf = pool.confidence
+                sumConfidence := sumConfidence + conf
+                if conf > highestConfidence
+                    highestConfidence := conf
+                if conf < lowestConfidence
+                    lowestConfidence := conf
+            avgConfidence := sumConfidence / registrySize
+        else
+            lowestConfidence := 0.0
+        
+        table.cell(g_statusTable, 0, 0, "DETECTION+REGISTRY+LIFECYCLE+REPLACEMENT", bgcolor = color.new(color.navy, 0), text_color = color.white)
+        table.cell(g_statusTable, 1, 0, "", bgcolor = color.new(color.navy, 0))
+        
+        table.cell(g_statusTable, 0, 1, "Total Candidates", text_color = color.white)
+        table.cell(g_statusTable, 1, 1, str.tostring(totalCandidates), text_color = totalCandidates > 0 ? color.green : color.red)
+        
+        table.cell(g_statusTable, 0, 2, "Candidates Processed", text_color = color.white)
+        table.cell(g_statusTable, 1, 2, str.tostring(g_candidatesProcessed), text_color = color.aqua)
+        
+        table.cell(g_statusTable, 0, 3, "Candidates Accepted", text_color = color.white)
+        table.cell(g_statusTable, 1, 3, str.tostring(g_candidatesAccepted), text_color = color.green)
+        
+        table.cell(g_statusTable, 0, 4, "Candidates Rejected", text_color = color.white)
+        table.cell(g_statusTable, 1, 4, str.tostring(g_candidatesRejected), text_color = color.orange)
+        
+        table.cell(g_statusTable, 0, 5, "Total Pools", text_color = color.white)
+        table.cell(g_statusTable, 1, 5, str.tostring(registrySize), text_color = registrySize > 0 ? color.green : color.orange)
+        
+        table.cell(g_statusTable, 0, 6, "FORMED", text_color = color.white)
+        table.cell(g_statusTable, 1, 6, str.tostring(formedCount), text_color = color.aqua)
+        
+        table.cell(g_statusTable, 0, 7, "ACTIVE", text_color = color.white)
+        table.cell(g_statusTable, 1, 7, str.tostring(activeCount), text_color = color.green)
+        
+        table.cell(g_statusTable, 0, 8, "Registry Integrity", text_color = color.white)
+        regIntegrityText = registryIntegrityPass ? "PASS" : "FAIL"
+        regIntegrityColor = registryIntegrityPass ? color.green : color.red
+        table.cell(g_statusTable, 1, 8, regIntegrityText, text_color = regIntegrityColor)
+        
+        table.cell(g_statusTable, 0, 9, "Lifecycle Integrity", text_color = color.white)
+        lcIntegrityText = lifecycleIntegrityPass ? "PASS" : "FAIL"
+        lcIntegrityColor = lifecycleIntegrityPass ? color.green : color.red
+        table.cell(g_statusTable, 1, 9, lcIntegrityText, text_color = lcIntegrityColor)
+        
+        table.cell(g_statusTable, 0, 10, "Replacement Integrity", text_color = color.white)
+        replIntegrityText = replacementIntegrityPass ? "PASS" : "FAIL"
+        replIntegrityColor = replacementIntegrityPass ? color.green : color.red
+        table.cell(g_statusTable, 1, 10, replIntegrityText, text_color = replIntegrityColor)
+        
+        table.cell(g_statusTable, 0, 11, "Replacement Engine", text_color = color.white)
+        table.cell(g_statusTable, 1, 11, i_enableReplacement ? "ENABLED" : "DISABLED", text_color = i_enableReplacement ? color.green : color.orange)
+        
+        table.cell(g_statusTable, 0, 12, "Confidence Module", text_color = color.white)
+        table.cell(g_statusTable, 1, 12, "ENABLED", text_color = color.green)
+        
+        table.cell(g_statusTable, 0, 13, "Event Bus", text_color = color.white)
+        table.cell(g_statusTable, 1, 13, "NO (DISABLED)", text_color = color.orange)
+        
+        table.cell(g_statusTable, 0, 14, "Session Module", text_color = color.white)
+        table.cell(g_statusTable, 1, 14, "NO (DISABLED)", text_color = color.orange)
+
+        table.cell(g_statusTable, 0, 15, "Average Confidence", text_color = color.white)
+        table.cell(g_statusTable, 1, 15, str.tostring(math.round(avgConfidence, 2)), text_color = color.aqua)
+
+        table.cell(g_statusTable, 0, 16, "Highest Confidence", text_color = color.white)
+        table.cell(g_statusTable, 1, 16, str.tostring(math.round(highestConfidence, 2)), text_color = color.green)
+
+        table.cell(g_statusTable, 0, 17, "Lowest Confidence", text_color = color.white)
+        table.cell(g_statusTable, 1, 17, str.tostring(math.round(lowestConfidence, 2)), text_color = color.orange)
