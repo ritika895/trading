@@ -1,0 +1,190 @@
+# FINAL ARCHITECTURE AUDIT — Gold ICT Pro Liquidity Engine
+## Event Model, Contracts, Failure Propagation, and Freeze Governance
+
+Same review posture as before: architect, not implementer. I'll answer all eight questions, then close with the full-system audit.
+
+---
+
+## 1. Is the architecture event-driven enough?
+
+**Recommendation: keep the pipeline sequential for computation, but formalize a thin event layer *on top of it* for notification purposes. Do not restructure the core pipeline around events.**
+
+### Why full event-driven is the wrong move here
+
+A fully event-driven redesign (modules react to `PoolCreated`, `PoolInvalidated` etc. asynchronously) would trade away the property that's currently keeping this system tractable: **deterministic, ordered, single-pass-per-bar evaluation.** Pine Script's execution model is fundamentally bar-sequential — there is no real concurrency, no message queue, no async dispatch. An event-driven architecture makes the most sense when consumers can react independently and out of order; in Pine, every "event" would still have to be resolved synchronously within the same bar, in a fixed order, before the script finishes executing. So a "true" event-driven redesign here would mostly add indirection without adding the benefit event-driven architectures normally provide (decoupled timing). That's a cost with no corresponding payoff.
+
+It would also directly conflict with the determinism principle we established: Analysis Layer modules must be pure functions of (bar history, config). A pub/sub event model tends to invite implicit ordering dependencies and hidden mutable subscriber state — exactly what you've been avoiding.
+
+### Why *some* event formalization is still valuable
+
+Your existing Event Bus module already proves you agree events have a place — just not as the primary control flow. The right role for events in this system is **notification of state transitions for modules that care but aren't in the direct data-dependency chain**: Visualization, Debug Dashboard, Alerts, and future analytics/logging.
+
+Concretely: Pool Selection doesn't need to *subscribe* to a `PoolCreated` event to do its job — it just reads Registry, in order, every bar, as it does now. But it's still useful for Pool Selection to *emit* a `PoolSelected` event once it has decided, purely so Alerts, Visualization, and any future analytics module can react without being wired directly into Pool Selection's output contract.
+
+**Concrete recommendation:**
+- Keep the sequential pipeline as the backbone for computation and data flow — this doesn't change.
+- Use Event Bus for **one-directional, fire-and-forget notifications** emitted by modules *after* they've completed their deterministic computation for the bar: `PoolCreated`, `PoolInvalidated`, `PoolReplaced`, `PoolSelected`, `TradeOpened`, `TradeClosed`.
+- Events are **derived from** the pipeline's output, never a substitute for it. No module should ever make a decision by listening for an event instead of reading its documented upstream input contract. This keeps the event layer purely additive — safe to extend later (new subscribers) without touching the core chain.
+- This gives you the exact benefit you're anticipating (notifications, analytics, multi-strategy hooks) without paying the cost of restructuring a system that depends on strict bar-sequential determinism.
+
+---
+
+## 2. Is the Registry schema future-proof? Minimum permanent field set.
+
+Worth freezing this explicitly, since — as established — Registry's schema is the highest-leverage, most expensive-to-change artifact in the system.
+
+### Essential (must exist from Phase 5 freeze onward)
+
+- **Pool ID** — stable, unique identifier, never reused even after invalidation/expiry (critical for Execution State module to reference pools reliably, and for debugging historical selections).
+- **Pool Type** — enum (Liquidity Sweep today; Order Block, FVG, Breaker Block, etc. later). Flagged last time as a preemptive add — reconfirming it belongs in the "essential, add now" tier, not optional.
+- **Direction** (Bullish/Bearish).
+- **Price Level(s)** — the level(s) defining the pool's structure.
+- **Lifecycle State** (ACTIVE, REINFORCED, SWEPT, INVALIDATED, EXPIRED) — owned/written by Lifecycle Manager only.
+- **Creation Bar/Time** — source of truth for Age computation.
+- **Confidence Score** — owned/written by Confidence Engine only.
+- **Touch/Reinforcement Count**.
+- **Sweep Status**.
+- **Session Information** (which session the pool formed in).
+- **Symbol/Timeframe Identity** — reconfirming as essential, not optional, per last review, even if only one value is populated today.
+- **Replacement Reference** — link to predecessor/successor pool when Replacement Engine acts, so history is traceable.
+
+### Optional (may exist, module-specific, not part of the "core" schema everyone depends on)
+
+- Extended detection metadata that only Detection Engine and Confidence Engine care about (e.g., raw swing metrics used to compute confidence) — these can live in Registry as pool attributes, but downstream modules beyond Confidence shouldn't depend on them directly. If a field is only consumed by its immediate producer/consumer pair, it's a candidate for "optional, not part of the guaranteed contract other modules can rely on."
+- Debug/diagnostic annotations useful for the Debug Dashboard but not decision-relevant to any trading-logic module.
+
+### Never (per the exclusion list from the previous review — reconfirmed here as permanent policy)
+
+- Execution state, scoring/ranking outputs, alert history, broker/order details, visualization state, risk parameters, tunable configuration values. These remain excluded for the reasons already established: they're either derived (recompute, don't store) or owned by a different concern entirely (execution vs. market truth).
+
+**One addition worth calling out explicitly now:** decide whether Pool ID uniqueness needs to be globally unique across symbol/timeframe once those fields exist, or just unique within Registry's current single-symbol scope. Cheap to decide now (e.g., compose ID from symbol+timeframe+sequence), expensive to retrofit once Execution State and Trade Manager start referencing Pool IDs externally.
+
+---
+
+## 3. Should every module return a standardized Result object?
+
+**Yes, uniformly — no exceptions, including for modules that feel "simple" today.**
+
+The temptation will be to skip the full Result pattern (data + status + integrity + statistics) for modules that seem too straightforward to need it — Session Engine, for instance, might feel like it just needs to return "current session." Resist this. The value of the pattern isn't proportional to a module's current complexity; it's proportional to **consistency across the whole system**, which is what makes debugging and testing tractable at scale.
+
+Concretely, three things break if the pattern isn't applied uniformly:
+
+1. **Debug Dashboard** becomes harder to build generically — if some modules expose Statistics/Integrity and others don't, Debug Dashboard needs bespoke handling per module instead of a uniform "render whatever Result object this module produced" pattern.
+2. **Failure propagation** (Question 4) depends on every module being able to say "I succeeded" or "I did not" in a consistent way. A module without an Integrity flag is a module that can fail silently.
+3. **Testing** (Question 7) benefits enormously from every module having the same shape of "given these inputs, assert this Result" — bespoke modules need bespoke test harnesses.
+
+**Recommendation:** formalize the Result pattern as a required structural template for every module going forward — including revisiting the already-completed modules (Detection, Registry, Lifecycle, Replacement, Confidence, Session, Event Bus) to confirm they conform, even if lightly. This doesn't mean reopening their internal logic — a thin wrapper that exposes existing internal state through the standard shape is a compatible, non-breaking addition, not a redesign.
+
+---
+
+## 4. How should failures propagate?
+
+This is the most operationally important unanswered question in the system, because it's the one that matters most once real orders are involved.
+
+### The core principle: fail closed, not open, and stop propagation at the point of failure
+
+**Recommendation: adopt a strict "fail closed" rule — if any module in the chain cannot produce a valid Result (Integrity = false), every downstream module treats that bar as "no action," full stop. No module should attempt to substitute a stale result, a partial result, or a best-guess fallback.**
+
+Why this matters specifically for this system:
+
+- The pipeline terminates in **live order execution**. A silent fallback anywhere upstream (e.g., Pool Selection using last bar's selection because this bar's Confidence Engine failed) could result in Entry Engine acting on data that doesn't reflect current market truth — the worst possible failure mode for a trading system.
+- "Fail closed" is much easier to reason about than partial degradation. A rule like "if Confidence Engine fails, Pool Selection scores without confidence weighting" sounds resilient but is actually dangerous — it silently changes system behavior in a way that's very hard to detect from the outside (the system doesn't crash, it just makes worse decisions).
+
+### Where propagation should stop, concretely
+
+- Each module checks the **Integrity flag of its immediate upstream input(s)** before running its own logic. If upstream Integrity is false, the module does not attempt its normal computation — it immediately produces its own Result with Integrity = false and an empty/null data payload, and passes that forward.
+- This means failure propagates as a **flag**, not as a crash or an exception — the pipeline still completes execution every bar (important in Pine, where you generally don't want unhandled runtime errors), but every downstream module past the failure point knows definitively "there is no valid decision this bar."
+- **Alerts and MT5 Execution must have an explicit, hard rule**: if the Integrity flag arriving from Trade Manager (or any upstream module in the chain) is false, no alert fires and no order is sent — ever, no exceptions, no "last known good" fallback. This is the single most important failure-propagation rule in the entire system, because it's the last line of defense before real capital is affected.
+
+### Centralized vs. distributed error handling
+
+You don't need a separate centralized "error bus" module — that would reintroduce the event-driven coupling risk from Question 1 for a problem that's already well-solved by the Result pattern's Integrity flag plus the "check-your-immediate-upstream" rule. Centralization isn't necessary because propagation is already linear and ordered by the pipeline itself; each module only ever needs to check what's directly upstream of it, not query some global error registry.
+
+**One addition worth deciding now:** should Debug Dashboard aggregate a system-wide "is anything currently failing" indicator by scanning every module's Integrity flag? This is a reasonable, low-cost addition — Debug Dashboard reading everyone's Result objects is already its job — and gives you one glance to see system health, without requiring any new coupling between the trading-logic modules themselves.
+
+---
+
+## 5. Should modules know about future/downstream modules?
+
+**No — this should be an absolute rule with zero exceptions, and it's worth stating why "zero exceptions" is achievable here rather than aspirational.**
+
+Every case that might look like a justified exception actually isn't, once you check it against the contract model from Question 2:
+
+- Pool Selection doesn't need to know Entry Engine exists — it just needs to produce a complete, well-formed Result. Whether Entry Engine, a future Risk Manager variant, or a completely different consumer (e.g., a manual review dashboard) reads that Result is irrelevant to Pool Selection.
+- Confidence doesn't need to know Pool Selection exists, for the same reason — Confidence's job is fully specified by its own output contract, not by who consumes it.
+- The one thing that might *look* like an exception is the event emission pattern from Question 1 (Pool Selection emits `PoolSelected`). But this doesn't violate the rule: emitting an event is not "knowing Entry Engine exists," it's "publishing a fact about my own completed work to an anonymous bus." Pool Selection doesn't know or care who's listening, or whether anyone is. That distinction is what keeps the event layer compatible with strict downstream-ignorance.
+
+**Recommendation: keep this rule absolute.** It's the property that lets you keep freezing modules independently — the moment any module contains a conditional like "if Entry Engine will need X, do Y differently," you've broken the boundary and coupled two frozen artifacts together invisibly.
+
+---
+
+## 6. Versioning and evolution of module contracts
+
+**Yes — adopt lightweight semantic versioning per module contract, not per the whole architecture document.**
+
+Given this project's structure (freeze module, move to next, revisit rarely), a full architecture-wide version number is too coarse — it would force a version bump even when only one module's contract changes. Instead:
+
+- **Each module's output contract gets its own version** (e.g., `SelectionResult v1`). Additive changes (new optional field) can stay within the same major version. Any change that removes a field, changes a field's meaning, or changes a Status enum's values is a breaking change and requires a major version bump.
+- **Downstream modules declare which contract version they were built against** (a comment/constant is sufficient in Pine — this doesn't need tooling). This makes it trivial, months later, to answer "did Pool Selection's contract change since Entry Engine was built against it?" without re-reading every line of both modules.
+- **The architecture document itself should carry a document version** (you're effectively already doing this — "v2" after the Configuration/Priority additions) so you can tell, at a glance, whether a given frozen module was implemented against the current or an older version of its design doc.
+
+This is intentionally lightweight — no need for formal semver tooling or automated compatibility checking in a Pine Script project. The value is purely in the discipline of **writing the version number down**, so "did this change break anything downstream" becomes a quick lookup instead of a full re-audit.
+
+---
+
+## 7. Testability — can every module be tested independently?
+
+This is genuinely valuable to check now, because it surfaces hidden dependencies before they're baked into more modules.
+
+### Modules that should already pass this test cleanly
+
+Detection, Registry, Lifecycle, Replacement, Confidence, Session, Pool Selection — all deterministic, all Analysis Layer, all should be testable by feeding a fixed synthetic bar history and fixed configuration, then asserting on the Result object. This is exactly what the "fail closed, deterministic Analysis Layer" principle (Question 6 from the prior review) was protecting.
+
+### Where hidden dependencies are likely to sneak in
+
+- **Event Bus** is the one module most likely to violate clean independent testability, precisely because its job is to be *listened to* by other modules. Testing it in isolation ("does emitting X produce the right event payload") is fine, but testing it *meaningfully* requires at least one subscriber, which means Event Bus tests will always have a soft dependency on whatever module you use as the test subscriber. This isn't a flaw, just worth naming so it's not mistaken for a design problem later.
+- **Visualization and Debug Dashboard** are inherently harder to unit test in the same way (their "output" is rendered drawing objects, not data), so "testable" for these means something different — verifying they correctly render a given Result object, not verifying a deterministic data output. Worth explicitly scoping these out of the strict testability principle rather than forcing them to fit a pattern that doesn't suit them.
+- **Once Execution State exists (Question 4 from the prior review)**, testing Entry Engine independently will require the ability to *inject* a synthetic Execution State (e.g., "pretend this pool already has an open trade") rather than only reading real Trade Manager output. This is worth deciding now: Execution State's read interface should be designed to accept a test/mock snapshot cleanly, not only live Registry-style state, or Entry Engine testing will always require the full downstream chain to be running.
+
+**Recommendation:** explicitly scope "fully independently testable with deterministic inputs/outputs" to the Analysis Layer + Entry Engine + Risk Manager + Trade Manager (anything whose job is decision-making), and treat Event Bus, Visualization, Debug Dashboard, and Alerts as a different testability category (integration-style, "does it correctly reflect/render the Result objects it's given") rather than trying to force them into the same mold.
+
+---
+
+## 8. Freeze policy — governance model
+
+Proposing a three-tier model:
+
+### Tier 1 — Permanently Frozen
+Modules whose contracts other modules structurally depend on, where reopening means cascading changes: **Registry schema** (once the essential field set from Question 2 is finalized), **Detection Engine's pool-creation contract**, **Lifecycle state enum**. Reopening these requires a documented, explicit architecture-level decision (not a casual edit), because the cost is paid by every module downstream simultaneously.
+
+### Tier 2 — Frozen, but reopenable under defined criteria
+Most of the pipeline modules (Confidence, Pool Selection, Entry Engine once built, Risk Manager, Trade Manager). These can be reopened when:
+- A **new pool type or trading concept** requires a genuinely new input the module wasn't designed to consume (not just a tuning change — that belongs in Configuration).
+- A **contract version bump** is needed (Question 6) because a downstream module's real, validated need can't be met by an additive change.
+- A **correctness bug** is found in the module's internal logic (not its contract) — this is a same-version patch, not a redesign.
+
+Reopening under this tier should require: (1) confirming the change doesn't break the module's existing output contract version, or (2) if it does, bumping the version and reviewing every downstream consumer before merging.
+
+### Tier 3 — Expected to evolve freely
+**Selection Configuration values, Priority band cutoffs, Session definitions, Visualization styling, Debug Dashboard layout.** These are tuning/presentation concerns by design — they should be *easy* to change, and treating them as frozen would defeat the entire purpose of having extracted them into a separate configuration layer in the first place.
+
+**Criteria for moving a module between tiers:** a module should only move from Tier 2 to Tier 1 once at least one downstream module has been built and stabilized against it (i.e., once reopening it would provably cascade). Don't over-freeze early — Pool Selection, for instance, shouldn't be treated as Tier 1 until Entry Engine actually exists and depends on its current contract shape.
+
+---
+
+## THE FINAL AUDIT — Full System, Hidden Coupling and Expensive-to-Change Risk
+
+Synthesizing this session and the prior one into a single, final list — ranked by cost-if-deferred, restricted only to items that are genuinely expensive to fix after Phase 5 freeze:
+
+| Rank | Risk | Why it's expensive later | Action before freeze |
+|---|---|---|---|
+| 1 | **Registry schema gaps** (pool type, symbol/timeframe, stable Pool ID scheme) | Every module reads Registry directly; a schema change ripples through the entire system at once | Finalize the essential field list (Q2) now; treat as Tier 1 frozen once set |
+| 2 | **Execution State ownership undecided** | If bolted onto Lifecycle or Trade Manager by default, unwinding later means reopening a Tier 1/2 module | Commit to a dedicated Execution State module now (contract only; implementation can wait) |
+| 3 | **No formal Result-object standard applied uniformly** | Debug Dashboard, failure propagation, and testing all silently depend on this being consistent; retrofitting it to 7 already-built modules is real work | Apply the standard retroactively as thin wrappers now, before more modules are added on top |
+| 4 | **No explicit fail-closed rule at the Alerts/MT5 boundary** | This is the one gap with direct financial consequence — a silent fallback here is the worst possible failure mode | Write the "Integrity=false ⇒ no alert, no order, no exception" rule into the architecture document explicitly, before Alerts/MT5 are built |
+| 5 | **Execution-order/bar-confirmation invariant not yet documented** | Subtle correctness bug, easy to introduce, hard to trace once several more modules stack on top | Document and verify now |
+| 6 | **Contract versioning not yet adopted** | Costs little now; becomes expensive to reconstruct retroactively once contracts have already changed a few times unversioned | Start version-tagging output contracts starting with Pool Selection, going forward |
+
+**Everything else — sequential pipeline shape, thin event layer for notifications only, ranked-list Pool Selection output, strict downstream-ignorance between modules, Registry-as-sole-source-of-truth — is correctly decided and should not change.** These are exactly the decisions that are cheap to get right early and expensive to revisit, and you've already gotten them right.
+
+**Bottom line for this audit:** the architecture doesn't need a structural redesign. What it needs, before Phase 5 is truly frozen, is for six specific cross-cutting agreements (table above) to be **written down as explicit, permanent rules** rather than left as implicit conventions — because the cost of formalizing them now is a few paragraphs of documentation, and the cost of discovering the gap later is reopening modules you've already committed to treating as finished.
