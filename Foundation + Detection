@@ -1,0 +1,224 @@
+//@version=6
+indicator("Gold ICT Pro Liquidity Engine [Phase 1]", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// =========================================================================
+// MODULE 1: USER SETTINGS & INPUTS
+// =========================================================================
+group_liquidity = "Liquidity Detection Settings"
+inp_lookback      = input.int(20, "Swing Lookback", minval=2, maxval=500, group=group_liquidity)
+inp_atr_mult      = input.float(1.5, "Merge Tolerance (ATR Mult)", minval=0.1, step=0.1, group=group_liquidity)
+inp_max_pools     = input.int(50, "Max Active Pools", minval=10, maxval=100, group=group_liquidity)
+
+group_sessions = "Session Settings"
+inp_asian_session   = input.session("0000-0600", "Asian Session", group=group_sessions)
+inp_london_session  = input.session("0700-1200", "London Session", group=group_sessions)
+inp_ny_session      = input.session("1200-1700", "New York Session", group=group_sessions)
+
+// =========================================================================
+// MODULE 2: CONSTANTS
+// =========================================================================
+// Colors
+const color COLOR_BULL   = color.new(color.teal, 0)
+const color COLOR_BEAR   = color.new(color.red, 0)
+const color COLOR_NEUTRAL= color.new(color.gray, 0)
+const color COLOR_TEXT   = color.new(color.white, 0)
+
+// Limits & Math
+const int   MAX_POOL_LIMIT = 100
+const float EPSILON        = 0.00001
+const float INVALID_PRICE  = -1.0
+
+// =========================================================================
+// MODULE 3: ENUMERATIONS
+// =========================================================================
+// Pool Types
+enum PoolType
+    BULLISH
+    BEARISH
+    NEUTRAL
+
+// Lifecycle States
+enum LifecycleState
+    FORMED
+    ACTIVE
+    REINFORCED
+    SWEPT
+    INVALIDATED
+    EXPIRED
+
+// Session Types
+enum SessionType
+    NONE
+    ASIAN
+    LONDON
+    NEW_YORK
+
+// Event Types for Event Bus
+enum EventType
+    CREATED
+    REINFORCED
+    SWEPT
+    INVALIDATED
+    EXPIRED
+
+// Priority Classifications for Selection Engine
+enum PriorityClass
+    A_PLUS
+    A
+    B
+    C
+    D
+
+// =========================================================================
+// MODULE 4: COMMON TYPES (UDFs)
+// =========================================================================
+// Core Liquidity Pool Structure
+type LiquidityPool
+    int             id              // Unique identifier
+    PoolType        pType           // Bullish, Bearish, Neutral
+    LifecycleState  state           // Current lifecycle state
+    float           price           // Price level of the pool
+    int             barCreated      // Bar index of creation
+    int             lastTouchBar    // Last bar it was touched
+    int             touchCount      // Number of reinforcements
+    float           confidence      // 0.0 to 100.0
+    SessionType     sessionCreated  // Session in which it was created
+    bool            isSwept         // Sweep flag
+    
+// Event Bus Structure
+type MarketEvent
+    EventType   eType
+    int         poolId
+    int         barIndex
+    float       price
+    string      message
+
+// Selection Data Structures
+type PoolScore
+    int     poolId
+    float   rawScore
+    float   normalizedScore
+
+type SelectionResult
+    int     bestBullishId
+    int     bestBearishId
+    int     bestOverallId
+
+type SelectionStatistics
+    int     eligibleCount
+    int     rankedCount
+    float   avgScore
+    float   highestScore
+
+// =========================================================================
+// MODULE 5: UTILITY FUNCTIONS
+// =========================================================================
+// Determine if a bar index is within a specific session
+f_get_session_type() =>
+    SessionType s = SessionType.NONE
+    // Using `time` with the current timeframe and session strings to determine active session
+    if not na(time(timeframe.period, inp_asian_session))
+        s := SessionType.ASIAN
+    else if not na(time(timeframe.period, inp_london_session))
+        s := SessionType.LONDON
+    else if not na(time(timeframe.period, inp_ny_session))
+        s := SessionType.NEW_YORK
+    s
+
+// Safely compare two float values for equality
+f_is_equal(float a, float b) =>
+    math.abs(a - b) < EPSILON
+
+// Safely check if price crosses a specific level
+f_is_crossed(float level, float barHigh, float barLow) =>
+    barHigh >= level and barLow <= level
+
+// Format price based on symbol's tick size
+f_format_price(float p) =>
+    str.tostring(p, format.mintick)
+
+// Generate a simple unique ID based on time and bar index
+f_generate_id() =>
+    int(timestamp(year, month, dayofmonth, hour, minute, second)) + bar_index
+
+// =========================================================================
+// PHASE 1: DETECTION LAYER
+// =========================================================================
+// Detection arrays to hold raw levels before becoming Candidate Pools
+var float[] detection_highs = array.new_float(0)
+var float[] detection_lows  = array.new_float(0)
+
+// Detect swing highs and lows based on lookback
+f_detect_swings() =>
+    float h = high
+    float l = low
+    if bar_index >= inp_lookback
+        float swingHigh = ta.pivothigh(high, inp_lookback, inp_lookback)
+        float swingLow  = ta.pivotlow(low, inp_lookback, inp_lookback)
+        
+        if not na(swingHigh)
+            array.push(detection_highs, swingHigh)
+            
+        if not na(swingLow)
+            array.push(detection_lows, swingLow)
+            
+        // Keep arrays bounded to prevent memory issues
+        if array.size(detection_highs) > MAX_POOL_LIMIT
+            array.shift(detection_highs)
+        if array.size(detection_lows) > MAX_POOL_LIMIT
+            array.shift(detection_lows)
+
+// Generate Candidate Pools from detected swings
+f_generate_candidates() =>
+    LiquidityPool[] candidates = array.new<LiquidityPool>(0)
+    SessionType currentSession = f_get_session_type()
+    
+    if array.size(detection_highs) > 0
+        float topHigh = array.get(detection_highs, array.size(detection_highs) - 1)
+        LiquidityPool bearPool = LiquidityPool.new(
+             id              = f_generate_id(),
+             pType           = PoolType.BEARISH,
+             state           = LifecycleState.FORMED,
+             price           = topHigh,
+             barCreated      = bar_index - inp_lookback,
+             lastTouchBar    = bar_index - inp_lookback,
+             touchCount      = 0,
+             confidence      = 50.0,
+             sessionCreated  = currentSession,
+             isSwept         = false
+         )
+        array.push(candidates, bearPool)
+        array.pop(detection_highs)
+        
+    if array.size(detection_lows) > 0
+        float topLow = array.get(detection_lows, array.size(detection_lows) - 1)
+        LiquidityPool bullPool = LiquidityPool.new(
+             id              = f_generate_id(),
+             pType           = PoolType.BULLISH,
+             state           = LifecycleState.FORMED,
+             price           = topLow,
+             barCreated      = bar_index - inp_lookback,
+             lastTouchBar    = bar_index - inp_lookback,
+             touchCount      = 0,
+             confidence      = 50.0,
+             sessionCreated  = currentSession,
+             isSwept         = false
+         )
+        array.push(candidates, bullPool)
+        array.pop(detection_lows)
+         
+    candidates
+
+// =========================================================================
+// INTEGRITY CHECK & EXECUTION
+// =========================================================================
+// Execute detection
+f_detect_swings()
+
+// Generate candidates
+LiquidityPool[] stage1_candidates = f_generate_candidates()
+
+// Verify execution
+if array.size(stage1_candidates) > 0
+    LiquidityPool testPool = array.get(stage1_candidates, 0)
+    label.new(bar_index, high, "Pool Detected: " + f_format_price(testPool.price), color=color.blue, style=label.style_label_down)
