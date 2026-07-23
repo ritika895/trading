@@ -1,0 +1,218 @@
+# Entry Engine — Architecture Review
+### Phase 6, Decision Layer — Design Only
+
+---
+
+## 1. Module Responsibility
+
+**Exact responsibility:** Given the frozen, immutable `SelectionResult` and current live market conditions, the Entry Engine determines whether a *specific selected pool* currently **qualifies for entry consideration** — and if so, under what direction, price, and integrity.
+
+It answers exactly one question: *"Is this pool valid to act on right now?"*
+
+**Where it ends:** at producing an immutable `EntryResult`. It does not decide "take the trade" in the risk-adjusted sense (that's a Risk-layer authorization), it does not size positions, and it does not touch execution. Think of it as **qualification**, not **authorization**. Authorization is a downstream composite of `EntryResult + Risk output + Execution readiness`, owned by Trade Manager.
+
+This distinction matters — if Entry Engine starts absorbing "should I actually trade this" logic, the layer boundary you've built (and want to keep frozen) erodes immediately.
+
+---
+
+## 2. Required Inputs
+
+The inputs split into two categories that should be architecturally separated:
+
+**A. Pool-specific validation (belongs inside Entry Engine)**
+- Current market price — yes, essential, checked against the specific selected pool
+- Liquidity sweep confirmation — yes, this is the core qualifying condition tying directly back to the selected pool
+
+**B. Generic market context (should NOT live inside Entry Engine — consumed as read-only external input)**
+- Session information — yes, but only *derived* session/killzone state from the frozen Session Engine, not recomputed
+- Trend context (HTF bias) — yes, consumed, not computed
+- Market structure (BOS/CHoCH) — consumed, **not detected inside Entry Engine**
+- Order Blocks / Fair Value Gaps — consumed as a catalog, interpretation is strategy-specific
+
+**Why this split matters:** BOS/CHoCH, OB, and FVG are objective market-state facts, not decisions about *this* pool. If you embed their detection logic inside Entry Engine, every future entry model (Silver Bullet, Judas Swing, etc.) will end up re-implementing or duplicating that detection. Treat structure/OB/FVG detection as a **shared Market Context Provider** sitting alongside Entry Engine — same architectural role as Session Engine already plays. Entry Engine consumes it read-only; it never owns it.
+
+Sweep confirmation is the exception — it's inherently pool-specific (it's checking price behavior against *this* selected pool), so it belongs inside Entry Engine itself.
+
+---
+
+## 3. Internal Pipeline
+
+Your proposed pipeline is close, but missing one step that will cause subtle bugs in Pine Script's recalculation model: an atomic snapshot step. Without it, you risk reading price/session/structure at slightly different evaluation points within the same bar, producing inconsistent validation.
+
+```
+SelectionResult
+      ↓
+Context Snapshot Assembly     ← NEW: one atomic read of price, session, trend,
+      ↓                          structure references — everything downstream
+      ↓                          reads from this frozen snapshot, not live state
+Structural Validation          (pool still valid / not replaced since selection)
+      ↓
+Liquidity Sweep Confirmation   (pool-specific — did price react correctly?)
+      ↓
+Market Context Validation      (session active? trend aligned? structure compatible?)
+      ↓
+Entry Strategy Evaluation      (pluggable — see Q9/addendum)
+      ↓
+Entry Qualification Decision   (aggregate → QUALIFIED / NOT_QUALIFIED / PENDING)
+      ↓
+EntryResult Construction (immutable)
+```
+
+The Context Snapshot Assembly step is the one addition I'd insist on — everything else in your pipeline is sound.
+
+---
+
+## 4. EntryResult Contract
+
+Your proposed fields are good. I'd add three more, all for reasons that become expensive to retrofit later (see Q10):
+
+| Field | Purpose |
+|---|---|
+| Entry Status | `QUALIFIED / NOT_QUALIFIED / PENDING / INVALIDATED` |
+| Direction | LONG / SHORT |
+| Pool ID | reference/handle only — never a copy of mutable pool data |
+| Entry Price | proposed trigger/reference price |
+| Entry Integrity | entry-condition strength — **distinct** from Confidence Engine's pool score, don't conflate the two |
+| Rejection Reason | mandatory on any non-qualified result, no silent rejections |
+| Statistics | evaluation timestamp, bar index, validation stage reached |
+| **Strategy ID** *(new)* | which pluggable entry model produced this result — required once you support multiple models |
+| **SelectionResult version/ref** *(new)* | ties every EntryResult back to the exact immutable SelectionResult it was derived from — prevents silent staleness |
+| **Timestamp / Bar Index** *(new)* | needed for determinism auditing and backtest reproducibility |
+
+`EntryResult` should be immutable, mirroring `SelectionResult` — consistency of pattern across layers reduces cognitive load for everything built on top.
+
+---
+
+## 5. Failure Propagation
+
+Not pure fail-fast, and not pure exhaustive — a hybrid:
+
+- **Structural invalidation** (pool no longer exists / was replaced) → hard fail-fast. Nothing downstream is meaningful once this fails.
+- **Softer validations** (context, strategy conditions) → evaluate all and aggregate reasons, rather than stopping at the first failure.
+
+Why: the Entry Engine only evaluates the small set of currently-selected top pools, so exhaustive evaluation is cheap. Rich, multi-reason rejection output (`"failed because: session inactive AND trend misaligned"`) is significantly more valuable for your Debug Dashboard and for tuning entry models than a single first-failure reason — and it's expensive to add this granularity retroactively once every validation stage has been written to early-return.
+
+---
+
+## 6. Determinism
+
+Yes — Entry Engine must remain deterministic, for the same reasons as the Analysis Layer: reproducible backtests, debuggable behavior, no hidden state drift.
+
+One legitimate exception: Entry Engine will need lightweight **cross-bar pending state** (e.g., "watching pool X, awaiting sweep confirmation before qualifying"), which the Analysis Layer didn't need since it re-classifies fresh each bar. This is *temporal* state, not *non-deterministic* state — given identical historical data it will always resolve the same way. Scope it tightly: it should only track "entry-in-progress" status, nothing else, and it should never be externally mutable.
+
+---
+
+## 7. Module Boundaries — What Entry Engine Must Never Do
+
+- Never modify Registry
+- Never modify SelectionResult (read-only, always)
+- Never modify Execution State
+- Never calculate risk or position size
+- Never send alerts — even though EntryResult changes may *trigger* alerts, the act of sending one belongs to a presentation/orchestration layer, not embedded inside a decision module. Keeps Entry Engine pure and independently testable.
+- Never communicate with MT5
+
+Entry Engine may only produce `EntryResult` plus its own internal, non-exported pending-state tracking.
+
+---
+
+## 8. Cross-Module Contracts
+
+- **Selection → Entry:** read-only consumption of immutable `SelectionResult`. No back-references — avoid any dependency that could become circular later.
+- **Entry → Risk:** `EntryResult` should be the *sole* interface. Risk must never reach back into `SelectionResult` or the Analysis Layer directly — this is the boundary most likely to get shortcut under implementation time pressure, and shortcuts here are what make later refactors expensive.
+- **Entry → Execution State:** Entry Engine must not write to Execution State directly. Only Trade Manager, combining `EntryResult` + Risk output, should write it. Single-writer principle.
+- **Entry → Trade Manager:** Trade Manager consumes `EntryResult` but must not call back into Entry Engine mid-execution to "re-ask" for validation. If re-validation is needed, that's a fresh evaluation next bar, not a mutation of a prior result.
+
+No contracts need structural changes given your constraints — but I'd formalize the pattern explicitly: **every layer boundary passes an immutable, versioned artifact downstream, never a live reference.** That's already true for `SelectionResult`; making it an explicit rule (not just an emergent pattern) will keep Risk and Trade Manager design consistent when you get there.
+
+---
+
+## 9. Future Extensibility
+
+Supportable without redesign **only if** Entry Engine is built as a pluggable decision framework now (see addendum below — this is the load-bearing decision for this entire question).
+
+- **Kill Zones / News Filter:** these are context *gates*, not strategies. They belong in the Market Context Validation stage as composable, reusable checks — every strategy should be able to opt into them without duplicating logic.
+- **Multi-timeframe confirmation:** should be designed into Context Snapshot Assembly (optional HTF data pulled into the snapshot), not hardcoded into one specific strategy. Any strategy can then opt in.
+- **Silver Bullet, Judas Swing, multiple entry models:** this is exactly what argues for pluggable strategy evaluation instead of a single hardcoded model.
+
+---
+
+## 10. Hidden Architectural Risks
+
+Ranked by how expensive they get after freeze:
+
+1. **Hardcoding a single entry model.** By far the most expensive mistake to fix later — see addendum.
+2. **Embedding generic structure detection (BOS/CHoCH/OB/FVG) inside Entry Engine instead of a shared provider.** Every future strategy will duplicate or diverge on this logic if it's not extracted now.
+3. **Omitting Strategy ID / versioning from `EntryResult` now.** Retrofitting multi-strategy identification onto a contract that Risk and Trade Manager already depend on means touching every downstream consumer.
+4. **Choosing pure fail-fast now.** Retrofitting rich, multi-reason rejection diagnostics later means rewriting every validation stage's control flow.
+5. **Not planning for cross-bar pending state.** Several ICT models (e.g., "wait for CHoCH after sweep") inherently need multi-bar tracking. If Entry Engine is assumed fully stateless at first, adding this later is intrusive.
+
+---
+
+## Addendum: Pluggable Framework vs. Hardcoded Model
+
+**Recommendation: pluggable, via a Strategy Router pattern.**
+
+**Hardcoded single model**
+- ✅ Simpler and faster to ship Phase 6
+- ❌ Every new model (Silver Bullet, Judas Swing) requires touching the core pipeline directly — regression risk
+- ❌ Breaks from the modular, architecture-first philosophy the rest of this project has followed
+- ❌ Harder to isolate-test individual entry logic
+
+**Pluggable strategy framework**
+- ✅ Matches your existing architectural philosophy (frozen, modular layers)
+- ✅ Enables Q9's extensibility list without redesign
+- ✅ Each entry model testable in isolation
+- ✅ Multiple models can run concurrently if desired
+- ⚠️ Pine Script v6 has no real interfaces/polymorphism, so "pluggable" needs to be simulated
+
+**Practical resolution for Pine Script v6's constraints:** implement a **Strategy Router** — a single evaluation function that takes a `strategyType` enum and dispatches internally via conditional branching, rather than true interface-based polymorphism. This gets ~90% of the maintainability benefit of a genuine plugin architecture while working within Pine Script's procedural limitations, and it costs little to build now versus a lot to retrofit later.
+
+Given that you've explicitly named multiple future entry models (Q9) as a requirement, not a maybe, I'd treat this as the single highest-leverage decision in this entire review — build the router from day one, even if only one strategy (e.g., ICT Reversal) exists behind it initially.
+
+---
+
+## Suggested Implementation Phases
+
+| Phase | Scope |
+|---|---|
+| 6a | Design finalization (this document) — no code |
+| 6b | Context Snapshot Assembly + read-only interfaces into frozen Analysis Layer modules |
+| 6c | Structural Validation + Sweep Confirmation (pool-specific), single strategy (ICT Reversal) implemented **behind the Strategy Router from day one** |
+| 6d | EntryResult contract + Debug Dashboard integration |
+| 6e | Add a second strategy (e.g., Silver Bullet) specifically to validate that the router actually decouples cleanly — do this before committing further |
+| 7 | Risk layer |
+
+---
+
+## Summary of Recommended Changes to Your Draft
+
+1. Add a **Context Snapshot Assembly** step before Structural Validation.
+2. Extract generic structure/OB/FVG detection into a **shared Market Context Provider**, external to Entry Engine — Entry Engine only owns pool-specific sweep confirmation.
+3. Add **Strategy ID**, **SelectionResult version/ref**, and **timestamp/bar index** to the `EntryResult` contract.
+4. Use **hybrid failure propagation**: fail-fast on structural invalidation, exhaustive-and-aggregate on softer validations.
+5. Build the **Strategy Router pattern** now, even with one strategy behind it, rather than a hardcoded model.
+
+Everything else in your draft — the layer boundaries, the "never touch Registry/Execution/Risk" invariants, and the overall pipeline shape — is sound and doesn't need to change.
+
+---
+
+## Frozen: Entry Engine Output Contract
+
+*(Supersedes the singleton `EntryResult` framing used earlier in this document — this is the authoritative version.)*
+
+> The Entry Engine returns an immutable collection of `EntryResult` objects.
+>
+> Each `EntryResult` represents the qualification status of a single selected liquidity pool under a specific entry strategy.
+>
+> The Entry Engine performs qualification only. It does not prioritize, arbitrate, or authorize execution between qualified entries.
+>
+> During Phase 6, the collection is bounded by the current `SelectionResult` contract and may contain:
+> - Zero qualified entries
+> - One qualified entry
+> - Two qualified entries (one bullish and one bearish)
+>
+> Any future expansion of `SelectionResult` may increase the number of evaluated candidates without changing the `EntryResult` contract.
+>
+> Arbitration between multiple qualified entries is exclusively the responsibility of downstream modules (Risk Manager and Trade Manager).
+
+This closes the last open question from the review: Entry Engine's output shape is now a bounded, versionable collection rather than a singleton, which keeps arbitration cleanly out of scope and requires no contract change if `SelectionResult` is later widened.
