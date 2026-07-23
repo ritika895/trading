@@ -1,0 +1,622 @@
+//@version=6
+indicator("Gold ICT Pro Liquidity Engine [Phase 5.1]", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// =========================================================================
+// MODULE 1: USER SETTINGS & INPUTS
+// =========================================================================
+group_liquidity = "Liquidity Detection Settings"
+inp_lookback      = input.int(20, "Swing Lookback", minval=2, maxval=500, group=group_liquidity)
+inp_atr_mult      = input.float(1.5, "Merge Tolerance (ATR Mult)", minval=0.1, step=0.1, group=group_liquidity)
+inp_max_pools     = input.int(50, "Max Active Pools", minval=10, maxval=100, group=group_liquidity)
+
+group_sessions = "Session Settings"
+inp_asian_session   = input.session("0000-0600", "Asian Session", group=group_sessions)
+inp_london_session  = input.session("0700-1200", "London Session", group=group_sessions)
+inp_ny_session      = input.session("1200-1700", "New York Session", group=group_sessions)
+
+// =========================================================================
+// MODULE 2: CONSTANTS
+// =========================================================================
+// Colors
+const color COLOR_BULL   = color.new(color.teal, 0)
+const color COLOR_BEAR   = color.new(color.red, 0)
+const color COLOR_NEUTRAL= color.new(color.gray, 0)
+const color COLOR_TEXT   = color.new(color.white, 0)
+
+// Limits & Math
+const int   MAX_POOL_LIMIT = 100
+const float EPSILON        = 0.00001
+const float INVALID_PRICE  = -1.0
+const int   EXPIRATION_BARS = 500
+
+// =========================================================================
+// MODULE 3: ENUMERATIONS
+// =========================================================================
+// Pool Types
+enum PoolType
+    BULLISH
+    BEARISH
+    NEUTRAL
+
+// Lifecycle States
+enum LifecycleState
+    FORMED
+    ACTIVE
+    REINFORCED
+    SWEPT
+    INVALIDATED
+    EXPIRED
+
+// Session Types
+enum SessionType
+    NONE
+    ASIAN
+    LONDON
+    NEW_YORK
+
+// Event Types for Event Bus
+enum EventType
+    CREATED
+    REINFORCED
+    SWEPT
+    INVALIDATED
+    EXPIRED
+
+// Priority Classifications for Selection Engine
+enum PriorityClass
+    A_PLUS
+    A
+    B
+    C
+    D
+
+// Replacement Engine Decisions
+enum ReplacementDecision
+    KEEP_EXISTING
+    REPLACE_EXISTING
+    MERGE
+    IGNORE_NEW
+    NO_CONFLICT
+
+// =========================================================================
+// MODULE 4: COMMON TYPES (UDFs)
+// =========================================================================
+// Core Liquidity Pool Structure
+type LiquidityPool
+    int             id              // Unique identifier
+    PoolType        pType           // Bullish, Bearish, Neutral
+    LifecycleState  state           // Current lifecycle state
+    float           price           // Price level of the pool
+    int             barCreated      // Bar index of creation
+    int             lastTouchBar    // Last bar it was touched
+    int             touchCount      // Number of reinforcements
+    float           confidence      // 0.0 to 100.0
+    SessionType     sessionCreated  // Session in which it was created
+    bool            isSwept         // Sweep flag
+    label           visual          // Visual label handle for the pool
+    
+// Event Bus Structure
+type MarketEvent
+    EventType   eType
+    int         poolId
+    int         barIndex
+    float       price
+    string      message
+
+// Selection Data Structures
+type PoolScore
+    int     poolId
+    float   rawScore
+    float   normalizedScore
+
+type SelectionResult
+    int     bestBullishId
+    int     bestBearishId
+    int     bestOverallId
+
+type SelectionStatistics
+    int     eligibleCount
+    int     rankedCount
+    float   avgScore
+    float   highestScore
+
+// Replacement Engine Data Structures
+type ReplacementConfig
+    float   replacementTolerance
+    bool    enableReplacement
+    bool    enableMerge
+    bool    keepHighestConfidence
+    bool    keepNewestPool
+
+type ReplacementResult
+    ReplacementDecision  decision
+    int                  existingPoolIndex
+    int                  newPoolIndex
+    string               replacementReason
+    bool                 success
+
+// Phase 5.1 - Eligibility Result Structure
+type EligibilityResult
+    LiquidityPool[] eligiblePools
+    int             eligibleBullishCount
+    int             eligibleBearishCount
+    bool            integrityFlag
+
+// =========================================================================
+// MODULE 5: UTILITY FUNCTIONS
+// =========================================================================
+// Determine if a bar index is within a specific session
+f_get_session_type() =>
+    SessionType s = SessionType.NONE
+    // Using `time` with the current timeframe and session strings to determine active session
+    if not na(time(timeframe.period, inp_asian_session))
+        s := SessionType.ASIAN
+    else if not na(time(timeframe.period, inp_london_session))
+        s := SessionType.LONDON
+    else if not na(time(timeframe.period, inp_ny_session))
+        s := SessionType.NEW_YORK
+    s
+
+// Safely compare two float values for equality
+f_is_equal(float a, float b) =>
+    math.abs(a - b) < EPSILON
+
+// Safely check if price crosses a specific level
+f_is_crossed(float level, float barHigh, float barLow) =>
+    barHigh >= level and barLow <= level
+
+// Format price based on symbol's tick size
+f_format_price(float p) =>
+    str.tostring(p, format.mintick)
+
+// Generate a simple unique ID based on time and bar index
+f_generate_id() =>
+    int(timestamp(year, month, dayofmonth, hour, minute, second)) + bar_index
+
+// Temporary Debug Helper: Convert LifecycleState to String
+f_state_to_string(LifecycleState s) =>
+    string str = "UNKNOWN"
+    if s == LifecycleState.FORMED
+        str := "FORMED"
+    else if s == LifecycleState.ACTIVE
+        str := "ACTIVE"
+    else if s == LifecycleState.REINFORCED
+        str := "REINFORCED"
+    else if s == LifecycleState.SWEPT
+        str := "SWEPT"
+    else if s == LifecycleState.INVALIDATED
+        str := "INVALIDATED"
+    else if s == LifecycleState.EXPIRED
+        str := "EXPIRED"
+    str
+
+// =========================================================================
+// PHASE 1: DETECTION LAYER
+// =========================================================================
+// Detection arrays to hold raw levels before becoming Candidate Pools
+var float[] detection_highs = array.new_float(0)
+var float[] detection_lows  = array.new_float(0)
+
+// Detect swing highs and lows based on lookback
+f_detect_swings() =>
+    float swingHigh = ta.pivothigh(high, inp_lookback, inp_lookback)
+    float swingLow  = ta.pivotlow(low, inp_lookback, inp_lookback)
+    
+    if bar_index >= inp_lookback
+        if not na(swingHigh)
+            array.push(detection_highs, swingHigh)
+            
+        if not na(swingLow)
+            array.push(detection_lows, swingLow)
+            
+        // Keep arrays bounded to prevent memory issues
+        if array.size(detection_highs) > MAX_POOL_LIMIT
+            array.shift(detection_highs)
+        if array.size(detection_lows) > MAX_POOL_LIMIT
+            array.shift(detection_lows)
+
+// Generate Candidate Pools from detected swings
+f_generate_candidates() =>
+    LiquidityPool[] candidates = array.new<LiquidityPool>(0)
+    SessionType currentSession = f_get_session_type()
+    
+    if array.size(detection_highs) > 0
+        float topHigh = array.get(detection_highs, array.size(detection_highs) - 1)
+        LiquidityPool bearPool = LiquidityPool.new(
+             id              = f_generate_id(),
+             pType           = PoolType.BEARISH,
+             state           = LifecycleState.FORMED,
+             price           = topHigh,
+             barCreated      = bar_index - inp_lookback,
+             lastTouchBar    = bar_index - inp_lookback,
+             touchCount      = 0,
+             confidence      = 50.0,
+             sessionCreated  = currentSession,
+             isSwept         = false,
+             visual          = na
+         )
+        array.push(candidates, bearPool)
+        array.pop(detection_highs)
+        
+    if array.size(detection_lows) > 0
+        float topLow = array.get(detection_lows, array.size(detection_lows) - 1)
+        LiquidityPool bullPool = LiquidityPool.new(
+             id              = f_generate_id(),
+             pType           = PoolType.BULLISH,
+             state           = LifecycleState.FORMED,
+             price           = topLow,
+             barCreated      = bar_index - inp_lookback,
+             lastTouchBar    = bar_index - inp_lookback,
+             touchCount      = 0,
+             confidence      = 50.0,
+             sessionCreated  = currentSession,
+             isSwept         = false,
+             visual          = na
+         )
+        array.push(candidates, bullPool)
+        array.pop(detection_lows)
+         
+    candidates
+
+// =========================================================================
+// PHASE 2: REGISTRY
+// =========================================================================
+// Global Registry Array
+var LiquidityPool[] registry = array.new<LiquidityPool>(0)
+
+// Add a pool to the registry or update it if it already exists
+f_registry_add(LiquidityPool pool) =>
+    bool exists = false
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            // Uniqueness defined by ID, Price, and Type to avoid duplicates
+            if p.id == pool.id or (f_is_equal(p.price, pool.price) and p.pType == pool.pType)
+                exists := true
+                // Update existing pool logic
+                p.lastTouchBar := pool.lastTouchBar
+                p.touchCount   := p.touchCount + 1
+                
+                // Update existing label instead of creating a new one
+                if not na(p.visual)
+                    label.set_xy(p.visual, bar_index, p.price)
+                    label.set_text(p.visual, "Pool: " + f_format_price(p.price) + " (Touches: " + str.tostring(p.touchCount) + ")")
+                break
+                
+    if not exists
+        // Create new label handle on first discovery
+        pool.visual := label.new(bar_index, pool.price, "Pool: " + f_format_price(pool.price) + " (Touches: " + str.tostring(pool.touchCount) + ")", color=color.blue, style=label.style_label_down)
+        array.push(registry, pool)
+        
+// Lookup a pool by ID
+f_registry_lookup(int id) =>
+    LiquidityPool foundPool = na
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            if p.id == id
+                foundPool := p
+                break
+    foundPool
+
+// Maintain registry size limits
+f_registry_maintain() =>
+    while array.size(registry) > inp_max_pools
+        LiquidityPool oldPool = array.shift(registry)
+        if not na(oldPool.visual)
+            label.delete(oldPool.visual)
+
+// =========================================================================
+// PHASE 3: LIFECYCLE MANAGER
+// =========================================================================
+// Manages the state transitions of all pools in the registry
+f_lifecycle_update() =>
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            
+            // Skip processing if already in a terminal state
+            if p.state == LifecycleState.INVALIDATED or p.state == LifecycleState.EXPIRED
+                // Just ensure label is up to date if it was somehow missed
+                if not na(p.visual)
+                    label.set_text(p.visual, "Price: " + f_format_price(p.price) + "\nState: " + f_state_to_string(p.state) + "\nTouches: " + str.tostring(p.touchCount))
+                continue
+                
+            // Transition FORMED to ACTIVE
+            if p.state == LifecycleState.FORMED and bar_index > p.barCreated
+                p.state := LifecycleState.ACTIVE
+                
+            // Check for expiration (no touch for X bars)
+            if bar_index - p.lastTouchBar > EXPIRATION_BARS and p.state != LifecycleState.SWEPT
+                p.state := LifecycleState.EXPIRED
+                if not na(p.visual)
+                    label.set_color(p.visual, color.gray)
+                continue
+                
+            bool isTouched = false
+            bool isSwept = false
+            bool isInvalidated = false
+            
+            if p.pType == PoolType.BULLISH
+                isTouched := low <= p.price
+                isSwept := low < p.price and close > p.price
+                isInvalidated := close < p.price
+            else if p.pType == PoolType.BEARISH
+                isTouched := high >= p.price
+                isSwept := high > p.price and close < p.price
+                isInvalidated := close > p.price
+                
+            if isInvalidated
+                p.state := LifecycleState.INVALIDATED
+                if not na(p.visual)
+                    label.set_color(p.visual, color.red)
+            else if isSwept and p.state != LifecycleState.SWEPT
+                p.state := LifecycleState.SWEPT
+                p.isSwept := true
+                if not na(p.visual)
+                    label.set_color(p.visual, color.orange)
+            else if isTouched and p.state == LifecycleState.ACTIVE
+                p.state := LifecycleState.REINFORCED
+                p.lastTouchBar := bar_index
+                p.touchCount := p.touchCount + 1
+                if not na(p.visual)
+                    label.set_color(p.visual, color.purple)
+            
+            // Temporary Debug: Update label text dynamically to show current state
+            if not na(p.visual)
+                label.set_xy(p.visual, bar_index, p.price)
+                label.set_text(p.visual, "Price: " + f_format_price(p.price) + "\nState: " + f_state_to_string(p.state) + "\nTouches: " + str.tostring(p.touchCount))
+
+// =========================================================================
+// PHASE 4: REPLACEMENT ENGINE - STEP 1 (FOUNDATION)
+// =========================================================================
+// Global replacement configuration
+var ReplacementConfig global_replacement_config = ReplacementConfig.new(
+    replacementTolerance   = 0.0, // Tolerance level for price comparison
+    enableReplacement      = true,
+    enableMerge            = true,
+    keepHighestConfidence  = true,
+    keepNewestPool         = false
+)
+
+// Utility function to create a replacement result object
+f_create_replacement_result(ReplacementDecision decision, int existingIdx, int newIdx, string reason, bool success) =>
+    ReplacementResult.new(
+        decision            = decision,
+        existingPoolIndex   = existingIdx,
+        newPoolIndex        = newIdx,
+        replacementReason   = reason,
+        success             = success
+    )
+
+// =========================================================================
+// PHASE 4: REPLACEMENT ENGINE - STEP 2 (CONFLICT DETECTION)
+// =========================================================================
+// Pure function: Checks if a new pool conflicts with any existing pool in the registry
+replacement_hasConflict(LiquidityPool pool, float tolerance) =>
+    bool found = false
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            if p.pType == pool.pType
+                float dist = math.abs(p.price - pool.price)
+                if dist <= tolerance
+                    found := true
+                    break
+    found
+
+// Pure function: Finds the conflicting pool and returns details
+replacement_findConflict(LiquidityPool pool, float tolerance) =>
+    bool found = false
+    int index = -1
+    float distance = -1.0
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            if p.pType == pool.pType
+                float dist = math.abs(p.price - pool.price)
+                if dist <= tolerance
+                    found := true
+                    index := i
+                    distance := dist
+                    break
+    [found, index, distance]
+
+// =========================================================================
+// PHASE 4: REPLACEMENT ENGINE - STEP 3 (REPLACEMENT DECISION ENGINE)
+// =========================================================================
+// Pure function: Decides the action based on conflict and pool properties
+replacement_decideAction(LiquidityPool newPool, LiquidityPool existingPool, bool hasConflict, ReplacementConfig config) =>
+    ReplacementDecision decision = ReplacementDecision.NO_CONFLICT
+    
+    if not hasConflict
+        decision := ReplacementDecision.NO_CONFLICT
+    else if not config.enableReplacement
+        decision := ReplacementDecision.KEEP_EXISTING
+    else if newPool.confidence < 30.0 // Arbitrary "poor quality" threshold for decision making
+        decision := ReplacementDecision.IGNORE_NEW
+    else if existingPool.confidence > newPool.confidence
+        decision := ReplacementDecision.KEEP_EXISTING
+    else if newPool.confidence > existingPool.confidence
+        decision := ReplacementDecision.REPLACE_EXISTING
+    else if config.enableMerge and newPool.pType == existingPool.pType
+        decision := ReplacementDecision.MERGE
+    else
+        decision := ReplacementDecision.KEEP_EXISTING // Default fallback for equal confidence without merge
+        
+    decision
+
+// =========================================================================
+// PHASE 5.1: POOL SELECTION ENGINE - ELIGIBILITY FILTERING
+// =========================================================================
+// Pure function: Filters registry for eligible pools based on lifecycle state
+f_filter_eligible_pools() =>
+    EligibilityResult result = EligibilityResult.new(
+        eligiblePools         = array.new<LiquidityPool>(0),
+        eligibleBullishCount  = 0,
+        eligibleBearishCount  = 0,
+        integrityFlag         = true
+    )
+    
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            
+            // Accept ACTIVE, REINFORCED, and SWEPT (as they are not terminal states)
+            if p.state == LifecycleState.ACTIVE or p.state == LifecycleState.REINFORCED or p.state == LifecycleState.SWEPT
+                array.push(result.eligiblePools, p)
+                
+                if p.pType == PoolType.BULLISH
+                    result.eligibleBullishCount += 1
+                else if p.pType == PoolType.BEARISH
+                    result.eligibleBearishCount += 1
+                    
+    // Verify integrity: counts must match array size
+    if result.eligibleBullishCount + result.eligibleBearishCount != array.size(result.eligiblePools)
+        result.integrityFlag := false
+        
+    result
+
+// =========================================================================
+// INTEGRITY CHECK & EXECUTION
+// =========================================================================
+// Execute detection
+f_detect_swings()
+
+// Generate candidates
+LiquidityPool[] stage1_candidates = f_generate_candidates()
+
+// Conflict Detection Debug Variables
+int checks_this_bar = 0
+int conflicts_this_bar = 0
+float current_tolerance = ta.atr(14) * inp_atr_mult
+
+// Decision Counters (Global tracking)
+var int decision_keep = 0
+var int decision_replace = 0
+var int decision_merge = 0
+var int decision_ignore = 0
+var int decision_no_conflict = 0
+
+if array.size(stage1_candidates) > 0
+    for i = 0 to array.size(stage1_candidates) - 1
+        LiquidityPool candidate = array.get(stage1_candidates, i)
+        checks_this_bar += 1
+        [hasConflict, conflictIdx, dist] = replacement_findConflict(candidate, current_tolerance)
+        
+        if hasConflict
+            conflicts_this_bar += 1
+            LiquidityPool existing = array.get(registry, conflictIdx)
+            ReplacementDecision dec = replacement_decideAction(candidate, existing, true, global_replacement_config)
+            
+            if dec == ReplacementDecision.KEEP_EXISTING
+                decision_keep += 1
+            else if dec == ReplacementDecision.REPLACE_EXISTING
+                decision_replace += 1
+            else if dec == ReplacementDecision.MERGE
+                decision_merge += 1
+            else if dec == ReplacementDecision.IGNORE_NEW
+                decision_ignore += 1
+        else
+            decision_no_conflict += 1
+
+// Integrate candidates into Registry
+if array.size(stage1_candidates) > 0
+    for i = 0 to array.size(stage1_candidates) - 1
+        f_registry_add(array.get(stage1_candidates, i))
+
+// Maintain registry size
+f_registry_maintain()
+
+// Execute Lifecycle Manager
+f_lifecycle_update()
+
+// Execute Eligibility Filter
+EligibilityResult eligibility_data = f_filter_eligible_pools()
+
+// =========================================================================
+// TEMPORARY DEBUG DASHBOARD
+// =========================================================================
+var table debug_table = table.new(position.top_right, 2, 19, border_width = 1)
+
+if barstate.islast
+    int count_formed = 0
+    int count_active = 0
+    int count_reinforced = 0
+    int count_swept = 0
+    int count_invalidated = 0
+    int count_expired = 0
+
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            LiquidityPool p = array.get(registry, i)
+            if p.state == LifecycleState.FORMED
+                count_formed += 1
+            else if p.state == LifecycleState.ACTIVE
+                count_active += 1
+            else if p.state == LifecycleState.REINFORCED
+                count_reinforced += 1
+            else if p.state == LifecycleState.SWEPT
+                count_swept += 1
+            else if p.state == LifecycleState.INVALIDATED
+                count_invalidated += 1
+            else if p.state == LifecycleState.EXPIRED
+                count_expired += 1
+
+    table.cell(debug_table, 0, 0, "State", bgcolor=color.gray, text_color=color.white)
+    table.cell(debug_table, 1, 0, "Count", bgcolor=color.gray, text_color=color.white)
+    
+    table.cell(debug_table, 0, 1, "FORMED", bgcolor=color.new(color.blue, 80))
+    table.cell(debug_table, 1, 1, str.tostring(count_formed), bgcolor=color.new(color.blue, 80))
+    
+    table.cell(debug_table, 0, 2, "ACTIVE", bgcolor=color.new(color.teal, 80))
+    table.cell(debug_table, 1, 2, str.tostring(count_active), bgcolor=color.new(color.teal, 80))
+    
+    table.cell(debug_table, 0, 3, "REINFORCED", bgcolor=color.new(color.purple, 80))
+    table.cell(debug_table, 1, 3, str.tostring(count_reinforced), bgcolor=color.new(color.purple, 80))
+    
+    table.cell(debug_table, 0, 4, "SWEPT", bgcolor=color.new(color.orange, 80))
+    table.cell(debug_table, 1, 4, str.tostring(count_swept), bgcolor=color.new(color.orange, 80))
+    
+    table.cell(debug_table, 0, 5, "INVALIDATED", bgcolor=color.new(color.red, 80))
+    table.cell(debug_table, 1, 5, str.tostring(count_invalidated), bgcolor=color.new(color.red, 80))
+    
+    table.cell(debug_table, 0, 6, "EXPIRED", bgcolor=color.new(color.gray, 80))
+    table.cell(debug_table, 1, 6, str.tostring(count_expired), bgcolor=color.new(color.gray, 80))
+    
+    table.cell(debug_table, 0, 7, "Checks", bgcolor=color.new(color.black, 80), text_color=color.white)
+    table.cell(debug_table, 1, 7, str.tostring(checks_this_bar), bgcolor=color.new(color.black, 80), text_color=color.white)
+    
+    table.cell(debug_table, 0, 8, "Conflicts", bgcolor=color.new(color.yellow, 80), text_color=color.black)
+    table.cell(debug_table, 1, 8, str.tostring(conflicts_this_bar), bgcolor=color.new(color.yellow, 80), text_color=color.black)
+    
+    table.cell(debug_table, 0, 9, "DECISIONS", bgcolor=color.new(color.white, 0), text_color=color.black)
+    table.cell(debug_table, 1, 9, "Count", bgcolor=color.new(color.white, 0), text_color=color.black)
+    
+    table.cell(debug_table, 0, 10, "KEEP_EXIST", bgcolor=color.new(color.green, 80))
+    table.cell(debug_table, 1, 10, str.tostring(decision_keep), bgcolor=color.new(color.green, 80))
+    
+    table.cell(debug_table, 0, 11, "REPLACE", bgcolor=color.new(color.red, 80))
+    table.cell(debug_table, 1, 11, str.tostring(decision_replace), bgcolor=color.new(color.red, 80))
+    
+    table.cell(debug_table, 0, 12, "MERGE", bgcolor=color.new(color.purple, 80))
+    table.cell(debug_table, 1, 12, str.tostring(decision_merge), bgcolor=color.new(color.purple, 80))
+    
+    table.cell(debug_table, 0, 13, "IGNORE_NEW", bgcolor=color.new(color.orange, 80))
+    table.cell(debug_table, 1, 13, str.tostring(decision_ignore), bgcolor=color.new(color.orange, 80))
+    
+    table.cell(debug_table, 0, 14, "NO_CONFLICT", bgcolor=color.new(color.gray, 80))
+    table.cell(debug_table, 1, 14, str.tostring(decision_no_conflict), bgcolor=color.new(color.gray, 80))
+    
+    // Phase 5.1 Eligibility Metrics
+    table.cell(debug_table, 0, 15, "ELIGIBILITY", bgcolor=color.new(color.white, 0), text_color=color.black)
+    table.cell(debug_table, 1, 15, "Stats", bgcolor=color.new(color.white, 0), text_color=color.black)
+    
+    table.cell(debug_table, 0, 16, "Eligible Pools", bgcolor=color.new(color.navy, 80), text_color=color.white)
+    table.cell(debug_table, 1, 16, str.tostring(array.size(eligibility_data.eligiblePools)), bgcolor=color.new(color.navy, 80), text_color=color.white)
+    
+    table.cell(debug_table, 0, 17, "Bull Eligible", bgcolor=color.new(color.teal, 80))
+    table.cell(debug_table, 1, 17, str.tostring(eligibility_data.eligibleBullishCount), bgcolor=color.new(color.teal, 80))
+    
+    table.cell(debug_table, 0, 18, "Bear Eligible", bgcolor=color.new(color.red, 80))
+    table.cell(debug_table, 1, 18, str.tostring(eligibility_data.eligibleBearishCount), bgcolor=color.new(color.red, 80))
