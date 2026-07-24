@@ -1,0 +1,311 @@
+# Gold ICT Pro Liquidity Engine — Master Architecture Review v1.0
+
+**Scope:** Review only. No Pine Script. No redesign of frozen modules unless a critical flaw is found.
+**Status of frozen layers:** Layer 0–4 (Selection → Analysis → Strategy Framework → Arbitration → Recommendation) treated as immutable except where noted in §9.
+
+---
+
+## 0. Executive Summary
+
+The current pipeline (Selection → Analysis → Strategy Framework → Arbitration → Recommendation) is a sound **signal-generation core**. Its biggest strength is the frozen rule that `EntryRecommendation Builder` is a passive 1:1 transformation with zero business logic — this is exactly the kind of boundary a production quant system needs, because it guarantees the "decision" and the "instruction to trade" are decoupled.
+
+The main gaps are not inside the frozen layers — they're **around** them. A signal engine is not a trading system until it is wrapped in Risk, Execution, State/Persistence, Observability, and Analytics layers that are equally disciplined about one-way data flow and single responsibility. Sections 3, 4, and 9 are the most important to read before you start the Risk Layer, because the decisions you make there (module boundaries, communication rules, event logging) are far more expensive to retrofit later than anything in Layers 0–4.
+
+No critical flaw was found that requires reopening the frozen layers. One near-flaw is flagged in §9 (StrategyResult\[] fan-in ambiguity) with a non-breaking contract addition recommended.
+
+---
+
+## 1. Layering Review
+
+**Is the current layering appropriate?** Yes, with one conceptual refinement.
+
+The five frozen layers map cleanly onto the classic quant-system separation:
+
+- Layer 0 (Selection) = *what am I looking at* (symbol/timeframe/session selection)
+- Layer 1 (Analysis) = *what is objectively true about the market* (structure, sweeps, context)
+- Layer 2 (Strategy Framework) = *what do my strategies think should happen* (opinion generation)
+- Layer 3 (Arbitration) = *which opinion wins* (conflict resolution)
+- Layer 4 (Recommendation) = *translate the winning opinion into a neutral, transportable object*
+
+This is the correct shape: **fact-finding is separated from opinion-forming, and opinion-forming is separated from arbitration.** A professional quant team would recognize this pattern immediately — it mirrors the "features → alpha signals → portfolio construction" separation used in systematic equities, adapted for a single-instrument discretionary-style ruleset.
+
+**What a professional team would likely name differently (not restructure, just rename/clarify):**
+
+- Layer 1 "Analysis" is really two sub-concerns bundled under one label: **market-state derivation** (Structural Validation, Sweep Validation) and **market-state synthesis** (Market Context, ValidationSummary). This isn't a flaw — it's fine as one layer — but it's worth documenting the internal seam now, because Sweep Validation and Structural Validation are independently reusable primitives that future strategies (Layer 2) may eventually want to query directly for lightweight checks. Keep them logically separable inside Layer 1 even though they stay in the same layer.
+- "Arbitration" is doing **portfolio-construction-lite** — with only one instrument and (currently) one position at a time, it behaves like a simple priority/conflict resolver. If multi-symbol or multi-position trading is ever added (see §7), Arbitration is the layer that will need to evolve into something closer to a true portfolio construction step. Naming it "Arbitration Engine" today rather than "Signal Combiner" is the right call — it already anticipates that future.
+
+**Verdict:** No layer reordering needed. No layer merging needed. No layer splitting needed at v1.0. The five-layer signal core is production-appropriate.
+
+---
+
+## 2. Separation of Responsibilities
+
+Reviewed module-by-module for single-responsibility violations.
+
+| Module | Stated Responsibility | Violation Found? | Notes |
+|---|---|---|---|
+| Selection Engine | Choose symbol/session/timeframe scope | None | Clean boundary; outputs a pure result object |
+| Context Snapshot | Capture raw market state at a point in time | None | Should remain a dumb data capture, not an evaluator |
+| Structural Validation | Judge structural conditions | None | Single concern |
+| Sweep Validation | Judge liquidity-sweep conditions | None | Single concern |
+| Market Context | Synthesize structural + sweep findings into context | Watch list | This is a fan-in module. If it starts adding *new* derived judgments (not just aggregating upstream results), it will silently acquire a second responsibility (deriving facts, not just aggregating them). Keep it strictly an aggregator. |
+| Strategy Registry | Hold/expose available strategies | None | Pure registry pattern |
+| Strategy Context Enrichment | Attach ValidationSummary + metadata to a strategy-ready context | Watch list | Enrichment modules are a classic place where filtering logic creeps in ("only enrich if X"). At v1.0 it appears to be pure attachment — keep it that way. Filtering belongs in the Router or the strategies themselves, never in Enrichment. |
+| Strategy Router | Route enriched context to applicable strategies | None, if it only routes | Confirm it does not also *score* or *filter by quality* — that's Arbitration's job. Routing should only ask "is this strategy eligible to run," never "is this strategy's output good." |
+| Strategies | Produce a StrategyResult per strategy | None | Correctly isolated — each strategy is a pure function of StrategyContext → StrategyResult |
+| Arbitration Engine | Resolve StrategyResult[] into one ArbitrationResult | None | This is correctly the *only* place conflict resolution happens |
+| EntryRecommendation Builder | 1:1 passive transform | None (by design, and frozen) | This is the cleanest module in the system — preserve exactly as-is |
+
+**Overall finding:** No genuine single-responsibility violations exist today. Two modules (Market Context, Strategy Context Enrichment) are architecturally *at risk* of scope creep because their names invite "just one more small judgment call here" additions. Recommend documenting these two as **aggregation-only, judgment-free** in code comments/module contracts so future contributors don't quietly turn them into decision points. This is a documentation recommendation, not a redesign.
+
+---
+
+## 3. Missing Layers
+
+The signal core is complete, but a production system needs the following layers. Recommended **only** where they provide durable long-term value — each is justified below rather than listed reflexively.
+
+### 3.1 Risk Layer *(already planned)*
+Position sizing, per-trade risk %, daily/weekly loss limits, correlation/exposure limits, prop-firm rule enforcement (drawdown ceilings, consistency rules, news-blackout windows). This is where "can I take this trade, and how big" is decided. Must never talk to Layers 0–4.
+
+### 3.2 Execution Authorization Layer *(already planned)*
+The gate between "Risk says this trade is sizeable and acceptable" and "an order is actually sent." This is intentionally a separate layer from Risk itself, because Authorization also needs to check things Risk doesn't own: market hours, broker connectivity state, symbol tradability, spread/slippage sanity checks, kill-switch state. Keeping this separate from Risk means a broker outage or a manual kill-switch never has to be modeled as a "risk" concept.
+
+### 3.3 Trade Manager *(already planned)*
+Owns the lifecycle of a trade **after** it's live: breakeven moves, partial closes, trailing logic, time-based exits. This must be a distinct layer from Execution — Execution places/modifies orders on command, Trade Manager decides *when* to issue those commands.
+
+### 3.4 Performance Analytics *(missing, recommend adding)*
+Consumes closed-trade records to produce per-strategy win rate, expectancy, R-multiple distribution, drawdown curves, and — critically for this system — **per-strategy attribution**, since Arbitration will eventually be choosing between many strategies. Without this layer you cannot answer "is Strategy #14 actually adding value or is Arbitration just picking it by coincidence." Justification: with 50+ strategies planned (§7), attribution is not optional, it's the only way to prune or retrain strategies responsibly.
+
+### 3.5 Event Log / Audit Trail (missing, recommend adding)
+An append-only, immutable log of every contract object produced at every layer boundary (SelectionResult, ValidationSummary, StrategyResult\[], ArbitrationResult, EntryRecommendation, RiskDecision, ExecutionOrder, TradeUpdate). Justification: this is the single highest-leverage addition you can make before Risk/Execution exist, because (a) it is the backbone of historical replay and paper-trading validation (§8), (b) it is what lets you reconstruct *why* a trade happened months later for prop-firm audits or dispute resolution, and (c) retrofitting it after Execution exists is far more painful than building it in from day one, since every layer boundary is already a natural log point.
+
+### 3.6 Configuration Layer (missing, recommend adding)
+Centralized, versioned config for per-strategy parameters, per-broker specifics, per-prop-firm rule sets, and per-environment (live/paper/backtest) settings. Justification: with multiple strategies × multiple brokers × multiple prop firms planned, hardcoded or scattered config becomes a combinatorial maintenance problem almost immediately. This does not need to be built now, but the *contracts* (§5) should be designed so a config layer can be slotted in without touching Layers 0–4.
+
+### 3.7 Persistence Layer (missing, recommend adding conceptually, not built yet)
+State storage for open positions, strategy state (if any strategies become stateful/adaptive), and the event log itself. Justification: MT5 integration and live trading both require crash recovery — if the process restarts mid-trade, the system needs to reconstruct "what do I currently hold and why" from persisted state, not from memory.
+
+### 3.8 Monitoring / Alerting (missing, recommend adding, lightweight)
+Health checks (broker connection alive, data feed alive, last-heartbeat timestamps) and threshold alerts (drawdown approaching limit, unusual error rate). This is operational, not architectural, but the *hooks* for it should exist at each layer boundary from day one (cheap to add now, expensive to retrofit into a live system).
+
+**Not recommended at this stage:** a dedicated Machine Learning layer. ML enhancements (mentioned in the objective) should plug in as an additional *strategy* inside the existing Strategy Framework (Layer 2), or as an additional *signal* feeding Market Context — not as a new top-level layer. Introducing a top-level ML layer now would be speculative architecture for a capability that doesn't exist yet, and it already has a natural home in the current design.
+
+---
+
+## 4. Module Communication Matrix
+
+Core rule: **data flows strictly downstream through the layer boundaries already frozen; no layer may reach backward or skip forward.** The table below governs cross-layer and cross-module reads.
+
+| Module | May Read | May NOT Read |
+|---|---|---|
+| Selection Engine | Raw market/session data | Anything from Layers 1–4 |
+| Context Snapshot | Selection Engine output (SelectionResult) | Structural/Sweep Validation, Strategies, Arbitration |
+| Structural Validation | Context Snapshot | Sweep Validation's internal state, Strategy layer, Arbitration |
+| Sweep Validation | Context Snapshot | Structural Validation's internal state, Strategy layer, Arbitration |
+| Market Context | Structural Validation + Sweep Validation outputs only | Raw Context Snapshot directly (must go through the two Validation modules, not around them), Strategy layer |
+| ValidationSummary (contract, not a module) | — | — |
+| Strategy Registry | Static strategy definitions/config | ValidationSummary, market data (registry is metadata-only) |
+| Strategy Context Enrichment | ValidationSummary + Strategy Registry metadata | Individual Strategy internals, StrategyResult, Arbitration |
+| Strategy Router | Enriched Strategy Context, Strategy Registry (eligibility rules) | StrategyResult (routing happens before results exist), Arbitration logic |
+| Strategies | Only their own enriched StrategyContext | Other strategies' contexts or results, Arbitration, Recommendation, Risk |
+| Arbitration Engine | StrategyResult[] (all of them, read-only) | Raw ValidationSummary, Context Snapshot, or any Layer 0/1 internals directly — it must reason only over StrategyResult[] |
+| EntryRecommendation Builder | ArbitrationResult only | Anything else — this is the frozen 1:1 rule; even ValidationSummary must not leak in here |
+| **Risk Layer (future)** | EntryRecommendation, account state, prop-firm config, open-position state | Strategies, Arbitration internals, ValidationSummary — Risk must be able to evaluate any EntryRecommendation without knowing *how* it was derived |
+| **Execution Authorization (future)** | Risk Layer's decision, broker/session state | Strategies, Arbitration, raw market analysis |
+| **Trade Manager (future)** | Live position state, Execution Layer confirmations | Selection/Analysis/Strategy layers directly — must react to price/time and its own position state only |
+| **Broker/MT5 adapter (future)** | Execution/Trade Manager commands | Anything above Execution — the broker adapter should be the "dumbest" module in the system |
+| **Event Log (future, cross-cutting)** | Read-only subscriber to every contract at every boundary | Nothing writes back into it except appends; it must never be queried *by* upstream layers to influence decisions (that would create a hidden feedback loop) |
+| **Performance Analytics (future)** | Event Log / closed-trade records only | Live Strategies/Arbitration/Risk — analytics must be strictly offline/downstream so it can never accidentally influence a live decision path |
+
+**Key architectural rule to carry forward:** the Event Log is a **sink**, never a **source**, for the live decision path. Analytics reads from history; nothing in the live path reads from Analytics. This prevents a very common institutional-system bug where "smart" feedback loops (e.g., a strategy quietly adjusting itself based on its own recent performance) bypass Risk and Arbitration entirely.
+
+---
+
+## 5. Contract Review
+
+Reviewing each immutable contract for long-term maintainability gaps. All additions below are **additive/optional fields** — none require breaking existing frozen structures.
+
+| Contract | Adequate As-Is? | Recommended Additions (non-breaking) |
+|---|---|---|
+| SelectionResult | Mostly | `selectionTimestamp`, `selectionId` (for event-log correlation) |
+| ContextSnapshot | Mostly | `snapshotId`, `sourceDataVersion` (which feed/version produced this — matters once you have multiple brokers/data sources) |
+| ValidationSummary | Mostly | `validationId`, back-reference `snapshotId` (for audit-trail traceability) |
+| StrategyContext | Mostly | `strategyId`, `contextId` |
+| StrategyResult | **Gap** | Add `confidence`/`strength` score (optional, strategy-populated) if not already present — without this, Arbitration can only do rule-based conflict resolution, never weighted/ranked resolution, which will matter as strategy count grows (§7). Also add `strategyVersion` (so Analytics can distinguish results from Strategy v1 vs v2 of the same strategy id). |
+| ArbitrationResult | **Gap** | Add `rejectedCandidates` (the StrategyResult[] that lost, with a short reason code each) — this is cheap to add now and becomes extremely valuable for Performance Analytics and for debugging "why didn't Strategy X fire even though its conditions looked right." Without this field, that information is lost forever the moment Arbitration completes. |
+| EntryRecommendation | Mostly | `recommendationId`, `arbitrationResultId` (traceability chain back through every contract) — required once the Risk Layer needs to log *why* a decision was made, and required for the Event Log (§3.5) to be genuinely queryable end-to-end. |
+
+**General recommendation:** every contract should carry a unique `id` and, where it's a derived object, a back-reference to the id of the contract it was derived from. This costs almost nothing today and is the difference between "we can trace any trade back to its exact market conditions" and "we can't," which matters enormously for prop-firm audits, debugging, and Performance Analytics.
+
+**No structural changes recommended** — field additions only. This does not violate the frozen-architecture constraint since additive fields don't change any module's logic or the 1:1 passive-transform rule.
+
+---
+
+## 6. Trade Lifecycle
+
+Proposed lifecycle, extending the one in the brief with the layers from §3:
+
+```
+Market
+   ↓
+Selection            (Layer 0)
+   ↓
+Analysis             (Layer 1)
+   ↓
+Strategy Framework    (Layer 2)
+   ↓
+Arbitration          (Layer 3)
+   ↓
+Recommendation       (Layer 4 — frozen boundary)
+   ↓
+Risk Evaluation       (position size, limits, prop-firm rules)
+   ↓
+Execution Authorization (broker/session/kill-switch checks)
+   ↓
+Order Execution        (Broker/MT5 adapter)
+   ↓
+Trade Management       (breakeven, partials, trailing, time exit)
+   ↓
+Trade Closed → Event Log (append-only record)
+   ↓
+Performance Analytics  (offline, batch/periodic)
+        ↺ (insight feeds back only into human/strategy-design decisions,
+           never automatically into the live path — see §4 sink rule)
+```
+
+**Should this lifecycle change from the brief's proposal?** Only one refinement: the brief's version goes `Recommendation → Risk → Authorization → Execution → Trade Management → Performance Analytics` directly. This review recommends inserting the **Event Log as a parallel, passive listener at every arrow**, not as a sequential step. Every transition above should emit an event; Event Log does not sit *in* the critical path (it must never block or slow a live decision), it sits *beside* it. This is a subtle but important distinction: Event Log is an observer pattern, not a pipeline stage.
+
+---
+
+## 7. Scalability Assessment
+
+| Requirement | Supported without redesign? | Notes |
+|---|---|---|
+| 50+ strategies | **Yes** | Strategy Registry + Router pattern already supports N strategies. The one thing to add before scaling to 50+ is the `confidence` field in StrategyResult (§5) so Arbitration can rank rather than only rule-match — this becomes necessary, not optional, once conflicts among many strategies get common. |
+| Multiple risk profiles | **Yes, if Risk Layer is designed for it from the start** | Risk Layer should accept a `riskProfileId` as an input parameter (part of Execution context/config, §3.6) rather than hardcoding one profile. This is a Risk Layer design note, not a Layer 0–4 change. |
+| Multiple brokers | **Yes, if Execution/Broker adapter is designed as an interface, not a concrete MT5 binding** | The Broker adapter (§4) should be built as a pluggable interface from day one, even though only MT5 exists today. Retrofitting a second broker later is only cheap if this boundary is respected from the start. |
+| Multiple prop firms | **Yes, via Risk Layer config** | Prop-firm rules (drawdown ceilings, consistency rules, etc.) belong entirely inside Risk Layer's configuration, never inside Layers 0–4. Confirmed no conflict with frozen architecture. |
+| Multi-symbol trading | **Partially — Arbitration will need to evolve** | Today Arbitration resolves conflicting *opinions about one instrument*. Multi-symbol introduces portfolio-level concerns (correlated exposure, aggregate risk across symbols) that don't fit cleanly into today's single-instrument Arbitration Engine. This is not a flaw in the frozen layers — Selection/Analysis/Strategy Framework are already symbol-scoped and would simply run in parallel per symbol — but Arbitration and Risk will both need a *portfolio-level* view added above the current per-symbol Arbitration. Recommend treating this as a new, additive "Portfolio Arbitration" layer sitting above per-symbol Arbitration when multi-symbol is actually built, rather than modifying Arbitration itself. |
+| Multiple execution engines | **Yes** | Falls out naturally from the Broker adapter being an interface (see "multiple brokers" above) plus Execution Authorization being broker-agnostic. |
+
+**Overall:** the frozen signal core scales cleanly to 50+ strategies and multiple brokers/prop-firms/risk-profiles with no redesign, provided the Risk/Execution/Broker layers are built as configurable/pluggable from the start (a build-time discipline, not an architecture change). The one genuine future architectural addition is a portfolio-level layer for multi-symbol trading — correctly deferred, since building it now would be speculative.
+
+---
+
+## 8. Testing Architecture
+
+A layered system should have a **matching layered test strategy**, with each layer's boundary (the immutable contracts) acting as the natural test seam.
+
+- **Unit testing:** Every module in Layers 0–4 is testable in isolation because contracts are immutable and modules are single-responsibility — feed a hand-built `ContextSnapshot`, assert the exact `ValidationSummary`. This is the direct payoff of the frozen-contract discipline in §1/§2. Same pattern applies going forward: Risk Layer unit tests feed hand-built `EntryRecommendation` objects and assert Risk decisions, without ever running Selection/Analysis/Strategy code.
+- **Integration testing:** Run the full Layer 0→4 pipeline against fixed, recorded `ContextSnapshot` fixtures and assert the final `EntryRecommendation`. Once Risk/Execution exist, extend integration tests to Layer 0→Risk (still no live broker), asserting the final Risk decision.
+- **Historical replay:** This is where the Event Log (§3.5) pays for itself directly — replay is just "feed historical market data through Layers 0–4 and compare the resulting EntryRecommendation/Risk/Execution stream against what actually happened, or against a new strategy version." Without an event log, replay has nothing authoritative to compare against.
+- **Paper trading:** Structurally identical to live trading except the Broker adapter (§4) is swapped for a simulated one. This is exactly why the Broker adapter must be an interface (§7) — paper trading falls out for free if that boundary is respected, and costs a redesign if it isn't.
+- **Live validation:** A canary/shadow-mode pattern — run paper trading and live trading in parallel on the same signals for a probation period, diffing their Risk/Execution decisions before trusting a new strategy or config change live. This requires nothing new architecturally beyond the Broker-adapter interface and Event Log already recommended.
+
+**Recommendation:** build the Event Log and the Broker-adapter-as-interface *before or alongside* the Risk Layer, not after. Both are prerequisites for the testing strategy above, and both are the two additions from this review most likely to be expensive to retrofit if deferred.
+
+---
+
+## 9. Hidden Weaknesses (2–3 Year Horizon)
+
+Only genuine long-term risks are listed; each has a low-cost preventative measure.
+
+1. **StrategyResult fan-in ambiguity.** As strategy count grows, Arbitration's ability to resolve conflicts intelligently is capped by what's in `StrategyResult`. Without a `confidence`/`strength` field (§5), Arbitration is stuck doing rule-based tie-breaking forever, which gets brittle past a handful of concurrently-eligible strategies. *Preventative fix:* add the optional field now — cheap today, expensive to retrofit once 20+ strategies exist and Arbitration logic has hardened around their absence.
+
+2. **No audit trail before Risk/Execution exist.** If Event Log is added *after* Risk/Execution are built, you lose the ability to explain any trade made before that point, and you're forced to instrument two systems at once under time pressure. *Preventative fix:* build the Event Log first, even in a minimal form (append JSON to a file/DB), before Risk Layer work begins.
+
+3. **Broker coupling risk.** If MT5 specifics (order types, symbol naming conventions, lot-size semantics) leak into Execution Authorization or Trade Manager instead of staying inside a Broker adapter, multi-broker support later becomes a full rewrite rather than an added adapter. *Preventative fix:* enforce the adapter-interface boundary from the first line of Execution code, even with only one broker.
+
+4. **Config sprawl.** Without a Configuration Layer (§3.6), per-strategy and per-prop-firm parameters tend to get hardcoded inside the modules that use them (a strategy file, a Risk function). This is fine at 3 strategies and one prop firm; at 50 strategies × multiple prop firms it becomes unmaintainable and error-prone (wrong risk limit applied to wrong account). *Preventative fix:* even a simple centralized config object/file now, rather than scattered constants, prevents a painful mass-refactor later.
+
+5. **Silent feedback loops.** The single most dangerous long-term risk for any system that adds "Performance Analytics" and later "ML enhancements" is analytics quietly becoming a live input (e.g., a strategy reads its own recent win-rate and self-adjusts). This is exactly the kind of thing that seems like a small convenience change two years from now and quietly breaks the auditability and testability the rest of this architecture protects. *Preventative fix:* keep the "Event Log/Analytics is a sink, not a source" rule (§4) as a hard, documented architectural law, not just a convention.
+
+**No critical flaw requiring reopening of Layers 0–4 was found.** Item 1 is the only recommendation that touches a frozen contract, and it is a strictly additive, optional field — it does not change any existing module's behavior, so it does not violate the freeze.
+
+---
+
+## 10. Master Architecture Diagram — Version 1.0
+
+```
+                              ┌─────────────────────────────┐
+                              │           MARKET             │
+                              └───────────────┬───────────────┘
+                                              ▼
+ ┌───────────────── LAYER 0 — SELECTION ─────────────────┐
+ │  Selection Engine → SelectionResult                     │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌───────────────── LAYER 1 — ANALYSIS ──────────────────┐
+ │  Context Snapshot                                        │
+ │        ↓                                                 │
+ │  Structural Validation     Sweep Validation               │
+ │        └──────────┬───────────┘                          │
+ │                    ▼                                     │
+ │              Market Context (aggregation-only)            │
+ │                    ▼                                     │
+ │              ValidationSummary                            │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌───────────────── LAYER 2 — STRATEGY FRAMEWORK ────────┐
+ │  Strategy Registry → Strategy Context Enrichment          │
+ │            → Strategy Router → Strategies[]                │
+ │            → StrategyResult[]  (recommend: + confidence)   │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌───────────────── LAYER 3 — ARBITRATION ───────────────┐
+ │  Arbitration Engine → ArbitrationResult                    │
+ │            (recommend: + rejectedCandidates[])              │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌────────── LAYER 4 — RECOMMENDATION BOUNDARY (FROZEN) ─┐
+ │  EntryRecommendation Builder (strict 1:1, no logic)        │
+ │            → EntryRecommendation                            │
+ │            (recommend: + recommendationId, traceability ids)│
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌────────────────── LAYER 5 — RISK (future) ────────────┐
+ │  Risk Layer: sizing, limits, prop-firm rules,               │
+ │  per-risk-profile config                                     │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌──────────── LAYER 6 — EXECUTION AUTHORIZATION (future) ┐
+ │  Session/kill-switch/spread checks → go/no-go              │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌────────────────── LAYER 7 — EXECUTION (future) ───────┐
+ │  Broker Adapter (interface) → MT5 / other brokers          │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+ ┌──────────────── LAYER 8 — TRADE MANAGEMENT (future) ──┐
+ │  Breakeven / partials / trailing / time exit                │
+ └───────────────────────────┬─────────────────────────────┘
+                              ▼
+                    ┌───────────────────┐
+                    │   Trade Closed      │
+                    └─────────┬───────────┘
+                              ▼
+ ┌──────────── LAYER 9 — PERFORMANCE ANALYTICS (future) ─┐
+ │  Offline / batch. Reads Event Log only.                      │
+ │  Never writes back into the live decision path.               │
+ └─────────────────────────────────────────────────────────┘
+
+ ═══════════════ CROSS-CUTTING (side-listeners, not pipeline stages) ═══════════════
+   • EVENT LOG — passive, append-only subscriber at every arrow above (sink only)
+   • CONFIGURATION LAYER — versioned config feeding Risk / Execution / Broker
+   • PERSISTENCE — position state + event log storage, enables crash recovery
+   • MONITORING/ALERTING — health checks at every layer boundary
+```
+
+---
+
+## Final Recommendations Before Risk Layer Implementation
+
+1. **No changes to Layers 0–4 logic.** The freeze holds; no critical flaw was found.
+2. **Add optional, additive fields to contracts** per §5 (ids, back-references, `confidence` on StrategyResult, `rejectedCandidates` on ArbitrationResult). These do not break the freeze.
+3. **Build the Event Log before or alongside the Risk Layer**, not after — it's the cheapest layer to add now and the most expensive to retrofit later, and it is a prerequisite for the testing architecture in §8.
+4. **Design the Broker adapter as an interface from its first line of code**, even though MT5 is the only broker today — this is what makes paper trading, multi-broker, and multi-execution-engine support free later instead of a rewrite.
+5. **Design Risk Layer to accept `riskProfileId` and prop-firm config as inputs**, not hardcoded values, so multi-profile/multi-prop-firm support doesn't require touching Risk logic later.
+6. **Defer** the Configuration Layer, Persistence Layer, Monitoring, and Portfolio-level Arbitration (multi-symbol) as *designed-for-but-not-built* — their seams should be respected in how Risk/Execution are built, but building them now would be premature for a single-symbol, single-broker v1.0.
+7. **Enforce the "Event Log/Analytics is a sink, never a source" rule** as a hard architectural law going forward — this is the single highest-risk item on the 2–3 year horizon (§9.5).
+
+This concludes the architecture review. No Risk Layer design has been started.
