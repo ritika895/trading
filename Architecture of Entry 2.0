@@ -1,0 +1,172 @@
+# Gold ICT Pro Liquidity Engine — Canonical Architecture (Frozen Reference)
+
+---
+
+## Question 1 — Canonical Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 0 — SELECTION                                                  │
+│                                                                        │
+│   Selection Engine                                                    │
+│        ↓                                                              │
+│   SelectionResult  (frozen)                                           │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 1 — ANALYSIS LAYER                                              │
+│                                                                        │
+│   Context Snapshot Engine                                             │
+│        ↓                                                              │
+│   ContextSnapshot  (frozen)                                           │
+│        ↓                                                              │
+│   Structural Validation Engine                                        │
+│        ↓                                                              │
+│   StructuralValidationResult  (frozen)                                │
+│        ↓                                                              │
+│   Sweep Validation Engine                                             │
+│        ↓                                                              │
+│   SweepValidationResult  (frozen)                                     │
+│        ↓                                                              │
+│   Market Context Engine (BOS/CHoCH/HTF — placeholder-backed today)    │
+│        ↓                                                              │
+│   MarketContextResult  (frozen)                                       │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 2 — DECISION LAYER                                              │
+│                                                                        │
+│   Validation Summary Engine                                           │
+│        ↓                                                              │
+│   ValidationSummary  (frozen — terminal contract of Decision Layer)   │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 3 — STRATEGY FRAMEWORK                                          │
+│                                                                        │
+│   ┌───────────────────┐        ┌──────────────────────────┐          │
+│   │ Strategy Registry │──reads→│ Strategy Router           │          │
+│   │  (directory,      │        │ (eligibility filter +     │          │
+│   │   metadata,       │        │  dispatch only)           │          │
+│   │   append-only)    │        └──────────────────────────┘          │
+│   └───────────────────┘                    ↓                          │
+│                                   Enrichment Step (read-only,          │
+│                                   builds StrategyContext per           │
+│                                   Registry.requiredStrategyContext)    │
+│                                             ↓                          │
+│                                   StrategyContext  (frozen shape)      │
+│                                             ↓                          │
+│              ┌──────────────┬──────────────┼──────────────┐           │
+│              ↓              ↓              ↓              ↓           │
+│      [Strategy A]   [Strategy B]   [Strategy C]   [Strategy N]        │
+│              ↓              ↓              ↓              ↓           │
+│                        StrategyResult[]  (frozen, uniform contract)   │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 4 — ARBITRATION LAYER                                           │
+│                                                                        │
+│   Arbitration Engine (policy-driven: CONSERVATIVE / MAJORITY /        │
+│   WEIGHTED / HIGHEST_CONFIDENCE / CONFLUENCE)                         │
+│        ↓                                                              │
+│   ArbitrationResult  (frozen)                                         │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 5 — RECOMMENDATION BOUNDARY                                     │
+│                                                                        │
+│   EntryRecommendation Builder                                         │
+│        ↓                                                              │
+│   EntryRecommendation  (frozen — NOT an executable order; see Q3)     │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 6 — RISK LAYER                                                  │
+│                                                                        │
+│   Risk Manager (sizing, exposure limits, drawdown guards,             │
+│                  correlation/news filters, account state)             │
+│        ↓                                                              │
+│   RiskAssessmentResult  (frozen)                                      │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 7 — AUTHORIZATION LAYER                                         │
+│                                                                        │
+│   Execution Authorization Module (final gate — see Q3)                │
+│        ↓                                                              │
+│   ExecutionAuthorization  (frozen — the ONLY "YES, place trade")      │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│ LAYER 8 — EXECUTION LAYER                                             │
+│                                                                        │
+│   Trade Manager (order construction, retries, fills, position mgmt)   │
+│        ↓                                                              │
+│   MT5 (broker interface)                                              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Module boundary rule (applies uniformly across every layer):** each engine reads only its immediate upstream frozen contract(s) plus the Registry/StrategyContext where applicable — never reaches further upstream, never reaches sideways into another layer's internals. The Strategy Registry is the one *cross-cutting* module — it is read by the Router but does not sit in the main data-flow spine.
+
+---
+
+## Question 2 — Contract Ownership Matrix
+
+| Contract | Created By | Read By | Modified By | Frozen After Creation? |
+|---|---|---|---|---|
+| `SelectionResult` | Selection Engine | Context Snapshot Engine | Nobody | Yes |
+| `ContextSnapshot` | Context Snapshot Engine | Structural Validation Engine | Nobody | Yes |
+| `StructuralValidationResult` | Structural Validation Engine | Sweep Validation Engine | Nobody | Yes |
+| `SweepValidationResult` | Sweep Validation Engine | Market Context Engine | Nobody | Yes |
+| `MarketContextResult` | Market Context Engine | Validation Summary Engine | Nobody | Yes |
+| `ValidationSummary` | Validation Summary Engine | Strategy Router, Enrichment Step (read-only, all strategies indirectly via StrategyContext) | Nobody | Yes |
+| `Strategy Registry (entries)` | Strategy Registry (design-time / config-time) | Strategy Router, Enrichment Step | Registry owner only, append/version — never in-place mutation of a live entry's logic-affecting fields | Per-version yes; toggles (`enabled`) are the sanctioned exception |
+| `StrategyContext` | Enrichment Step (inside Strategy Framework) | The one Strategy instance it was built for | Nobody | Yes (per invocation) |
+| `StrategyResult` | Individual Strategy module | Arbitration Engine | Nobody | Yes |
+| `ArbitrationResult` | Arbitration Engine | EntryRecommendation Builder | Nobody | Yes |
+| `EntryRecommendation` | EntryRecommendation Builder | Risk Manager | Nobody | Yes |
+| `RiskAssessmentResult` | Risk Manager | Execution Authorization Module | Nobody | Yes |
+| `ExecutionAuthorization` | Execution Authorization Module | Trade Manager | Nobody | Yes |
+| (Order/Fill state) | Trade Manager | MT5, logging/audit modules | Trade Manager only (operational, not a frozen contract — this is live execution state) | No — this is the one deliberately mutable layer |
+
+**Invariant enforced by this matrix:** every contract has exactly one writer and flows strictly one direction downstream. No module ever reads two layers upstream of itself, and nothing downstream can write back into an upstream contract — including Risk Manager and Execution Authorization, which can *reject or attenuate* what they receive, but never *edit* the `EntryRecommendation` or `ArbitrationResult` object itself. Rejection is expressed as a new object (`RiskAssessmentResult.approved = false`), not a mutation.
+
+---
+
+## Question 3 — Execution Philosophy & Final Trade Authorization
+
+### EntryResult vs. EntryRecommendation
+
+**Recommend `EntryRecommendation`, not `EntryResult`.** Rename the terminal output of the Strategy/Arbitration chain to make the semantics explicit in the name itself: it is a *recommendation*, not an authorization to trade. This isn't cosmetic — it's the architectural statement that the Strategy Framework's job ends at "here is what the signals say," and it has no authority over money, risk, or account state.
+
+### Where should the final "YES, place this trade" decision occur?
+
+**In a dedicated Execution Authorization module — a separate, final gate downstream of Risk Manager, not inside Risk Manager itself.**
+
+Reasoning for separating Risk Manager from Execution Authorization rather than merging them:
+
+| | Risk Manager | Execution Authorization |
+|---|---|---|
+| Concern | *How much* / *whether this fits current exposure, drawdown, correlation limits* | *Is it actually safe/valid to send an order right now* |
+| Inputs | `EntryRecommendation`, account state, open positions, risk config | `RiskAssessmentResult`, live system health (broker connectivity, spread/slippage sanity, market hours, kill-switch state) |
+| Nature of checks | Portfolio-level, position-sizing math | Operational/environmental gating — often orthogonal to strategy quality entirely |
+| Change frequency | Changes with risk appetite, account growth, strategy mix | Changes with infrastructure — broker outages, news blackout windows, emergency halt flags |
+
+Collapsing these into one module means every time you need an operational safety change (e.g. "halt all trading during high-impact news" or "kill switch if MT5 connection is flaky") you're editing the same module that owns position sizing math — two very different concerns with very different change cadences and very different failure profiles. Keeping them separate means:
+
+- Risk Manager answers: *"Given account state and strategy signal, what size/should we even consider this?"*
+- Execution Authorization answers: *"Given that risk-approved recommendation, is *right now* actually safe to act?"* — this is your last line of defense for a fully unattended system: broker connectivity checks, duplicate-order guards, spread/latency sanity checks, manual kill-switch state, session/holiday calendar checks.
+
+**This separation is the single most important safety property for a system that runs unattended.** A strategy signal being *statistically good* (Strategy/Arbitration's job) is a completely different question from whether it's *operationally safe to execute this specific order right now* (Execution Authorization's job). Bundling them means a purely operational failure (e.g. stale price feed) can only be caught by code that's conceptually about position sizing — a bad coupling that tends to produce exactly the kind of silent failure that's catastrophic in unattended live trading.
+
+### Why this design is preferable for full automation
+
+1. **Fail-safe by construction, not by convention.** Every stage between the Strategy Framework and Trade Manager can *only* downgrade or reject, never invent or approve independently — `ExecutionAuthorization` is the single, unambiguous point where "place this trade" is asserted. If Trade Manager ever receives anything without a valid `ExecutionAuthorization`, that's a hard architectural violation, trivially detectable in code review or automated tests — not a subtle bug hiding in a signal-generation module.
+
+2. **Independent testability of "is this safe" vs. "is this a good signal."** You can unit-test Execution Authorization's kill-switch/connectivity/session logic with zero dependency on strategy correctness, and vice versa — this mirrors the same isolation principle applied throughout the Strategy Framework (Q6 of the previous round).
+
+3. **Operational changes don't risk strategy logic, and strategy changes don't risk operational safety.** In an unattended system, the scariest failure mode is an infrastructure edit accidentally touching signal/sizing logic (or vice versa) under time pressure — e.g., patching a broker reconnect issue at 2am shouldn't require touching anything that Arbitration or Risk Manager depend on.
+
+4. **Clean audit trail for "why did/didn't a trade execute."** Because each layer only rejects-or-passes-forward, a post-mortem can walk the chain — `EntryRecommendation → RiskAssessmentResult → ExecutionAuthorization` — and see exactly which layer said no and why, without cross-referencing intertwined logic.
+
+5. **Matches the frozen-contract philosophy already established.** Every prior layer in this engine (Analysis, Decision, Strategy, Arbitration) follows "one writer, one frozen output, strictly downstream flow." Terminating the automated-decision chain in a dedicated `ExecutionAuthorization` contract — rather than letting Risk Manager double as both sizing engine and final authorizer — keeps that same discipline all the way to the broker boundary, which is exactly where discipline matters most.
