@@ -1,0 +1,142 @@
+//@version=6
+indicator("Gold ICT Pro - Phase 8 Engine", overlay=true)
+
+// =========================================================================
+// MODULE 1: CORE FOUNDATION & TYPES
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// 1.1 GLOBAL CONFIGURATION & INPUTS
+// -------------------------------------------------------------------------
+
+// --- General Settings ---
+GRP_GENERAL = "General Settings"
+int SWING_LOOKBACK   = input.int(5, "Swing Lookback", group=GRP_GENERAL, minval=2)
+int ATR_LENGTH       = input.int(14, "ATR Length", group=GRP_GENERAL, minval=1)
+float SWEEP_THRESHOLD= input.float(0.2, "Sweep Threshold (ATR multiplier)", group=GRP_GENERAL, step=0.1)
+
+// --- Session Settings (UTC Time) ---
+GRP_SESSION = "Session Settings (UTC)"
+string ASIAN_START   = input.string("00:00", "Asian Session Start", group=GRP_SESSION)
+string ASIAN_END     = input.string("08:00", "Asian Session End", group=GRP_SESSION)
+string LONDON_START  = input.string("08:00", "London Session Start", group=GRP_SESSION)
+string LONDON_END    = input.string("16:00", "London Session End", group=GRP_SESSION)
+string NY_START      = input.string("13:00", "New York Session Start", group=GRP_SESSION)
+string NY_END        = input.string("21:00", "New York Session End", group=GRP_SESSION)
+
+// --- Engine Limits ---
+GRP_LIMITS = "Engine Limits"
+int MAX_POOLS           = input.int(50, "Max Registry Pools", group=GRP_LIMITS, minval=10)
+int MAX_RECOMMENDATIONS = input.int(10, "Max Tracked Recommendations", group=GRP_LIMITS, minval=1)
+
+// -------------------------------------------------------------------------
+// 1.2 FUNDAMENTAL ENUMS (Emulated via Integer Constants)
+// -------------------------------------------------------------------------
+
+// Defines the lifecycle of a liquidity pool
+int LS_FORMED      = 0
+int LS_ACTIVE      = 1
+int LS_REINFORCED  = 2
+int LS_SWEPT       = 3
+int LS_INVALIDATED = 4
+int LS_EXPIRED     = 5
+
+// Defines the type of liquidity
+int LT_BUY_SIDE  = 0
+int LT_SELL_SIDE = 1
+int LT_INTERNAL  = 2
+int LT_EXTERNAL  = 3
+
+// Defines the active trading session
+int ST_OFF_SESSION = 0
+int ST_ASIAN       = 1
+int ST_LONDON      = 2
+int ST_NEW_YORK    = 3
+
+// Defines the directional bias
+int TD_NEUTRAL = 0
+int TD_LONG    = 1
+int TD_SHORT   = 2
+
+// Defines the status of a recommendation
+int RS_PENDING     = 0
+int RS_ACTIVE      = 1
+int RS_INVALIDATED = 2
+int RS_FULFILLED   = 3
+int RS_EXPIRED     = 4
+
+// Defines replacement engine decisions (for future diagnostics)
+int RD_KEEP    = 0
+int RD_REPLACE = 1
+int RD_MERGE   = 2
+int RD_IGNORE  = 3
+
+// Defines registry actions (for future diagnostics)
+int RA_NONE        = 0
+int RA_CREATED_NEW = 1
+int RA_UPDATED     = 2
+int RA_MERGED      = 3
+int RA_REPLACED    = 4
+int RA_IGNORED     = 5
+
+// -------------------------------------------------------------------------
+// 1.3 CORE TYPE DEFINITIONS
+// -------------------------------------------------------------------------
+
+// Represents a structural swing point on the chart
+type SwingPoint
+    float price
+    int   barIndex
+    int   time
+    bool  isHigh
+
+// Represents a liquidity pool in the Registry
+type LiquidityPool
+    int               id
+    int               poolType         // Maps to LT_* constants
+    int               state            // Maps to LS_* constants
+    float             priceLevel
+    int               touchCount
+    float             confidence
+    bool              isSwept
+    int               createdAtBar
+    int               sweptAtBar
+    int               invalidatedAtBar
+    string            sweepReasonCode // e.g., "HIGH_SWEEP", "TIME_EXPIRY"
+    array<SwingPoint> mitigations      // History of touches/mitigations
+
+// Represents an immutable snapshot of market context at evaluation time
+type ContextSnapshot
+    int   barIndex
+    int   time
+    float currentPrice
+    float atr
+    int   currentSession // Maps to ST_* constants
+    int   marketBias     // Maps to TD_* constants
+    float premiumZone
+    float discountZone
+
+// Represents a candidate trade idea from a Strategy
+type StrategyCandidate
+    int             id
+    LiquidityPool   sourcePool
+    ContextSnapshot context
+    int             direction       // Maps to TD_* constants
+    float           entryPrice
+    float           stopLoss
+    float           takeProfit
+    string          strategyName
+
+// Represents the final output of the pipeline
+type Recommendation
+    int               id
+    StrategyCandidate candidate
+    int               status          // Maps to RS_* constants
+    int               createdBarIndex
+    float             actualEntry
+    float             actualStop
+
+// -------------------------------------------------------------------------
+// 1.4 PLACEHOLDER OUTPUT (Required for TradingView Compilation)
+// -------------------------------------------------------------------------
+plot(na, title="Phase 8 Foundation")
