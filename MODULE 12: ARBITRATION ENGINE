@@ -1,0 +1,971 @@
+//@version=6
+indicator("Gold ICT Pro - Phase 8 Engine", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ============================================================================
+// Gold ICT Pro - Phase 8 Engine
+// Architecture Version: 8.0
+// Pine Script Version: 6
+// This script is developed incrementally using the Architecture Charter.
+// ============================================================================
+
+// =========================================================================
+// MODULE 1: CORE FOUNDATION & TYPES
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// 1.1 GLOBAL CONFIGURATION & INPUTS
+// -------------------------------------------------------------------------
+
+// --- General Settings ---
+GRP_GENERAL = "General Settings"
+int SWING_LOOKBACK   = input.int(5, "Swing Lookback", group=GRP_GENERAL, minval=2)
+int ATR_LENGTH       = input.int(14, "ATR Length", group=GRP_GENERAL, minval=1)
+float SWEEP_THRESHOLD= input.float(0.2, "Sweep Threshold (ATR multiplier)", group=GRP_GENERAL, step=0.1)
+
+// --- Session Settings (UTC Time) ---
+GRP_SESSION = "Session Settings (UTC)"
+int ASIAN_START_HR   = input.int(0, "Asian Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_START_MIN  = input.int(0, "Asian Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int ASIAN_END_HR     = input.int(8, "Asian End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_END_MIN    = input.int(0, "Asian End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+int LONDON_START_HR  = input.int(8, "London Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_START_MIN = input.int(0, "London Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int LONDON_END_HR    = input.int(16, "London End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_END_MIN   = input.int(0, "London End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+int NY_START_HR      = input.int(13, "New York Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_START_MIN     = input.int(0, "New York Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int NY_END_HR        = input.int(21, "New York End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_END_MIN       = input.int(0, "New York End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+// --- Engine Limits ---
+GRP_LIMITS = "Engine Limits"
+int MAX_POOLS           = input.int(50, "Max Registry Pools", group=GRP_LIMITS, minval=10)
+int MAX_RECOMMENDATIONS = input.int(10, "Max Tracked Recommendations", group=GRP_LIMITS, minval=1)
+
+// -------------------------------------------------------------------------
+// 1.2 FUNDAMENTAL ENUMS (Emulated via Integer Constants)
+// -------------------------------------------------------------------------
+
+// Defines the lifecycle of a liquidity pool
+int LS_FORMED      = 0
+int LS_ACTIVE      = 1
+int LS_REINFORCED  = 2
+int LS_SWEPT       = 3
+int LS_INVALIDATED = 4
+int LS_EXPIRED     = 5
+
+// Defines the type of liquidity
+int LT_BUY_SIDE  = 0
+int LT_SELL_SIDE = 1
+int LT_INTERNAL  = 2
+int LT_EXTERNAL  = 3
+
+// Defines the active trading session
+int ST_OFF_SESSION = 0
+int ST_ASIAN       = 1
+int ST_LONDON      = 2
+int ST_NEW_YORK    = 3
+
+// Defines the directional bias
+int TD_NEUTRAL = 0
+int TD_LONG    = 1
+int TD_SHORT   = 2
+
+// Defines the status of a recommendation
+int RS_PENDING     = 0
+int RS_ACTIVE      = 1
+int RS_INVALIDATED = 2
+int RS_FULFILLED   = 3
+int RS_EXPIRED     = 4
+
+// Defines replacement engine decisions
+int RD_KEEP    = 0
+int RD_REPLACE = 1
+int RD_MERGE   = 2
+int RD_IGNORE  = 3
+
+// Defines registry actions
+int RA_NONE        = 0
+int RA_CREATED_NEW = 1
+int RA_UPDATED     = 2
+int RA_MERGED      = 3
+int RA_REPLACED    = 4
+int RA_IGNORED     = 5
+
+// -------------------------------------------------------------------------
+// 1.3 CORE TYPE DEFINITIONS
+// -------------------------------------------------------------------------
+
+// Represents a structural swing point on the chart
+type SwingPoint
+    float price
+    int   barIndex
+    int   timeMs   
+    bool  isHigh
+
+// Represents a liquidity pool in the Registry
+type LiquidityPool
+    int               id
+    int               poolType         
+    int               state            
+    float             priceLevel
+    int               touchCount
+    float             confidence
+    bool              isSwept
+    int               createdAtBar
+    int               sweptAtBar
+    int               invalidatedAtBar
+    string            sweepReasonCode 
+    array<SwingPoint> mitigations      
+
+// Represents an immutable snapshot of market context at evaluation time
+type ContextSnapshot
+    int   barIndex
+    int   timeMs           
+    float currentPrice
+    float atr
+    int   currentSession 
+    int   marketBias     
+    float premiumZone
+    float discountZone
+
+// Represents a candidate trade idea from a Strategy
+type StrategyCandidate
+    int             id
+    LiquidityPool   sourcePool
+    ContextSnapshot context
+    int             direction       
+    float           entryPrice
+    float           stopLoss
+    float           takeProfit
+    string          strategyName
+
+// Represents the final output of the pipeline
+type Recommendation
+    int               id
+    StrategyCandidate candidate
+    int               status          
+    int               createdBarIndex
+    float             actualEntry
+    float             actualStop
+
+
+// =========================================================================
+// MODULE 2: DASHBOARD FRAMEWORK (COMPACTED FOR SCREEN FIT)
+// =========================================================================
+
+// 2.1 Dashboard Table Instance (36 rows exact to fit standard TV screens)
+var table dash_table = table.new(position.top_right, 2, 36, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+// 2.2 Dashboard Helper Functions
+f_dash_header(int row, string headerText) =>
+    table.cell(dash_table, 0, row, headerText, text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+    table.merge_cells(dash_table, 0, row, 1, row)
+    
+f_dash_data(int row, string label, string value) =>
+    table.cell(dash_table, 0, row, label, text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, row, value, text_color=color.white, text_size=size.tiny)
+
+// 2.3 Dashboard Initialization Function
+f_init_dashboard() =>
+    if barstate.isfirst
+        table.cell(dash_table, 0, 0, "GOLD ICT PRO - PHASE 8", text_color=color.yellow, text_size=size.small, text_halign=text.align_center)
+        table.merge_cells(dash_table, 0, 0, 1, 0)
+
+        f_dash_header(1, "ENGINE STATUS")
+        f_dash_data(2, "Engine Version", "v8.0.0")
+        f_dash_data(3, "Build Status", "Stable")
+        f_dash_data(4, "Current Module", "Arbitration")
+        f_dash_data(5, "Engine Health", "Online")
+
+        f_dash_header(6, "SESSION INFORMATION")
+        f_dash_data(7, "Current Session", "Waiting...")
+        f_dash_data(8, "Market Status", "N/A")
+        f_dash_data(9, "Time", "00:00")
+
+        f_dash_header(10, "LIQUIDITY STATUS")
+        f_dash_data(11, "Bullish Pools", "0")
+        f_dash_data(12, "Bearish Pools", "0")
+        f_dash_data(13, "Active Pools", "0")
+        f_dash_data(14, "Swept Pools", "0")
+        f_dash_data(15, "Reinforced Pools", "0")
+        f_dash_data(16, "Invalidated Pools", "0")
+
+        f_dash_header(17, "STRUCTURE")
+        f_dash_data(18, "BOS", "Waiting...")
+        f_dash_data(19, "CHoCH", "Waiting...")
+        f_dash_data(20, "Trend", "Neutral")
+
+        f_dash_header(21, "STRATEGY & ARBITRATION")
+        f_dash_data(22, "Strat Status", "Inactive")
+        f_dash_data(23, "Direction", "N/A")
+        f_dash_data(24, "Strat Entry", "N/A")
+        f_dash_data(25, "SL / TP", "N/A")
+        f_dash_data(26, "Risk:Reward", "0")
+        f_dash_data(27, "Arb Status", "N/A")
+        f_dash_data(28, "Arb Reason", "N/A")
+
+        f_dash_header(29, "SYSTEM STATUS")
+        f_dash_data(30, "Validation Status", "N/A")
+        f_dash_data(31, "Sweep Status", "N/A")
+        f_dash_data(32, "Selected Pool", "None")
+        f_dash_data(33, "Market Zone", "N/A")
+
+// 2.4 Execution
+f_init_dashboard()
+
+
+// =========================================================================
+// MODULE 3: SESSION ENGINE
+// =========================================================================
+
+// 3.1 Helper: Check if current time is within a range (supports overnight crossing)
+f_is_in_range(int cur_mins, int start_mins, int end_mins) =>
+    if start_mins <= end_mins
+        cur_mins >= start_mins and cur_mins < end_mins
+    else
+        cur_mins >= start_mins or cur_mins < end_mins
+
+// 3.2 Session Engine Logic (Evaluates the bar's time for deterministic backtesting)
+f_run_session_engine() =>
+    int cur_hour = hour(time, "UTC")
+    int cur_min  = minute(time, "UTC")
+    int cur_mins = cur_hour * 60 + cur_min
+    int cur_day  = dayofweek(time, "UTC")
+
+    int asian_start  = ASIAN_START_HR * 60 + ASIAN_START_MIN
+    int asian_end    = ASIAN_END_HR * 60 + ASIAN_END_MIN
+    int london_start = LONDON_START_HR * 60 + LONDON_START_MIN
+    int london_end   = LONDON_END_HR * 60 + LONDON_END_MIN
+    int ny_start     = NY_START_HR * 60 + NY_START_MIN
+    int ny_end       = NY_END_HR * 60 + NY_END_MIN
+
+    bool is_weekend = false
+    if cur_day == 7
+        is_weekend := true
+    else if cur_day == 1
+        if cur_mins < (22 * 60)
+            is_weekend := true
+    else if cur_day == 6
+        if cur_mins >= (22 * 60)
+            is_weekend := true
+
+    int session = ST_OFF_SESSION
+    string status = "CLOSED"
+
+    if not is_weekend
+        status := "OPEN"
+        if f_is_in_range(cur_mins, ny_start, ny_end)
+            session := ST_NEW_YORK
+        else if f_is_in_range(cur_mins, london_start, london_end)
+            session := ST_LONDON
+        else if f_is_in_range(cur_mins, asian_start, asian_end)
+            session := ST_ASIAN
+        else
+            session := ST_OFF_SESSION
+            status := "CLOSED"
+
+    string h_str = cur_hour < 10 ? "0" + str.tostring(cur_hour) : str.tostring(cur_hour)
+    string m_str = cur_min < 10 ? "0" + str.tostring(cur_min) : str.tostring(cur_min)
+    string time_str = h_str + ":" + m_str
+    
+    [session, status, time_str]
+
+// 3.3 Global State Variables
+[g_current_session, g_market_status, g_current_time_str] = f_run_session_engine()
+
+// 3.4 Dashboard Update 
+if barstate.islast
+    int now_hour = hour(timenow, "UTC")
+    int now_min  = minute(timenow, "UTC")
+    int now_mins = now_hour * 60 + now_min
+    int now_day  = dayofweek(timenow, "UTC")
+    
+    bool is_weekend_now = false
+    if now_day == 7
+        is_weekend_now := true
+    else if now_day == 1
+        if now_mins < (22 * 60)
+            is_weekend_now := true
+    else if now_day == 6
+        if now_mins >= (22 * 60)
+            is_weekend_now := true
+            
+    string display_session_name = "Off Session"
+    string display_status = "CLOSED"
+    string display_time_str = g_current_time_str
+    
+    if is_weekend_now
+        display_session_name := "Off Session"
+        display_status := "CLOSED"
+        string h_str = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+        string m_str = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+        display_time_str := h_str + ":" + m_str + " (Wknd)"
+    else
+        if g_current_session == ST_ASIAN
+            display_session_name := "Asian"
+        else if g_current_session == ST_LONDON
+            display_session_name := "London"
+        else if g_current_session == ST_NEW_YORK
+            display_session_name := "New York"
+        display_status := g_market_status
+
+    table.cell(dash_table, 1, 7, display_session_name, text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 8, display_status, text_color=display_status == "OPEN" ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash_table, 1, 9, display_time_str, text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 4: REGISTRY ENGINE
+// =========================================================================
+
+// 4.1 Registry State Variables
+var array<LiquidityPool> g_registry = array.new<LiquidityPool>()
+var array<int> g_next_pool_id_arr = array.new<int>(1, 1) // Pine v6 workaround for global counters
+var array<string> g_event_log = array.new<string>()
+
+// 4.2 Registry API: Add
+f_registry_add(float priceLevel, int poolType, float confidence) =>
+    int newId = -1
+    if array.size(g_registry) < MAX_POOLS
+        newId := array.get(g_next_pool_id_arr, 0)
+        array.set(g_next_pool_id_arr, 0, newId + 1) // Increment global counter safely
+        
+        LiquidityPool newPool = LiquidityPool.new(
+             newId, poolType, LS_ACTIVE, priceLevel, 0, confidence, 
+             false, bar_index, 0, 0, "INIT", array.new<SwingPoint>()
+        )
+        array.push(g_registry, newPool)
+        array.push(g_event_log, str.format("{0} - Pool {1} Created (Type: {2})", bar_index, newId, poolType))
+    newId
+
+// 4.3 Registry API: Get
+f_registry_get(int poolId) =>
+    LiquidityPool foundPool = na
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            if p.id == poolId
+                foundPool := p
+                break
+    foundPool
+
+// 4.4 Registry API: Update State
+f_registry_update_state(LiquidityPool pool, int newState, string reason) =>
+    string logEntry = ""
+    if not na(pool)
+        int prevState = pool.state
+        pool.state := newState
+        if newState == LS_SWEPT
+            pool.isSwept := true
+            pool.sweptAtBar := bar_index
+        else if newState == LS_INVALIDATED
+            pool.invalidatedAtBar := bar_index
+        pool.sweepReasonCode := reason
+        logEntry := str.format("{0} - Pool {1} Transition: {2} -> {3} ({4})", bar_index, pool.id, prevState, newState, reason)
+    logEntry
+
+// 4.5 Registry API: Find Index for Deletion
+f_registry_find_index(int poolId) =>
+    int idx = -1
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            if array.get(g_registry, i).id == poolId
+                idx := i
+                break
+    idx
+
+// 4.6 Registry Queries
+f_registry_count_by_type(int poolType) =>
+    int count = 0
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            if array.get(g_registry, i).poolType == poolType
+                count += 1
+    count
+
+f_registry_count_by_state(int state) =>
+    int count = 0
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            if array.get(g_registry, i).state == state
+                count += 1
+    count
+
+// 4.7 Dashboard Integration
+if barstate.islast
+    int bull_count = f_registry_count_by_type(LT_BUY_SIDE)
+    int bear_count = f_registry_count_by_type(LT_SELL_SIDE)
+    int active_count = f_registry_count_by_state(LS_ACTIVE)
+    int swept_count = f_registry_count_by_state(LS_SWEPT)
+    
+    table.cell(dash_table, 1, 11, str.tostring(bull_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 12, str.tostring(bear_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 13, str.tostring(active_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 14, str.tostring(swept_count), text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 5: LIFECYCLE ENGINE
+// =========================================================================
+
+int POOL_EXPIRY_BARS = 200 // Configuration for pool expiration
+
+// 5.1 API: Mark Pool Swept
+f_mark_pool_swept(LiquidityPool pool, string reason) =>
+    string log = f_registry_update_state(pool, LS_SWEPT, reason)
+    log
+
+// 5.2 API: Mark Pool Invalidated
+f_mark_pool_invalidated(LiquidityPool pool, string reason) =>
+    string log = f_registry_update_state(pool, LS_INVALIDATED, reason)
+    log
+
+// 5.3 API: Mark Pool Reinforced
+f_mark_pool_reinforced(LiquidityPool pool, float touchPrice) =>
+    string log = ""
+    if not na(pool)
+        pool.state := LS_REINFORCED
+        pool.touchCount += 1
+        pool.confidence := math.min(pool.confidence + 0.1, 1.0) // Increase confidence, cap at 1.0
+        
+        // Preserve pool history
+        SwingPoint mitigation = SwingPoint.new(touchPrice, bar_index, time, false)
+        if na(pool.mitigations)
+            pool.mitigations := array.new<SwingPoint>()
+        array.push(pool.mitigations, mitigation)
+        
+        log := str.format("{0} - Pool {1} Reinforced (Touches: {2}, Conf: {3})", bar_index, pool.id, pool.touchCount, pool.confidence)
+    log
+
+// 5.4 API: Expire Old Pools
+f_expire_old_pools(LiquidityPool pool) =>
+    string log = ""
+    if not na(pool)
+        if pool.state == LS_ACTIVE or pool.state == LS_REINFORCED
+            if bar_index - pool.createdAtBar > POOL_EXPIRY_BARS
+                log := f_registry_update_state(pool, LS_EXPIRED, "TIME_EXPIRY")
+    log
+
+// 5.5 Main Lifecycle Update Logic
+f_lifecycle_update(float h, float l, float c) =>
+    string logs = ""
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            string log = ""
+            
+            // 1. Expiration Check
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED
+                log := f_expire_old_pools(p)
+                
+            // 2. Sweep & Reinforcement Checks (Only if Active or Reinforced)
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED
+                if p.poolType == LT_BUY_SIDE
+                    if c < p.priceLevel // Swept (Closed below)
+                        log := f_mark_pool_swept(p, "CLOSED_BELOW_BSL")
+                    else if l <= p.priceLevel and c > p.priceLevel // Reinforced (Wick tapped)
+                        log := f_mark_pool_reinforced(p, l)
+                        
+                else if p.poolType == LT_SELL_SIDE
+                    if c > p.priceLevel // Swept (Closed above)
+                        log := f_mark_pool_swept(p, "CLOSED_ABOVE_SSL")
+                    else if h >= p.priceLevel and c < p.priceLevel // Reinforced (Wick tapped)
+                        log := f_mark_pool_reinforced(p, h)
+                        
+            // 3. Invalidation Check (Transition from Swept to Invalidated on the *next* bar)
+            if p.state == LS_SWEPT and p.sweptAtBar < bar_index
+                log := f_mark_pool_invalidated(p, "POST_SWEEP_INVALIDATION")
+                
+            if log != ""
+                logs += log + "\n"
+    logs
+
+// 5.6 Execution Pipeline
+string lifecycle_logs = f_lifecycle_update(high, low, close)
+if lifecycle_logs != ""
+    array.push(g_event_log, lifecycle_logs)
+
+// 5.7 Dashboard Integration
+if barstate.islast
+    int invalid_count = f_registry_count_by_state(LS_INVALIDATED)
+    int rein_count = f_registry_count_by_state(LS_REINFORCED)
+    table.cell(dash_table, 1, 15, str.tostring(rein_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 16, str.tostring(invalid_count), text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 6: STRUCTURE ENGINE
+// =========================================================================
+
+// 6.1 Structure State Variables
+var float g_last_swing_high_price = na
+var int   g_last_swing_high_bar   = na
+var float g_last_swing_low_price  = na
+var int   g_last_swing_low_bar    = na
+var int   g_current_trend         = TD_NEUTRAL
+var int   g_last_bos_dir          = 0 // 0=none, 1=Bullish, 2=Bearish
+var int   g_last_choch_dir        = 0
+
+// 6.2 Structure Engine Logic
+f_run_structure_engine(float h, float l, float c) =>
+    float ph = ta.pivothigh(h, SWING_LOOKBACK, SWING_LOOKBACK)
+    float pl = ta.pivotlow(l, SWING_LOOKBACK, SWING_LOOKBACK)
+    
+    int newTrend = g_current_trend
+    int newBos = g_last_bos_dir
+    int newChoch = g_last_choch_dir
+    string logs = ""
+    
+    float newHigh = g_last_swing_high_price
+    int newHighBar = g_last_swing_high_bar
+    float newLow = g_last_swing_low_price
+    int newLowBar = g_last_swing_low_bar
+
+    // 1. Check for Breaks
+    if not na(g_last_swing_high_price) and c > g_last_swing_high_price
+        if g_current_trend == TD_SHORT
+            newChoch := TD_LONG 
+            newTrend := TD_LONG
+            logs += "CHoCH (Bullish) detected. "
+        else
+            newBos := TD_LONG 
+            newTrend := TD_LONG
+            logs += "BOS (Bullish) detected. "
+            
+    if not na(g_last_swing_low_price) and c < g_last_swing_low_price
+        if g_current_trend == TD_LONG
+            newChoch := TD_SHORT 
+            newTrend := TD_SHORT
+            logs += "CHoCH (Bearish) detected. "
+        else
+            newBos := TD_SHORT 
+            newTrend := TD_SHORT
+            logs += "BOS (Bearish) detected. "
+
+    // 2. Process newly confirmed pivots
+    if not na(ph)
+        f_registry_add(ph, LT_BUY_SIDE, 1.0)
+        newHigh := ph
+        newHighBar := bar_index - SWING_LOOKBACK
+        logs += str.format("Confirmed Swing High: {0}. ", ph)
+        
+    if not na(pl)
+        f_registry_add(pl, LT_SELL_SIDE, 1.0)
+        newLow := pl
+        newLowBar := bar_index - SWING_LOOKBACK
+        logs += str.format("Confirmed Swing Low: {0}. ", pl)
+        
+    [newTrend, newBos, newChoch, newHigh, newHighBar, newLow, newLowBar, logs]
+
+// 6.3 Execution Pipeline
+[ret_trend, ret_bos, ret_choch, ret_high, ret_highbar, ret_low, ret_lowbar, struct_logs] = f_run_structure_engine(high, low, close)
+
+g_current_trend := ret_trend
+g_last_bos_dir := ret_bos
+g_last_choch_dir := ret_choch
+g_last_swing_high_price := ret_high
+g_last_swing_high_bar := ret_highbar
+g_last_swing_low_price := ret_low
+g_last_swing_low_bar := ret_lowbar
+
+if struct_logs != ""
+    array.push(g_event_log, str.format("{0} - STRUCT: {1}", bar_index, struct_logs))
+
+// 6.4 Dashboard Integration
+if barstate.islast
+    string trend_str = g_current_trend == TD_LONG ? "Bullish" : g_current_trend == TD_SHORT ? "Bearish" : "Neutral"
+    string bos_str = g_last_bos_dir == TD_LONG ? "Bullish BOS" : g_last_bos_dir == TD_SHORT ? "Bearish BOS" : "None"
+    string choch_str = g_last_choch_dir == TD_LONG ? "Bullish CHoCH" : g_last_choch_dir == TD_SHORT ? "Bearish CHoCH" : "None"
+    
+    table.cell(dash_table, 1, 18, bos_str, text_color=g_last_bos_dir != 0 ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 19, choch_str, text_color=g_last_choch_dir != 0 ? color.orange : color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 20, trend_str, text_color=g_current_trend == TD_LONG ? color.green : g_current_trend == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 7: SELECTION ENGINE
+// =========================================================================
+
+// 7.1 Selection Result Type Definition
+type SelectionResult
+    LiquidityPool bestBullPool
+    LiquidityPool bestBearPool
+    LiquidityPool bestOverallPool
+    string        selectionReason
+    float         selectionConfidence
+
+// 7.2 Helper: Score a pool for ranking
+f_score_pool(LiquidityPool p) =>
+    float score = p.confidence
+    if p.state == LS_REINFORCED
+        score += 0.5   
+        score += p.touchCount * 0.1 
+    score
+
+// 7.3 Selection Engine Logic
+f_run_selection_engine() =>
+    LiquidityPool bestBull = na
+    float bestBullScore = -1.0
+    
+    LiquidityPool bestBear = na
+    float bestBearScore = -1.0
+    
+    string reason = "No eligible pools found."
+    float confidence = 0.0
+
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED
+                float score = f_score_pool(p)
+                
+                if p.poolType == LT_BUY_SIDE
+                    if score > bestBullScore
+                        bestBullScore := score
+                        bestBull := p
+                else if p.poolType == LT_SELL_SIDE
+                    if score > bestBearScore
+                        bestBearScore := score
+                        bestBear := p
+
+    LiquidityPool bestOverall = na
+    if not na(bestBull) and not na(bestBear)
+        if bestBullScore >= bestBearScore
+            bestOverall := bestBull
+            reason := "Bullish selected (Highest Score)."
+            confidence := bestBull.confidence
+        else
+            bestOverall := bestBear
+            reason := "Bearish selected (Highest Score)."
+            confidence := bestBear.confidence
+    else if not na(bestBull)
+        bestOverall := bestBull
+        reason := "Bullish selected (No Bearish competition)."
+        confidence := bestBull.confidence
+    else if not na(bestBear)
+        bestOverall := bestBear
+        reason := "Bearish selected (No Bullish competition)."
+        confidence := bestBear.confidence
+
+    SelectionResult.new(bestBull, bestBear, bestOverall, reason, confidence)
+
+// 7.4 Execution Pipeline
+var SelectionResult g_current_selection = na
+g_current_selection := f_run_selection_engine()
+
+if g_current_selection.selectionReason != "No eligible pools found."
+    array.push(g_event_log, str.format("{0} - SELECT: {1}", bar_index, g_current_selection.selectionReason))
+
+// 7.5 Dashboard Integration
+if barstate.islast
+    string sel_str = "None"
+    if not na(g_current_selection) and not na(g_current_selection.bestOverallPool)
+        sel_str := str.tostring(g_current_selection.bestOverallPool.id) + " (Conf: " + str.tostring(g_current_selection.selectionConfidence, "#.##") + ")"
+        
+    table.cell(dash_table, 1, 32, sel_str, text_color=color.yellow, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 8: CONTEXT SNAPSHOT
+// =========================================================================
+
+// 8.1 Context Snapshot Logic
+f_get_context_snapshot() =>
+    float atr = ta.atr(ATR_LENGTH)
+    float high50 = ta.highest(high, 50)
+    float low50 = ta.lowest(low, 50)
+    float priceRange = high50 - low50
+    
+    float eq = low50 + (priceRange * 0.5)
+    float premium = low50 + (priceRange * 0.7)
+    float discount = low50 + (priceRange * 0.3)
+    
+    ContextSnapshot.new(
+        bar_index, 
+        time, 
+        close, 
+        atr, 
+        g_current_session,  
+        g_current_trend,    
+        premium, 
+        discount
+    )
+
+// 8.2 Execution Pipeline
+var ContextSnapshot g_current_context = na
+g_current_context := f_get_context_snapshot()
+
+// 8.3 Dashboard Integration
+if barstate.islast
+    string pd_str = "N/A"
+    if not na(g_current_context) and not na(g_current_context.currentPrice)
+        if g_current_context.currentPrice >= g_current_context.premiumZone
+            pd_str := "Premium"
+        else if g_current_context.currentPrice <= g_current_context.discountZone
+            pd_str := "Discount"
+        else
+            pd_str := "Equilibrium"
+            
+    table.cell(dash_table, 1, 33, pd_str, text_color=pd_str == "Premium" ? color.red : pd_str == "Discount" ? color.green : color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 9: SWEEP VALIDATION
+// =========================================================================
+
+// 9.1 Sweep Validation Result Type Definition
+type SweepValidationResult
+    bool          isSwept
+    int           sweepDirection
+    float         sweepConfidence
+    string        sweepReason
+    LiquidityPool sweptPool
+
+// 9.2 Sweep Validation Logic
+f_validate_sweep(SelectionResult sel, ContextSnapshot snap) =>
+    bool isSwept = false
+    int sweepDir = TD_NEUTRAL
+    float sweepConf = 0.0
+    string sweepReason = "NO_SWEEP_DETECTED"
+    LiquidityPool sweptPool = na
+    
+    if not na(sel.bestOverallPool) and not na(snap)
+        LiquidityPool p = sel.bestOverallPool
+        float level = p.priceLevel
+        float atr_val = snap.atr
+        float max_depth = atr_val * SWEEP_THRESHOLD
+        
+        if p.poolType == LT_SELL_SIDE
+            if low <= level and close > level 
+                float sweep_depth = level - low
+                if sweep_depth <= max_depth
+                    isSwept := true
+                    sweepDir := TD_LONG
+                    sweepConf := 0.8 - (sweep_depth / max_depth * 0.3) 
+                    sweepReason := "BULLISH_SWEEP_WICK"
+                    sweptPool := p
+                else
+                    sweepReason := "SWEEP_TOO_DEEP"
+                    
+        else if p.poolType == LT_BUY_SIDE
+            if high >= level and close < level 
+                float sweep_depth = high - level
+                if sweep_depth <= max_depth
+                    isSwept := true
+                    sweepDir := TD_SHORT
+                    sweepConf := 0.8 - (sweep_depth / max_depth * 0.3)
+                    sweepReason := "BEARISH_SWEEP_WICK"
+                    sweptPool := p
+                else
+                    sweepReason := "SWEEP_TOO_DEEP"
+                    
+    SweepValidationResult.new(isSwept, sweepDir, sweepConf, sweepReason, sweptPool)
+
+// 9.3 Execution Pipeline
+var SweepValidationResult g_current_sweep_validation = na
+g_current_sweep_validation := f_validate_sweep(g_current_selection, g_current_context)
+
+if g_current_sweep_validation.isSwept
+    array.push(g_event_log, str.format("{0} - SWEEP: {1} (Pool: {2}, Conf: {3})", bar_index, g_current_sweep_validation.sweepReason, g_current_sweep_validation.sweptPool.id, g_current_sweep_validation.sweepConfidence))
+
+// 9.4 Dashboard Integration
+if barstate.islast
+    string sweep_status_str = g_current_sweep_validation.isSwept ? "Validated" : "Waiting..."
+    table.cell(dash_table, 1, 31, sweep_status_str, text_color=g_current_sweep_validation.isSwept ? color.yellow : color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 10: VALIDATION SUMMARY
+// =========================================================================
+
+// 10.1 Validation Summary Type Definition
+type ValidationSummary
+    bool                  isReady
+    string                validationResult
+    string                failureReason
+    string                validationStatus
+    ContextSnapshot       context
+    SelectionResult       selection
+    SweepValidationResult sweep
+    int                   trend
+
+// 10.2 Validation Summary Logic
+f_create_validation_summary(SelectionResult sel, ContextSnapshot snap, SweepValidationResult sweep, int trend) =>
+    bool ready = true
+    string result = "PASS"
+    string reason = "All conditions met."
+    string status = "Validated"
+    
+    if g_market_status != "OPEN"
+        ready := false
+        result := "FAIL"
+        reason := "Market Closed"
+        status := "Rejected (Market Closed)"
+    else if na(sel.bestOverallPool)
+        ready := false
+        result := "FAIL"
+        reason := "No Pool Selected"
+        status := "Rejected (No Selection)"
+    else if not sweep.isSwept
+        ready := false
+        result := "FAIL"
+        reason := "No Sweep Detected"
+        status := "Rejected (No Sweep)"
+    else if trend == TD_NEUTRAL
+        ready := false
+        result := "FAIL"
+        reason := "Trend Neutral"
+        status := "Rejected (No Trend)"
+        
+    ValidationSummary.new(ready, result, reason, status, snap, sel, sweep, trend)
+
+// 10.3 Execution Pipeline
+var ValidationSummary g_current_validation = na
+g_current_validation := f_create_validation_summary(g_current_selection, g_current_context, g_current_sweep_validation, g_current_trend)
+
+if g_current_validation.isReady
+    array.push(g_event_log, str.format("{0} - VALIDATION: PASS - Ready for Strategy", bar_index))
+else if g_current_validation.validationResult == "FAIL"
+    array.push(g_event_log, str.format("{0} - VALIDATION: FAIL - {1}", bar_index, g_current_validation.failureReason))
+
+// 10.4 Dashboard Integration
+if barstate.islast
+    table.cell(dash_table, 1, 30, g_current_validation.validationStatus, text_color=g_current_validation.isReady ? color.green : color.red, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 11: STRATEGY ENGINE
+// =========================================================================
+
+// 11.1 Strategy Result Type Definition
+type StrategyResult
+    bool   strategyApproved
+    int    direction
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    float  riskReward
+    float  strategyConfidence
+    string rejectionReason
+
+// 11.2 Strategy Engine Logic
+f_run_strategy(ValidationSummary summary) =>
+    bool approved = false
+    int dir = TD_NEUTRAL
+    float entry = na
+    float sl = na
+    float tp = na
+    float rr = 0.0
+    float conf = 0.0
+    string reason = "N/A"
+    
+    if summary.isReady
+        SweepValidationResult sweep = summary.sweep
+        ContextSnapshot snap = summary.context
+        LiquidityPool pool = summary.selection.bestOverallPool
+        
+        if sweep.sweepDirection == TD_LONG 
+            approved := true
+            dir := TD_LONG
+            entry := close
+            sl := pool.priceLevel - (snap.atr * 0.2)
+            tp := entry + (snap.atr * 2.0)
+            if entry != sl
+                rr := (tp - entry) / (entry - sl)
+            conf := (sweep.sweepConfidence * 0.6) + (pool.confidence * 0.4)
+            
+        else if sweep.sweepDirection == TD_SHORT 
+            approved := true
+            dir := TD_SHORT
+            entry := close
+            sl := pool.priceLevel + (snap.atr * 0.2)
+            tp := entry - (snap.atr * 2.0)
+            if entry != sl
+                rr := (entry - tp) / (sl - entry)
+            conf := (sweep.sweepConfidence * 0.6) + (pool.confidence * 0.4)
+        else
+            reason := "Invalid Sweep Direction"
+    else
+        reason := summary.failureReason
+        
+    StrategyResult.new(approved, dir, entry, sl, tp, rr, conf, reason)
+
+// 11.3 Execution Pipeline
+var StrategyResult g_current_strategy = na
+g_current_strategy := f_run_strategy(g_current_validation)
+
+if g_current_strategy.strategyApproved
+    array.push(g_event_log, str.format("{0} - STRATEGY: Approved {1} (RR: {2})", bar_index, g_current_strategy.direction == TD_LONG ? "LONG" : "SHORT", g_current_strategy.riskReward))
+
+// 11.4 Dashboard Integration
+if barstate.islast
+    table.cell(dash_table, 1, 22, g_current_strategy.strategyApproved ? "Approved" : "Rejected", text_color=g_current_strategy.strategyApproved ? color.green : color.red, text_size=size.tiny)
+    
+    string dir_str = g_current_strategy.direction == TD_LONG ? "LONG" : g_current_strategy.direction == TD_SHORT ? "SHORT" : "N/A"
+    table.cell(dash_table, 1, 23, dir_str, text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 24, str.tostring(g_current_strategy.entryPrice, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 25, str.tostring(g_current_strategy.stopLoss, "#.##") + " / " + str.tostring(g_current_strategy.takeProfit, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 26, str.tostring(g_current_strategy.riskReward, "#.##"), text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 12: ARBITRATION ENGINE
+// =========================================================================
+
+// 12.1 Arbitration Result Type Definition
+type ArbitrationResult
+    bool   isApproved
+    int    direction
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    string reason
+
+// 12.2 Arbitration Engine Logic
+// Evaluates the Strategy Result against market context to resolve conflicts.
+f_run_arbitration(StrategyResult strat, ContextSnapshot snap) =>
+    bool approved = false
+    int dir = TD_NEUTRAL
+    float entry = na
+    float sl = na
+    float tp = na
+    string reason = "N/A"
+    
+    if strat.strategyApproved
+        // Conflict check: ensure strategy direction aligns with market trend
+        if strat.direction == TD_LONG and snap.marketBias == TD_SHORT
+            reason := "Conflict: Long vs Bearish Trend"
+        else if strat.direction == TD_SHORT and snap.marketBias == TD_LONG
+            reason := "Conflict: Short vs Bullish Trend"
+        else
+            approved := true
+            dir := strat.direction
+            entry := strat.entryPrice
+            sl := strat.stopLoss
+            tp := strat.takeProfit
+            reason := "Approved (No Conflicts)"
+    else
+        reason := "Strategy Rejected"
+        
+    ArbitrationResult.new(approved, dir, entry, sl, tp, reason)
+
+// 12.3 Execution Pipeline
+var ArbitrationResult g_current_arbitration = na
+g_current_arbitration := f_run_arbitration(g_current_strategy, g_current_context)
+
+if g_current_arbitration.isApproved
+    array.push(g_event_log, str.format("{0} - ARBITRATION: Approved {1} (Entry: {2})", bar_index, g_current_arbitration.direction == TD_LONG ? "LONG" : "SHORT", g_current_arbitration.entryPrice))
+
+// 12.4 Dashboard Integration
+if barstate.islast
+    table.cell(dash_table, 1, 27, g_current_arbitration.isApproved ? "Approved" : "Rejected", text_color=g_current_arbitration.isApproved ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash_table, 1, 28, g_current_arbitration.reason, text_color=color.white, text_size=size.tiny)
+
+// -------------------------------------------------------------------------
+// PLACEHOLDER OUTPUT (Required for TradingView Compilation)
+// -------------------------------------------------------------------------
+plot(na, title="Phase 8 Foundation")
