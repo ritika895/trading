@@ -1,0 +1,333 @@
+# Gold ICT Pro — Phase 9 Architecture Specification
+## Institutional Intelligence Engine
+
+**Document status:** Draft for implementation
+**Depends on:** Phase 8 (frozen, unmodified)
+**Target implementer:** GLM (code generation agent)
+**Author role:** Chief Software Architect
+
+---
+
+## 0. Scope and Non-Goals
+
+Phase 9 adds an **enrichment layer** on top of the frozen Phase 8 pipeline. It does not alter, wrap, re-emit, or shadow any Phase 8 contract. Phase 9 modules are strictly **downstream consumers** of Phase 8 outputs.
+
+**In scope:** Multi-Timeframe Structure, Liquidity Hierarchy, Fair Value Gaps, Order Blocks, Breaker Blocks, Premium/Discount Arrays, Market Structure Shift, Confidence Scoring, Trade Rating, Statistics.
+
+**Out of scope:** Any modification to Selection, Structure, Strategy, Arbitration, Recommendation, or Audit modules from Phase 8. Execution, Risk, and Authorization layers are Phase 10+ and are only referenced here as future consumers of Phase 9 outputs.
+
+---
+
+## 1. Inherited Architectural Law (carried forward from Phase 8, non-negotiable)
+
+| Principle | Rule |
+|---|---|
+| Frozen boundary | Phase 8 modules and contracts are read-only inputs to Phase 9. No Phase 9 module may write into a Phase 8 contract. |
+| Single source of truth | Every contract has exactly one writer module. |
+| Downstream-only flow | Data flows strictly forward through the dependency graph. No back-references, no cycles. |
+| Append-only registries | Any registry-type contract (POI Registry, Institutional Event Log) is append-only; entries are never mutated, only superseded by new versioned entries. |
+| Fail-closed propagation | If any upstream `integrity = false`, every downstream Phase 9 module halts output and forwards `integrity = false`. No partial results, no silent defaults. |
+| Single responsibility | Each module performs exactly one transformation. Detection, classification, scoring, and logging are always separate modules, never merged. |
+
+---
+
+## 2. New Module Inventory
+
+Thirteen new modules. Each has one responsibility, one owned contract, and explicit consumers.
+
+### 2.1 MTF Structure Adapter
+- **Responsibility:** Request and normalize Structure Engine output across a configured set of higher timeframes (HTF). Does **not** recompute structure logic — it re-invokes the existing Phase 8 Structure Engine per timeframe and aligns outputs onto the current chart's time axis.
+- **Why it exists:** Phase 8's Structure Engine is single-timeframe by design (frozen). ICT decision-making requires structural alignment across HTF/LTF. Rather than duplicate structure logic, this module is a pure adapter/aggregator.
+- **ICT value:** Enables HTF bias confirmation (e.g. Daily bullish structure filtering 15m entries), a core ICT top-down analysis requirement.
+- **Owned contract:** `MTFStructureContract`
+- **Input:** Phase 8 `StructureContract` (per timeframe, via repeated invocation)
+- **Output fields:** `{ timeframe, structuralBias, lastBOS, lastCHoCH, integrity, timestamp }[]`
+- **Consumers:** Liquidity Hierarchy Engine, Premium/Discount Array Engine, Market Structure Shift Engine, Confidence Scoring Engine
+
+### 2.2 Liquidity Hierarchy Engine
+- **Responsibility:** Rank existing liquidity pools (equal highs/lows, swing highs/lows, session extremes) into a tiered hierarchy (Major / Intermediate / Minor).
+- **Why it exists:** Phase 8's Selection Engine selects pools; nothing in Phase 8 ranks *relative institutional significance* of liquidity across timeframes. This is a distinct classification responsibility.
+- **ICT value:** Distinguishes which liquidity a sweep is actually targeting (e.g. daily high vs. a minor 5m equal-high), directly improving sweep-validation quality downstream in future phases.
+- **Owned contract:** `LiquidityHierarchyContract`
+- **Input:** Phase 8 `SelectionContract`, Phase 8 `StructureContract`, `MTFStructureContract`
+- **Output fields:** `{ poolId, tier: Major|Intermediate|Minor, sourceTimeframe, price, swept: bool, integrity }[]`
+- **Consumers:** POI Aggregator, Confidence Scoring Engine
+
+### 2.3 Fair Value Gap (FVG) Engine
+- **Responsibility:** Detect three-candle imbalances, classify as bullish/bearish, track mitigation state (unmitigated / partially mitigated / fully mitigated).
+- **Why it exists:** No Phase 8 module detects imbalance-type price inefficiencies. Single responsibility: detection + mitigation tracking only, no scoring.
+- **ICT value:** FVGs are a primary ICT entry/target reference (inefficiency fill).
+- **Owned contract:** `FVGContract`
+- **Input:** Phase 8 `ContextSnapshotContract`
+- **Output fields:** `{ fvgId, direction, high, low, createdAt, mitigationState, integrity }[]`
+- **Consumers:** POI Aggregator
+
+### 2.4 Order Block Engine
+- **Responsibility:** Detect candidate order blocks (last opposing candle before a displacement move validated by Phase 8 Structure/Sweep data), track mitigation state.
+- **Why it exists:** Distinct detection responsibility from FVG; order blocks are structurally anchored (require a validated sweep + displacement), not just candle geometry.
+- **ICT value:** Order blocks are the canonical ICT institutional entry reference.
+- **Owned contract:** `OrderBlockContract`
+- **Input:** Phase 8 `StructureContract`, Phase 8 `SweepValidationContract`, Phase 8 `ContextSnapshotContract`
+- **Output fields:** `{ obId, direction, high, low, originBarTime, mitigationState, validatedBySweepId, integrity }[]`
+- **Consumers:** Breaker Block Engine, POI Aggregator
+
+### 2.5 Market Structure Shift (MSS) Engine
+- **Responsibility:** Detect character-change events distinct from ordinary BOS — specifically counter-trend structural breaks that signal a potential reversal, using Structure Engine + MTF Structure Adapter as inputs.
+- **Why it exists:** Phase 8 Structure Engine emits raw HH/HL/LH/LL and BOS classification but does not distinguish a trend-continuation BOS from a reversal-grade MSS. This is a separate classification, kept out of the frozen Structure Engine deliberately.
+- **ICT value:** MSS is the trigger condition for order-block invalidation (→ breaker) and for re-biasing the MTF context.
+- **Owned contract:** `MSSContract`
+- **Input:** Phase 8 `StructureContract`, `MTFStructureContract`
+- **Output fields:** `{ mssId, direction, triggerBarTime, invalidatedStructureId, integrity }[]`
+- **Consumers:** Breaker Block Engine, Confidence Scoring Engine
+
+### 2.6 Premium/Discount Array Engine
+- **Responsibility:** Compute the current dealing range (most recent valid swing range) and derive equilibrium, premium zone, discount zone.
+- **Why it exists:** Purely a range/zone computation; must not be entangled with liquidity ranking or FVG/OB detection.
+- **ICT value:** Encodes the ICT rule that longs are only favored from discount and shorts only from premium — a required filter for institutional-grade entries.
+- **Owned contract:** `PDArrayContract`
+- **Input:** Phase 8 `StructureContract`, `MTFStructureContract`
+- **Output fields:** `{ rangeHigh, rangeLow, equilibrium, currentZone: Premium|Discount|Equilibrium, integrity }`
+- **Consumers:** POI Aggregator, Confidence Scoring Engine
+
+### 2.7 Breaker Block Engine
+- **Responsibility:** Reclassify a mitigated/invalidated Order Block as a Breaker Block when an MSS event invalidates the structure that produced it.
+- **Why it exists:** This is a pure re-classification step dependent on two upstream facts (OB existence + MSS invalidation) and must not be embedded in either upstream detector, preserving single responsibility.
+- **ICT value:** Breaker blocks are a distinct, high-probability ICT POI type used after failed order blocks — commonly higher-confidence than the original OB.
+- **Owned contract:** `BreakerBlockContract`
+- **Input:** `OrderBlockContract`, `MSSContract`
+- **Output fields:** `{ breakerId, sourceObId, sourceMssId, direction, high, low, integrity }[]`
+- **Consumers:** POI Aggregator
+
+### 2.8 Institutional POI Aggregator
+- **Responsibility:** Merge FVG, Order Block, Breaker Block, PD Array zone, and Liquidity Hierarchy outputs into a single append-only Point-of-Interest registry, tagging confluence (e.g. an OB sitting inside an FVG inside a discount zone).
+- **Why it exists:** Single source of truth for "what institutional zones currently exist." Without this, downstream scoring would need to independently query five modules and risk duplicated/contradictory confluence logic.
+- **ICT value:** Confluence stacking (OB + FVG + discount + liquidity draw) is the central ICT concept for identifying high-probability zones.
+- **Owned contract:** `POIRegistryContract` (append-only)
+- **Input:** `FVGContract`, `OrderBlockContract`, `BreakerBlockContract`, `PDArrayContract`, `LiquidityHierarchyContract`
+- **Output fields:** `{ poiId, type, direction, priceHigh, priceLow, confluenceTags[], confluenceCount, integrity, createdAt }[]`
+- **Consumers:** Confidence Scoring Engine, Institutional Event Log
+
+### 2.9 Confidence Scoring Engine
+- **Responsibility:** Produce a single numeric confidence score per active recommendation/POI, from a defined weighted formula (confluence count, liquidity tier, MTF structural alignment, MSS recency).
+- **Why it exists:** Scoring must be isolated from detection so scoring weights can evolve (Tier 2/3 governance) without touching frozen detection logic.
+- **ICT value:** Converts qualitative ICT confluence into a reproducible, auditable number, removing discretionary bias from setup evaluation.
+- **Owned contract:** `ConfidenceScoreContract`
+- **Input:** `POIRegistryContract`, Phase 8 `ArbitrationResult`, Phase 8 `RecommendationEngine` output, Phase 8 `ValidationSummaryContract`, `MSSContract`
+- **Output fields:** `{ recommendationId, poiId, score (0-100), scoreBreakdown{}, integrity }`
+- **Consumers:** Trade Rating Engine
+
+### 2.10 Trade Rating Engine
+- **Responsibility:** Convert a Confidence Score plus recommendation metadata into a discrete trade grade (A+/A/B/C/D), following the same tier convention already established in Phase 8's Priority Classification Layer.
+- **Why it exists:** A human-facing grade is a separate concern from the raw numeric score — grading thresholds are Tier 2 (reopenable) governance, while score computation is Tier 3.
+- **ICT value:** Gives the trader (or downstream Risk Layer) a fast, standardized quality label per setup.
+- **Owned contract:** `TradeRatingContract`
+- **Input:** `ConfidenceScoreContract`, Phase 8 `RecommendationEngine` output, Phase 8 `ArbitrationResult`
+- **Output fields:** `{ recommendationId, grade: A+|A|B|C|D, score, integrity }`
+- **Consumers:** Institutional Event Log, Statistics Engine
+
+### 2.11 Institutional Event Log
+- **Responsibility:** Append-only log of every Phase 9 module's emitted events (POI creation/mitigation, MSS triggers, ratings issued). Structurally separate from Phase 8's `Event Log` to preserve Phase 8 single-writer immutability.
+- **Why it exists:** Phase 8's Event Log is frozen and owned by Phase 8 modules only; Phase 9 needs its own append-only ledger rather than writing into a frozen contract.
+- **ICT value:** Indirect — enables backtesting/statistics and audit of institutional-zone lifecycle.
+- **Owned contract:** `InstitutionalEventLogContract` (append-only)
+- **Input:** All Phase 9 modules (event emission only, not raw contracts)
+- **Output fields:** `{ eventId, sourceModule, eventType, payloadRef, timestamp, integrity }[]`
+- **Consumers:** Institutional Audit, Statistics Engine
+
+### 2.12 Institutional Audit
+- **Responsibility:** Read-only reconciliation module verifying that POI Registry, Confidence Score, and Trade Rating entries are internally consistent (no orphaned references, no integrity mismatches) — mirrors the Phase 8 Selection Audit / Lifecycle Audit pattern.
+- **Why it exists:** Matches the established Phase 8 convention of pairing every major registry with a dedicated audit module, kept separate from the registries themselves.
+- **ICT value:** Indirect — system trustworthiness, not trading logic.
+- **Owned contract:** `InstitutionalAuditContract`
+- **Input:** `POIRegistryContract`, `ConfidenceScoreContract`, `TradeRatingContract`, `InstitutionalEventLogContract`
+- **Output fields:** `{ auditId, checkedContract, status: OK|Mismatch, detail, timestamp }[]`
+- **Consumers:** None (terminal — for manual/automated review only)
+
+### 2.13 Statistics Engine
+- **Responsibility:** Aggregate historical Trade Rating and Institutional Event Log data into performance statistics (win-rate by grade, by POI type, by liquidity tier, by MTF alignment).
+- **Why it exists:** Pure read-only aggregation over historical append-only data; must not run per-bar in the live decision path — it is an analytics-only terminal consumer.
+- **ICT value:** Empirically validates or challenges ICT assumptions (e.g. "do A+ breaker-block setups actually outperform A-grade order-block setups on this instrument") — turns the engine into a self-auditing system over time.
+- **Owned contract:** `StatisticsContract`
+- **Input:** `TradeRatingContract`, `InstitutionalEventLogContract`
+- **Output fields:** `{ statId, dimension, winRate, sampleSize, avgScore, generatedAt }[]`
+- **Consumers:** None (terminal — reporting/dashboard only)
+
+---
+
+## 3. Dependency Graph
+
+```
+                        ┌────────────────────────┐
+                        │   PHASE 8 (frozen)      │
+                        │  Structure Engine       │
+                        │  Selection Engine       │
+                        │  Sweep Validation       │
+                        │  Context Snapshot       │
+                        │  Arbitration Engine     │
+                        │  Recommendation Engine  │
+                        │  Validation Summary     │
+                        └───────────┬─────────────┘
+                                    │ (read-only)
+                                    ▼
+                     ┌──────────────────────────────┐
+                     │   MTF Structure Adapter       │
+                     └──────┬───────────┬────────────┘
+                            │           │
+              ┌─────────────┘           └───────────────┐
+              ▼                                          ▼
+   ┌────────────────────┐                    ┌──────────────────────┐
+   │ Liquidity Hierarchy │                    │ Premium/Discount      │
+   │ Engine              │                    │ Array Engine          │
+   └─────────┬───────────┘                    └───────────┬───────────┘
+             │                                              │
+             │        ┌───────────────────┐                 │
+             │        │  FVG Engine        │                 │
+             │        └─────────┬──────────┘                 │
+             │                  │                             │
+             │        ┌─────────▼──────────┐                  │
+             │        │ Order Block Engine  │                  │
+             │        └─────────┬──────────┘                  │
+             │                  │                              │
+             │        ┌─────────▼──────────┐                   │
+             │        │  MSS Engine         │                   │
+             │        └─────────┬──────────┘                   │
+             │                  │                              │
+             │        ┌─────────▼──────────┐                   │
+             │        │ Breaker Block Engine│                   │
+             │        └─────────┬──────────┘                   │
+             │                  │                              │
+             └──────────┬───────┴──────────┬───────────────────┘
+                        ▼                  ▼
+              ┌───────────────────────────────────┐
+              │     Institutional POI Aggregator    │
+              └──────────────────┬───────────────────┘
+                                 ▼
+              ┌───────────────────────────────────┐
+              │     Confidence Scoring Engine       │
+              └──────────────────┬───────────────────┘
+                                 ▼
+              ┌───────────────────────────────────┐
+              │        Trade Rating Engine          │
+              └──────────────────┬───────────────────┘
+                                 ▼
+              ┌───────────────────────────────────┐
+              │    Institutional Event Log (append) │
+              └──────────┬───────────────┬───────────┘
+                         ▼               ▼
+              ┌────────────────┐ ┌────────────────┐
+              │ Institutional   │ │ Statistics      │
+              │ Audit (terminal)│ │ Engine (terminal)│
+              └────────────────┘ └────────────────┘
+```
+
+---
+
+## 4. Data Flow Summary
+
+1. Phase 8 outputs (read-only) enter Phase 9 only through explicit contract reads — never through shared mutable state.
+2. MTF Structure Adapter is the sole module permitted to re-invoke Phase 8's Structure Engine across timeframes; every other Phase 9 module receives MTF context only through `MTFStructureContract`.
+3. Detection-tier modules (FVG, Order Block, MSS, Liquidity Hierarchy, PD Array) run independently and in parallel — none depends on another detection-tier module except where explicitly noted (Order Block → Breaker Block, MSS → Breaker Block).
+4. All detection-tier outputs converge at the POI Aggregator — the only module allowed to write `POIRegistryContract`.
+5. Scoring (Confidence Scoring Engine) and grading (Trade Rating Engine) are strictly sequential and each single-purpose: score first, grade second. Grading logic never re-derives a score.
+6. All Phase 9 modules emit to the Institutional Event Log; the log is the only module that batches events into the append-only ledger.
+7. Audit and Statistics are terminal, read-only, and never feed back into any upstream module (no cycles).
+
+---
+
+## 5. Runtime Execution Order (per bar / per confirmed close)
+
+1. MTF Structure Adapter
+2. Liquidity Hierarchy Engine
+3. Premium/Discount Array Engine
+4. Fair Value Gap Engine
+5. Order Block Engine
+6. Market Structure Shift Engine
+7. Breaker Block Engine
+8. Institutional POI Aggregator
+9. Confidence Scoring Engine
+10. Trade Rating Engine
+11. Institutional Event Log
+12. Institutional Audit *(can run less frequently — e.g. once per N bars — since it is a consistency check, not a live decision input)*
+13. Statistics Engine *(runs on closed-trade/session boundaries, not every bar)*
+
+Fail-closed rule applies at every step: if step *n* receives `integrity = false` from any required input, step *n* emits `integrity = false` and performs no further computation; steps 8–13 downstream of it do the same.
+
+---
+
+## 6. Module Interface Definitions
+
+Each module exposes exactly one public compute function and one contract type, per Phase 8 convention.
+
+| Module | Function signature (conceptual) | Returns |
+|---|---|---|
+| MTF Structure Adapter | `computeMTFStructure(timeframes[]) → MTFStructureContract[]` | array, one per timeframe |
+| Liquidity Hierarchy Engine | `rankLiquidity(selectionData, structureData, mtfData) → LiquidityHierarchyContract[]` | ranked pools |
+| Premium/Discount Array Engine | `computePDArray(structureData, mtfData) → PDArrayContract` | single current zone state |
+| FVG Engine | `detectFVGs(contextSnapshot) → FVGContract[]` | active + historical FVGs |
+| Order Block Engine | `detectOrderBlocks(structureData, sweepData, contextSnapshot) → OrderBlockContract[]` | active + mitigated OBs |
+| MSS Engine | `detectMSS(structureData, mtfData) → MSSContract[]` | MSS events |
+| Breaker Block Engine | `reclassifyBreakers(orderBlocks, mssEvents) → BreakerBlockContract[]` | breaker blocks |
+| POI Aggregator | `aggregatePOIs(fvgs, obs, breakers, pdArray, liquidity) → POIRegistryContract[]` | unified POI registry (append) |
+| Confidence Scoring Engine | `scoreConfidence(poiRegistry, arbitrationResult, recommendation, validationSummary, mssEvents) → ConfidenceScoreContract[]` | scores |
+| Trade Rating Engine | `rateTrade(confidenceScores, recommendation, arbitrationResult) → TradeRatingContract[]` | grades |
+| Institutional Event Log | `logEvent(sourceModule, eventType, payloadRef) → InstitutionalEventLogContract` | append-only entry |
+| Institutional Audit | `auditConsistency(poiRegistry, scores, ratings, eventLog) → InstitutionalAuditContract[]` | audit results |
+| Statistics Engine | `computeStatistics(ratings, eventLog) → StatisticsContract[]` | aggregated stats |
+
+---
+
+## 7. Contract Ownership Matrix — Phase 9 Additions
+
+| Contract | Sole Writer | Readers |
+|---|---|---|
+| `MTFStructureContract` | MTF Structure Adapter | Liquidity Hierarchy, PD Array, MSS, Confidence Scoring |
+| `LiquidityHierarchyContract` | Liquidity Hierarchy Engine | POI Aggregator, Confidence Scoring |
+| `PDArrayContract` | PD Array Engine | POI Aggregator, Confidence Scoring |
+| `FVGContract` | FVG Engine | POI Aggregator |
+| `OrderBlockContract` | Order Block Engine | Breaker Block Engine, POI Aggregator |
+| `MSSContract` | MSS Engine | Breaker Block Engine, Confidence Scoring |
+| `BreakerBlockContract` | Breaker Block Engine | POI Aggregator |
+| `POIRegistryContract` | POI Aggregator | Confidence Scoring, Institutional Event Log |
+| `ConfidenceScoreContract` | Confidence Scoring Engine | Trade Rating Engine |
+| `TradeRatingContract` | Trade Rating Engine | Institutional Event Log, Statistics Engine |
+| `InstitutionalEventLogContract` | Institutional Event Log | Institutional Audit, Statistics Engine |
+| `InstitutionalAuditContract` | Institutional Audit | (terminal) |
+| `StatisticsContract` | Statistics Engine | (terminal) |
+
+---
+
+## 8. Freeze Governance Assignment (Phase 9)
+
+Per the existing three-tier model:
+
+| Tier | Modules | Rationale |
+|---|---|---|
+| Tier 1 (permanently frozen once validated) | MTF Structure Adapter, FVG Engine, Order Block Engine, MSS Engine, Breaker Block Engine, POI Aggregator | Structural detection logic — must match ICT definitions exactly; changing detection criteria invalidates all downstream scoring history. |
+| Tier 2 (reopenable under defined criteria) | Confidence Scoring Engine (weights), Trade Rating Engine (grade thresholds), Liquidity Hierarchy Engine (tier boundaries), PD Array Engine (equilibrium method) | Parameters may be recalibrated as statistics accumulate, without changing detection logic. |
+| Tier 3 (freely evolving) | Statistics Engine (dimensions/reports), Institutional Audit (checks performed) | Purely observational — safe to extend without risk to live decision logic. |
+
+---
+
+## 9. Requirement Coverage Map
+
+| Requirement | Delivered by |
+|---|---|
+| Multi-Timeframe Structure | MTF Structure Adapter |
+| Liquidity Hierarchy | Liquidity Hierarchy Engine |
+| Fair Value Gaps | FVG Engine |
+| Order Blocks | Order Block Engine |
+| Breaker Blocks | Breaker Block Engine |
+| Premium/Discount Arrays | PD Array Engine |
+| Market Structure Shift | MSS Engine |
+| Confidence Scoring | Confidence Scoring Engine |
+| Trade Rating | Trade Rating Engine |
+| Statistics | Statistics Engine |
+
+---
+
+## 10. Notes for GLM Implementation
+
+- Build in the execution order given in Section 5 — each module should be fully testable in isolation against a mocked upstream contract before the next module is built.
+- Do not let any Tier 1 module's compute function accept a "weight" or "threshold" parameter — those belong exclusively to Tier 2 modules.
+- The Institutional Event Log must never be queried for *current state* by any live-decision module (Confidence Scoring, Trade Rating) — it is a downstream ledger only, never a re-entrant input.
+- All contract arrays are conceptually append-only where noted; implementers should use whatever storage primitive enforces immutability of past entries in the target language.
