@@ -1,0 +1,2025 @@
+//@version=6
+indicator("Gold ICT Pro - Phase 8 & 9 Engine", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ============================================================================
+// Gold ICT Pro - Phase 8.0.1 & Phase 9.0 Engine
+// Architecture Version: 8.0.1 (Frozen) -> 9.0 (Modules 1, 2 & 3 added)
+// Pine Script Version: 6
+// ============================================================================
+
+// =========================================================================
+// MODULE 1: CORE FOUNDATION & TYPES
+// =========================================================================
+
+// --- General Settings ---
+GRP_GENERAL = "General Settings"
+int SWING_LOOKBACK   = input.int(5, "Swing Lookback", group=GRP_GENERAL, minval=2)
+int ATR_LENGTH       = input.int(14, "ATR Length", group=GRP_GENERAL, minval=1)
+float SWEEP_THRESHOLD= input.float(0.2, "Sweep Threshold (ATR multiplier)", group=GRP_GENERAL, step=0.1)
+
+// --- Session Settings (Exchange Time) ---
+GRP_SESSION = "Session Settings (Exchange Time)"
+int ASIAN_START_HR   = input.int(19, "Asian Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_START_MIN  = input.int(0, "Asian Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int ASIAN_END_HR     = input.int(4, "Asian End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_END_MIN    = input.int(0, "Asian End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+int LONDON_START_HR  = input.int(3, "London Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_START_MIN = input.int(0, "London Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int LONDON_END_HR    = input.int(12, "London End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_END_MIN   = input.int(0, "London End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+int NY_START_HR      = input.int(8, "New York Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_START_MIN     = input.int(0, "New York Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int NY_END_HR        = input.int(17, "New York End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_END_MIN       = input.int(0, "New York End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+// --- Engine Limits ---
+GRP_LIMITS = "Engine Limits"
+int MAX_POOLS           = input.int(50, "Max Registry Pools", group=GRP_LIMITS, minval=10)
+int MAX_RECOMMENDATIONS = input.int(10, "Max Tracked Recommendations", group=GRP_LIMITS, minval=1)
+
+// -------------------------------------------------------------------------
+// 1.2 FUNDAMENTAL ENUMS
+// -------------------------------------------------------------------------
+
+int LS_FORMED      = 0
+int LS_ACTIVE      = 1
+int LS_REINFORCED  = 2
+int LS_SWEPT       = 3
+int LS_INVALIDATED = 4
+int LS_EXPIRED     = 5
+
+int LT_BUY_SIDE  = 0
+int LT_SELL_SIDE = 1
+int LT_INTERNAL  = 2
+int LT_EXTERNAL  = 3
+
+int ST_OFF_SESSION = 0
+int ST_ASIAN       = 1
+int ST_LONDON      = 2
+int ST_NEW_YORK    = 3
+
+int TD_NEUTRAL = 0
+int TD_LONG    = 1
+int TD_SHORT   = 2
+
+int RS_PENDING     = 0
+int RS_ACTIVE      = 1
+int RS_INVALIDATED = 2
+int RS_FULFILLED   = 3
+int RS_EXPIRED     = 4
+
+int RD_KEEP    = 0
+int RD_REPLACE = 1
+int RD_MERGE   = 2
+int RD_IGNORE  = 3
+
+int RA_NONE        = 0
+int RA_CREATED_NEW = 1
+int RA_UPDATED     = 2
+int RA_MERGED      = 3
+int RA_REPLACED    = 4
+int RA_IGNORED     = 5
+
+// -------------------------------------------------------------------------
+// 1.3 CORE TYPE DEFINITIONS
+// -------------------------------------------------------------------------
+
+type SwingPoint
+    float price
+    int   barIndex
+    int   timeMs   
+    bool  isHigh
+
+type LiquidityPool
+    int               id
+    int               poolType         
+    int               state            
+    float             priceLevel
+    int               touchCount
+    float             confidence
+    bool              isSwept
+    int               createdAtBar
+    int               sweptAtBar
+    int               invalidatedAtBar
+    string            sweepReasonCode 
+    array<SwingPoint> mitigations      
+
+type ContextSnapshot
+    int   barIndex
+    int   timeMs           
+    float currentPrice
+    float atr
+    int   currentSession 
+    int   marketBias     
+    float premiumZone
+    float discountZone
+
+type StrategyCandidate
+    int             id
+    LiquidityPool   sourcePool
+    ContextSnapshot context
+    int             direction       
+    float           entryPrice
+    float           stopLoss
+    float           takeProfit
+    string          strategyName
+
+type Recommendation
+    int               id
+    StrategyCandidate candidate
+    int               status
+    int               createdBarIndex
+    float             actualEntry
+    float             actualStop
+
+// -------------------------------------------------------------------------
+// 1.4 GLOBAL HELPERS
+// -------------------------------------------------------------------------
+
+f_state_to_string(int state) =>
+    string res = "UNKNOWN"
+    if state == LS_FORMED
+        res := "FORMED"
+    else if state == LS_ACTIVE
+        res := "ACTIVE"
+    else if state == LS_REINFORCED
+        res := "REINFORCED"
+    else if state == LS_SWEPT
+        res := "SWEPT"
+    else if state == LS_INVALIDATED
+        res := "INVALIDATED"
+    else if state == LS_EXPIRED
+        res := "EXPIRED"
+    res
+
+// =========================================================================
+// MODULE 2: DASHBOARD FRAMEWORK
+// =========================================================================
+
+var table dash_table = table.new(position.top_right, 2, 36, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_dash_header(int row, string headerText) =>
+    table.cell(dash_table, 0, row, headerText, text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+    table.merge_cells(dash_table, 0, row, 1, row)
+    
+f_dash_data(int row, string label, string value) =>
+    table.cell(dash_table, 0, row, label, text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, row, value, text_color=color.white, text_size=size.tiny)
+
+f_init_dashboard() =>
+    if barstate.isfirst
+        table.cell(dash_table, 0, 0, "GOLD ICT PRO - PHASE 8", text_color=color.yellow, text_size=size.small, text_halign=text.align_center)
+        table.merge_cells(dash_table, 0, 0, 1, 0)
+
+        f_dash_header(1, "ENGINE STATUS")
+        f_dash_data(2, "Engine Version", "v8.0.1")
+        f_dash_data(3, "Build Status", "Stable")
+        f_dash_data(4, "Current Module", "P9: PD Array")
+        f_dash_data(5, "Engine Health", "Online")
+
+        f_dash_header(6, "SESSION INFORMATION")
+        f_dash_data(7, "Current Session", "Waiting...")
+        f_dash_data(8, "Market Status", "N/A")
+        f_dash_data(9, "Time", "00:00")
+
+        f_dash_header(10, "LIQUIDITY STATUS")
+        f_dash_data(11, "Bullish Pools", "0")
+        f_dash_data(12, "Bearish Pools", "0")
+        f_dash_data(13, "Active Pools", "0")
+        f_dash_data(14, "Swept Pools", "0")
+        f_dash_data(15, "Reinforced Pools", "0")
+        f_dash_data(16, "Invalidated Pools", "0")
+
+        f_dash_header(17, "STRUCTURE")
+        f_dash_data(18, "BOS", "Waiting...")
+        f_dash_data(19, "CHoCH", "Waiting...")
+        f_dash_data(20, "Trend", "Neutral")
+
+        f_dash_header(21, "STRATEGY & ARBITRATION")
+        f_dash_data(22, "Strat Status", "Inactive")
+        f_dash_data(23, "Direction", "N/A")
+        f_dash_data(24, "Strat Entry", "N/A")
+        f_dash_data(25, "SL / TP", "N/A")
+        f_dash_data(26, "Risk:Reward", "0")
+        f_dash_data(27, "Arb Status", "N/A")
+        f_dash_data(28, "Arb Reason", "N/A")
+
+        f_dash_header(29, "SYSTEM STATUS")
+        f_dash_data(30, "Validation Status", "N/A")
+        f_dash_data(31, "Sweep Status", "N/A")
+        f_dash_data(32, "Selected Pool", "None")
+        f_dash_data(33, "Market Zone", "N/A")
+
+f_init_dashboard()
+
+
+// =========================================================================
+// MODULE 3: SESSION ENGINE (v8.0.1 MAINTENANCE PATCH)
+// =========================================================================
+
+f_is_in_range(int cur_mins, int start_mins, int end_mins) =>
+    if start_mins <= end_mins
+        cur_mins >= start_mins and cur_mins < end_mins
+    else
+        cur_mins >= start_mins or cur_mins < end_mins
+
+f_run_session_engine() =>
+    int cur_hour = hour(time, syminfo.timezone)
+    int cur_min  = minute(time, syminfo.timezone)
+    int cur_mins = cur_hour * 60 + cur_min
+    int cur_day  = dayofweek(time, syminfo.timezone)
+
+    int asian_start  = ASIAN_START_HR * 60 + ASIAN_START_MIN
+    int asian_end    = ASIAN_END_HR * 60 + ASIAN_END_MIN
+    int london_start = LONDON_START_HR * 60 + LONDON_START_MIN
+    int london_end   = LONDON_END_HR * 60 + LONDON_END_MIN
+    int ny_start     = NY_START_HR * 60 + NY_START_MIN
+    int ny_end       = NY_END_HR * 60 + NY_END_MIN
+
+    bool is_weekend = false
+    if cur_day == 1
+        if cur_mins < (17 * 60)
+            is_weekend := true
+    else if cur_day == 6
+        if cur_mins >= (17 * 60)
+            is_weekend := true
+
+    int session = ST_OFF_SESSION
+    string status = "CLOSED"
+
+    if not is_weekend
+        bool is_ny = f_is_in_range(cur_mins, ny_start, ny_end)
+        bool is_london = f_is_in_range(cur_mins, london_start, london_end)
+        bool is_asian = f_is_in_range(cur_mins, asian_start, asian_end)
+        
+        status := "OPEN"
+        if is_ny and is_london
+            session := ST_NEW_YORK // Treat overlap as NY for internal logic
+        else if is_ny
+            session := ST_NEW_YORK
+        else if is_london
+            session := ST_LONDON
+        else if is_asian
+            session := ST_ASIAN
+        else
+            session := ST_OFF_SESSION
+            status := "CLOSED"
+
+    string h_str = cur_hour < 10 ? "0" + str.tostring(cur_hour) : str.tostring(cur_hour)
+    string m_str = cur_min < 10 ? "0" + str.tostring(cur_min) : str.tostring(cur_min)
+    string time_str = h_str + ":" + m_str
+    
+    [session, status, time_str]
+
+[g_current_session, g_market_status, g_current_time_str] = f_run_session_engine()
+
+if barstate.islast
+    int now_hour = hour(timenow, syminfo.timezone)
+    int now_min  = minute(timenow, syminfo.timezone)
+    int now_mins = now_hour * 60 + now_min
+    int now_day  = dayofweek(timenow, syminfo.timezone)
+    
+    bool is_weekend_now = false
+    if now_day == 1
+        if now_mins < (17 * 60)
+            is_weekend_now := true
+    else if now_day == 6
+        if now_mins >= (17 * 60)
+            is_weekend_now := true
+            
+    string display_session_name = "Off Session"
+    string display_status = "CLOSED"
+    string display_time_str = g_current_time_str
+    
+    int asian_start  = ASIAN_START_HR * 60 + ASIAN_START_MIN
+    int asian_end    = ASIAN_END_HR * 60 + ASIAN_END_MIN
+    int london_start = LONDON_START_HR * 60 + LONDON_START_MIN
+    int london_end   = LONDON_END_HR * 60 + LONDON_END_MIN
+    int ny_start     = NY_START_HR * 60 + NY_START_MIN
+    int ny_end       = NY_END_HR * 60 + NY_END_MIN
+    
+    if is_weekend_now
+        display_session_name := "Off Session"
+        display_status := "CLOSED"
+        string h_str = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+        string m_str = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+        display_time_str := h_str + ":" + m_str + " (Wknd)"
+    else
+        bool now_is_ny = f_is_in_range(now_mins, ny_start, ny_end)
+        bool now_is_london = f_is_in_range(now_mins, london_start, london_end)
+        bool now_is_asian = f_is_in_range(now_mins, asian_start, asian_end)
+        
+        if now_is_ny and now_is_london
+            display_session_name := "London/NY Overlap"
+            display_status := "OPEN"
+        else if now_is_ny
+            display_session_name := "New York"
+            display_status := "OPEN"
+        else if now_is_london
+            display_session_name := "London"
+            display_status := "OPEN"
+        else if now_is_asian
+            display_session_name := "Asian"
+            display_status := "OPEN"
+            
+        string h_str = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+        string m_str = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+        display_time_str := h_str + ":" + m_str
+
+    table.cell(dash_table, 1, 7, display_session_name, text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 8, display_status, text_color=display_status == "OPEN" ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash_table, 1, 9, display_time_str, text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 4: REGISTRY ENGINE
+// =========================================================================
+
+var array<LiquidityPool> g_registry = array.new<LiquidityPool>()
+var array<int> g_next_pool_id_arr = array.new<int>(1, 1)
+var array<string> g_event_log = array.new<string>()
+
+f_registry_add(float priceLevel, int poolType, float confidence) =>
+    int newId = -1
+    if array.size(g_registry) < MAX_POOLS
+        newId := array.get(g_next_pool_id_arr, 0)
+        array.set(g_next_pool_id_arr, 0, newId + 1)
+        
+        LiquidityPool newPool = LiquidityPool.new(
+             newId, poolType, LS_ACTIVE, priceLevel, 0, confidence, 
+             false, bar_index, 0, 0, "INIT", array.new<SwingPoint>()
+        )
+        array.push(g_registry, newPool)
+        array.push(g_event_log, str.tostring(bar_index) + " - Pool " + str.tostring(newId) + " Created (Type: " + str.tostring(poolType) + ")")
+    newId
+
+f_registry_get(int poolId) =>
+    LiquidityPool foundPool = na
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            if p.id == poolId
+                foundPool := p
+                break
+    foundPool
+
+f_registry_update_state(LiquidityPool pool, int newState, string reason) =>
+    string logEntry = ""
+    if not na(pool)
+        int prevState = pool.state
+        pool.state := newState
+        if newState == LS_SWEPT
+            pool.isSwept := true
+            pool.sweptAtBar := bar_index
+        else if newState == LS_INVALIDATED
+            pool.invalidatedAtBar := bar_index
+        pool.sweepReasonCode := reason
+        logEntry := str.tostring(bar_index) + " - Pool " + str.tostring(pool.id) + " Transition: " + f_state_to_string(prevState) + " -> " + f_state_to_string(newState) + " (" + reason + ")"
+    logEntry
+
+f_registry_find_index(int poolId) =>
+    int idx = -1
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            if array.get(g_registry, i).id == poolId
+                idx := i
+                break
+    idx
+
+f_registry_count_by_type(int poolType) =>
+    int count = 0
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            if array.get(g_registry, i).poolType == poolType
+                count += 1
+    count
+
+f_registry_count_by_state(int state) =>
+    int count = 0
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            if array.get(g_registry, i).state == state
+                count += 1
+    count
+
+if barstate.islast
+    int bull_count = f_registry_count_by_type(LT_BUY_SIDE)
+    int bear_count = f_registry_count_by_type(LT_SELL_SIDE)
+    int active_count = f_registry_count_by_state(LS_ACTIVE)
+    int swept_count = f_registry_count_by_state(LS_SWEPT)
+    
+    table.cell(dash_table, 1, 11, str.tostring(bull_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 12, str.tostring(bear_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 13, str.tostring(active_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 14, str.tostring(swept_count), text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 5: LIFECYCLE ENGINE
+// =========================================================================
+
+int POOL_EXPIRY_BARS = 200
+
+f_mark_pool_swept(LiquidityPool pool, string reason) =>
+    string log = f_registry_update_state(pool, LS_SWEPT, reason)
+    log
+
+f_mark_pool_invalidated(LiquidityPool pool, string reason) =>
+    string log = f_registry_update_state(pool, LS_INVALIDATED, reason)
+    log
+
+f_mark_pool_reinforced(LiquidityPool pool, float touchPrice) =>
+    string log = ""
+    if not na(pool)
+        pool.state := LS_REINFORCED
+        pool.touchCount += 1
+        pool.confidence := math.min(pool.confidence + 0.1, 1.0)
+        
+        SwingPoint mitigation = SwingPoint.new(touchPrice, bar_index, time, false)
+        if na(pool.mitigations)
+            pool.mitigations := array.new<SwingPoint>()
+        array.push(pool.mitigations, mitigation)
+        
+        log := str.tostring(bar_index) + " - Pool " + str.tostring(pool.id) + " Reinforced (Touches: " + str.tostring(pool.touchCount) + ", Conf: " + str.tostring(pool.confidence) + ")"
+    log
+
+f_expire_old_pools(LiquidityPool pool) =>
+    string log = ""
+    if not na(pool)
+        if pool.state == LS_ACTIVE or pool.state == LS_REINFORCED
+            if bar_index - pool.createdAtBar > POOL_EXPIRY_BARS
+                log := f_registry_update_state(pool, LS_EXPIRED, "TIME_EXPIRY")
+    log
+
+f_lifecycle_update(float h, float l, float c) =>
+    string logs = ""
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            string log = ""
+            
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED
+                log := f_expire_old_pools(p)
+                
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED
+                if p.poolType == LT_BUY_SIDE
+                    if c < p.priceLevel
+                        log := f_mark_pool_swept(p, "CLOSED_BELOW_BSL")
+                    else if l <= p.priceLevel and c > p.priceLevel
+                        log := f_mark_pool_reinforced(p, l)
+                        
+                else if p.poolType == LT_SELL_SIDE
+                    if c > p.priceLevel
+                        log := f_mark_pool_swept(p, "CLOSED_ABOVE_SSL")
+                    else if h >= p.priceLevel and c < p.priceLevel
+                        log := f_mark_pool_reinforced(p, h)
+                        
+            if p.state == LS_SWEPT and p.sweptAtBar < bar_index
+                log := f_mark_pool_invalidated(p, "POST_SWEEP_INVALIDATION")
+                
+            if log != ""
+                logs += log + "\n"
+    logs
+
+string lifecycle_logs = f_lifecycle_update(high, low, close)
+if lifecycle_logs != ""
+    array.push(g_event_log, lifecycle_logs)
+
+if barstate.islast
+    int invalid_count = f_registry_count_by_state(LS_INVALIDATED)
+    int rein_count = f_registry_count_by_state(LS_REINFORCED)
+    table.cell(dash_table, 1, 15, str.tostring(rein_count), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 16, str.tostring(invalid_count), text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 6: STRUCTURE ENGINE
+// =========================================================================
+
+var float g_last_swing_high_price = na
+var int   g_last_swing_high_bar   = na
+var float g_last_swing_low_price  = na
+var int   g_last_swing_low_bar    = na
+var int   g_current_trend         = TD_NEUTRAL
+var int   g_last_bos_dir          = 0
+var int   g_last_choch_dir        = 0
+
+f_run_structure_engine(float h, float l, float c) =>
+    float ph = ta.pivothigh(h, SWING_LOOKBACK, SWING_LOOKBACK)
+    float pl = ta.pivotlow(l, SWING_LOOKBACK, SWING_LOOKBACK)
+    
+    int newTrend = g_current_trend
+    int newBos = g_last_bos_dir
+    int newChoch = g_last_choch_dir
+    string logs = ""
+    
+    float newHigh = g_last_swing_high_price
+    int newHighBar = g_last_swing_high_bar
+    float newLow = g_last_swing_low_price
+    int newLowBar = g_last_swing_low_bar
+
+    if not na(g_last_swing_high_price) and c > g_last_swing_high_price
+        if g_current_trend == TD_SHORT
+            newChoch := TD_LONG 
+            newTrend := TD_LONG
+            logs += "CHoCH (Bullish) detected. "
+        else
+            newBos := TD_LONG 
+            newTrend := TD_LONG
+            logs += "BOS (Bullish) detected. "
+            
+    if not na(g_last_swing_low_price) and c < g_last_swing_low_price
+        if g_current_trend == TD_LONG
+            newChoch := TD_SHORT 
+            newTrend := TD_SHORT
+            logs += "CHoCH (Bearish) detected. "
+        else
+            newBos := TD_SHORT 
+            newTrend := TD_SHORT
+            logs += "BOS (Bearish) detected. "
+
+    if not na(ph)
+        f_registry_add(ph, LT_BUY_SIDE, 1.0)
+        newHigh := ph
+        newHighBar := bar_index - SWING_LOOKBACK
+        logs += "Confirmed Swing High: " + str.tostring(ph) + ". "
+        
+    if not na(pl)
+        f_registry_add(pl, LT_SELL_SIDE, 1.0)
+        newLow := pl
+        newLowBar := bar_index - SWING_LOOKBACK
+        logs += "Confirmed Swing Low: " + str.tostring(pl) + ". "
+        
+    [newTrend, newBos, newChoch, newHigh, newHighBar, newLow, newLowBar, logs]
+
+[ret_trend, ret_bos, ret_choch, ret_high, ret_highbar, ret_low, ret_lowbar, struct_logs] = f_run_structure_engine(high, low, close)
+
+g_current_trend := ret_trend
+g_last_bos_dir := ret_bos
+g_last_choch_dir := ret_choch
+g_last_swing_high_price := ret_high
+g_last_swing_high_bar := ret_highbar
+g_last_swing_low_price := ret_low
+g_last_swing_low_bar := ret_lowbar
+
+if struct_logs != ""
+    array.push(g_event_log, str.tostring(bar_index) + " - STRUCT: " + struct_logs)
+
+if barstate.islast
+    string trend_str = g_current_trend == TD_LONG ? "Bullish" : g_current_trend == TD_SHORT ? "Bearish" : "Neutral"
+    string bos_str = g_last_bos_dir == TD_LONG ? "Bullish BOS" : g_last_bos_dir == TD_SHORT ? "Bearish BOS" : "None"
+    string choch_str = g_last_choch_dir == TD_LONG ? "Bullish CHoCH" : g_last_choch_dir == TD_SHORT ? "Bearish CHoCH" : "None"
+    
+    table.cell(dash_table, 1, 18, bos_str, text_color=g_last_bos_dir != 0 ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 19, choch_str, text_color=g_last_choch_dir != 0 ? color.orange : color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 20, trend_str, text_color=g_current_trend == TD_LONG ? color.green : g_current_trend == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 7: SELECTION ENGINE
+// =========================================================================
+
+type SelectionResult
+    LiquidityPool bestBullPool
+    LiquidityPool bestBearPool
+    LiquidityPool bestOverallPool
+    string        selectionReason
+    float         selectionConfidence
+
+f_score_pool(LiquidityPool p) =>
+    float score = p.confidence
+    if p.state == LS_REINFORCED
+        score += 0.5   
+        score += p.touchCount * 0.1 
+    score
+
+f_run_selection_engine() =>
+    LiquidityPool bestBull = na
+    float bestBullScore = -1.0
+    
+    LiquidityPool bestBear = na
+    float bestBearScore = -1.0
+    
+    string reason = "No eligible pools found."
+    float confidence = 0.0
+
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED or p.state == LS_SWEPT
+                float score = f_score_pool(p)
+                
+                if p.poolType == LT_BUY_SIDE
+                    if score > bestBullScore
+                        bestBullScore := score
+                        bestBull := p
+                else if p.poolType == LT_SELL_SIDE
+                    if score > bestBearScore
+                        bestBearScore := score
+                        bestBear := p
+
+    LiquidityPool bestOverall = na
+    if not na(bestBull) and not na(bestBear)
+        if bestBullScore >= bestBearScore
+            bestOverall := bestBull
+            reason := "Bullish selected (Highest Score)."
+            confidence := bestBull.confidence
+        else
+            bestOverall := bestBear
+            reason := "Bearish selected (Highest Score)."
+            confidence := bestBear.confidence
+    else if not na(bestBull)
+        bestOverall := bestBull
+        reason := "Bullish selected (No Bearish competition)."
+        confidence := bestBull.confidence
+    else if not na(bestBear)
+        bestOverall := bestBear
+        reason := "Bearish selected (No Bullish competition)."
+        confidence := bestBear.confidence
+
+    SelectionResult.new(bestBull, bestBear, bestOverall, reason, confidence)
+
+var SelectionResult g_current_selection = na
+g_current_selection := f_run_selection_engine()
+
+if g_current_selection.selectionReason != "No eligible pools found."
+    array.push(g_event_log, str.tostring(bar_index) + " - SELECT: " + g_current_selection.selectionReason)
+
+if barstate.islast
+    string sel_str = "None"
+    if not na(g_current_selection) and not na(g_current_selection.bestOverallPool)
+        sel_str := str.tostring(g_current_selection.bestOverallPool.id) + " (Conf: " + str.tostring(g_current_selection.selectionConfidence, "#.##") + ")"
+        
+    table.cell(dash_table, 1, 32, sel_str, text_color=color.yellow, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 8: CONTEXT SNAPSHOT
+// =========================================================================
+
+f_get_context_snapshot() =>
+    float atr = ta.atr(ATR_LENGTH)
+    float high50 = ta.highest(high, 50)
+    float low50 = ta.lowest(low, 50)
+    float priceRange = high50 - low50
+    
+    float eq = low50 + (priceRange * 0.5)
+    float premium = low50 + (priceRange * 0.7)
+    float discount = low50 + (priceRange * 0.3)
+    
+    ContextSnapshot.new(
+        bar_index, 
+        time, 
+        close, 
+        atr, 
+        g_current_session,  
+        g_current_trend,    
+        premium, 
+        discount
+    )
+
+var ContextSnapshot g_current_context = na
+g_current_context := f_get_context_snapshot()
+
+if barstate.islast
+    string pd_str = "N/A"
+    if not na(g_current_context) and not na(g_current_context.currentPrice)
+        if g_current_context.currentPrice >= g_current_context.premiumZone
+            pd_str := "Premium"
+        else if g_current_context.currentPrice <= g_current_context.discountZone
+            pd_str := "Discount"
+        else
+            pd_str := "Equilibrium"
+            
+    table.cell(dash_table, 1, 33, pd_str, text_color=pd_str == "Premium" ? color.red : pd_str == "Discount" ? color.green : color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 9: SWEEP VALIDATION
+// =========================================================================
+
+type SweepValidationResult
+    bool          isSwept
+    int           sweepDirection
+    float         sweepConfidence
+    string        sweepReason
+    LiquidityPool sweptPool
+
+f_validate_sweep(SelectionResult sel, ContextSnapshot snap) =>
+    bool isSwept = false
+    int sweepDir = TD_NEUTRAL
+    float sweepConf = 0.0
+    string sweepReason = "NO_SWEEP_DETECTED"
+    LiquidityPool sweptPool = na
+    
+    if not na(sel.bestOverallPool) and not na(snap)
+        LiquidityPool p = sel.bestOverallPool
+        float level = p.priceLevel
+        float atr_val = snap.atr
+        float max_depth = atr_val * SWEEP_THRESHOLD
+        
+        if p.poolType == LT_SELL_SIDE
+            if low <= level and close > level 
+                float sweep_depth = level - low
+                if sweep_depth <= max_depth
+                    isSwept := true
+                    sweepDir := TD_LONG
+                    sweepConf := 0.8 - (sweep_depth / max_depth * 0.3) 
+                    sweepReason := "BULLISH_SWEEP_WICK"
+                    sweptPool := p
+                else
+                    sweepReason := "SWEEP_TOO_DEEP"
+                    
+        else if p.poolType == LT_BUY_SIDE
+            if high >= level and close < level 
+                float sweep_depth = high - level
+                if sweep_depth <= max_depth
+                    isSwept := true
+                    sweepDir := TD_SHORT
+                    sweepConf := 0.8 - (sweep_depth / max_depth * 0.3)
+                    sweepReason := "BEARISH_SWEEP_WICK"
+                    sweptPool := p
+                else
+                    sweepReason := "SWEEP_TOO_DEEP"
+                    
+    SweepValidationResult.new(isSwept, sweepDir, sweepConf, sweepReason, sweptPool)
+
+var SweepValidationResult g_current_sweep_validation = na
+g_current_sweep_validation := f_validate_sweep(g_current_selection, g_current_context)
+
+if g_current_sweep_validation.isSwept
+    array.push(g_event_log, str.tostring(bar_index) + " - SWEEP: " + g_current_sweep_validation.sweepReason + " (Pool: " + str.tostring(g_current_sweep_validation.sweptPool.id) + ", Conf: " + str.tostring(g_current_sweep_validation.sweepConfidence) + ")")
+
+if barstate.islast
+    string sweep_status_str = g_current_sweep_validation.isSwept ? "Validated" : "Waiting..."
+    table.cell(dash_table, 1, 31, sweep_status_str, text_color=g_current_sweep_validation.isSwept ? color.yellow : color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 10: VALIDATION SUMMARY
+// =========================================================================
+
+type ValidationSummary
+    bool                  isReady
+    string                validationResult
+    string                failureReason
+    string                validationStatus
+    ContextSnapshot       context
+    SelectionResult       selection
+    SweepValidationResult sweep
+    int                   trend
+
+f_create_validation_summary(SelectionResult sel, ContextSnapshot snap, SweepValidationResult sweep, int trend) =>
+    bool ready = true
+    string result = "PASS"
+    string reason = "All conditions met."
+    string status = "Validated"
+    
+    if g_market_status != "OPEN"
+        ready := false
+        result := "FAIL"
+        reason := "Market Closed"
+        status := "Rejected (Market Closed)"
+    else if na(sel.bestOverallPool)
+        ready := false
+        result := "FAIL"
+        reason := "No Pool Selected"
+        status := "Rejected (No Selection)"
+    else if not sweep.isSwept
+        ready := false
+        result := "FAIL"
+        reason := "No Sweep Detected"
+        status := "Rejected (No Sweep)"
+    else if trend == TD_NEUTRAL
+        ready := false
+        result := "FAIL"
+        reason := "Trend Neutral"
+        status := "Rejected (No Trend)"
+        
+    ValidationSummary.new(ready, result, reason, status, snap, sel, sweep, trend)
+
+var ValidationSummary g_current_validation = na
+g_current_validation := f_create_validation_summary(g_current_selection, g_current_context, g_current_sweep_validation, g_current_trend)
+
+if g_current_validation.isReady
+    array.push(g_event_log, str.tostring(bar_index) + " - VALIDATION: PASS - Ready for Strategy")
+else if g_current_validation.validationResult == "FAIL"
+    array.push(g_event_log, str.tostring(bar_index) + " - VALIDATION: FAIL - " + g_current_validation.failureReason)
+
+if barstate.islast
+    table.cell(dash_table, 1, 30, g_current_validation.validationStatus, text_color=g_current_validation.isReady ? color.green : color.red, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 11: STRATEGY ENGINE
+// =========================================================================
+
+type StrategyResult
+    bool   strategyApproved
+    int    direction
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    float  riskReward
+    float  strategyConfidence
+    string rejectionReason
+
+f_run_strategy(ValidationSummary summary) =>
+    bool approved = false
+    int dir = TD_NEUTRAL
+    float entry = na
+    float sl = na
+    float tp = na
+    float rr = 0.0
+    float conf = 0.0
+    string reason = "N/A"
+    
+    if summary.isReady
+        SweepValidationResult sweep = summary.sweep
+        ContextSnapshot snap = summary.context
+        LiquidityPool pool = summary.selection.bestOverallPool
+        
+        if sweep.sweepDirection == TD_LONG 
+            approved := true
+            dir := TD_LONG
+            entry := close
+            sl := pool.priceLevel - (snap.atr * 0.2)
+            tp := entry + (snap.atr * 2.0)
+            if entry != sl
+                rr := (tp - entry) / (entry - sl)
+            conf := (sweep.sweepConfidence * 0.6) + (pool.confidence * 0.4)
+            
+        else if sweep.sweepDirection == TD_SHORT 
+            approved := true
+            dir := TD_SHORT
+            entry := close
+            sl := pool.priceLevel + (snap.atr * 0.2)
+            tp := entry - (snap.atr * 2.0)
+            if entry != sl
+                rr := (entry - tp) / (sl - entry)
+            conf := (sweep.sweepConfidence * 0.6) + (pool.confidence * 0.4)
+        else
+            reason := "Invalid Sweep Direction"
+    else
+        reason := summary.failureReason
+        
+    StrategyResult.new(approved, dir, entry, sl, tp, rr, conf, reason)
+
+var StrategyResult g_current_strategy = na
+g_current_strategy := f_run_strategy(g_current_validation)
+
+if g_current_strategy.strategyApproved
+    array.push(g_event_log, str.tostring(bar_index) + " - STRATEGY: Approved " + (g_current_strategy.direction == TD_LONG ? "LONG" : "SHORT") + " (RR: " + str.tostring(g_current_strategy.riskReward) + ")")
+
+if barstate.islast
+    table.cell(dash_table, 1, 22, g_current_strategy.strategyApproved ? "Approved" : "Rejected", text_color=g_current_strategy.strategyApproved ? color.green : color.red, text_size=size.tiny)
+    
+    string dir_str = g_current_strategy.direction == TD_LONG ? "LONG" : g_current_strategy.direction == TD_SHORT ? "SHORT" : "N/A"
+    table.cell(dash_table, 1, 23, dir_str, text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 24, str.tostring(g_current_strategy.entryPrice, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 25, str.tostring(g_current_strategy.stopLoss, "#.##") + " / " + str.tostring(g_current_strategy.takeProfit, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(dash_table, 1, 26, str.tostring(g_current_strategy.riskReward, "#.##"), text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 12: ARBITRATION ENGINE
+// =========================================================================
+
+type ArbitrationResult
+    bool   isApproved
+    int    direction
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    string reason
+
+f_run_arbitration(StrategyResult strat, ContextSnapshot snap) =>
+    bool approved = false
+    int dir = TD_NEUTRAL
+    float entry = na
+    float sl = na
+    float tp = na
+    string reason = "N/A"
+    
+    if strat.strategyApproved
+        if strat.direction == TD_LONG and snap.marketBias == TD_SHORT
+            reason := "Conflict: Long vs Bearish Trend"
+        else if strat.direction == TD_SHORT and snap.marketBias == TD_LONG
+            reason := "Conflict: Short vs Bullish Trend"
+        else
+            approved := true
+            dir := strat.direction
+            entry := strat.entryPrice
+            sl := strat.stopLoss
+            tp := strat.takeProfit
+            reason := "Approved (No Conflicts)"
+    else
+        reason := "Strategy Rejected"
+        
+    ArbitrationResult.new(approved, dir, entry, sl, tp, reason)
+
+var ArbitrationResult g_current_arbitration = na
+g_current_arbitration := f_run_arbitration(g_current_strategy, g_current_context)
+
+if g_current_arbitration.isApproved
+    array.push(g_event_log, str.tostring(bar_index) + " - ARBITRATION: Approved " + (g_current_arbitration.direction == TD_LONG ? "LONG" : "SHORT") + " (Entry: " + str.tostring(g_current_arbitration.entryPrice) + ")")
+
+if barstate.islast
+    table.cell(dash_table, 1, 27, g_current_arbitration.isApproved ? "Approved" : "Rejected", text_color=g_current_arbitration.isApproved ? color.green : color.red, text_size=size.tiny)
+    table.cell(dash_table, 1, 28, g_current_arbitration.reason, text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 13: RECOMMENDATION ENGINE
+// =========================================================================
+
+var array<Recommendation> g_recommendations = array.new<Recommendation>()
+var array<int> g_next_rec_id_arr = array.new<int>(1, 1)
+
+f_manage_recommendations(float h, float l, float c) =>
+    string logs = ""
+    if array.size(g_recommendations) > 0
+        for i = 0 to array.size(g_recommendations) - 1
+            Recommendation rec = array.get(g_recommendations, i)
+            if rec.status == RS_ACTIVE
+                if rec.candidate.direction == TD_LONG and l <= rec.actualStop
+                    rec.status := RS_INVALIDATED
+                    logs += "Rec " + str.tostring(rec.id) + " INVALIDATED (SL hit). "
+                else if rec.candidate.direction == TD_SHORT and h >= rec.actualStop
+                    rec.status := RS_INVALIDATED
+                    logs += "Rec " + str.tostring(rec.id) + " INVALIDATED (SL hit). "
+                    
+                else if rec.candidate.direction == TD_LONG and h >= rec.candidate.takeProfit
+                    rec.status := RS_FULFILLED
+                    logs += "Rec " + str.tostring(rec.id) + " FULFILLED (TP hit). "
+                else if rec.candidate.direction == TD_SHORT and l <= rec.candidate.takeProfit
+                    rec.status := RS_FULFILLED
+                    logs += "Rec " + str.tostring(rec.id) + " FULFILLED (TP hit). "
+                    
+                else if bar_index - rec.createdBarIndex > 100
+                    rec.status := RS_EXPIRED
+                    logs += "Rec " + str.tostring(rec.id) + " EXPIRED (Time limit). "
+    logs
+
+string rec_manage_logs = f_manage_recommendations(high, low, close)
+if rec_manage_logs != ""
+    array.push(g_event_log, str.tostring(bar_index) + " - REC_MGMT: " + rec_manage_logs)
+
+bool has_active_rec = false
+Recommendation active_rec = na
+
+if array.size(g_recommendations) > 0
+    for i = array.size(g_recommendations) - 1 to 0
+        Recommendation r = array.get(g_recommendations, i)
+        if r.status == RS_ACTIVE
+            has_active_rec := true
+            active_rec := r
+            break
+
+if g_current_arbitration.isApproved and not has_active_rec
+    int recId = array.get(g_next_rec_id_arr, 0)
+    array.set(g_next_rec_id_arr, 0, recId + 1)
+    
+    StrategyCandidate cand = StrategyCandidate.new(
+        recId, 
+        g_current_selection.bestOverallPool, 
+        g_current_context, 
+        g_current_arbitration.direction, 
+        g_current_arbitration.entryPrice, 
+        g_current_arbitration.stopLoss, 
+        g_current_arbitration.takeProfit, 
+        "ICT_Liquidity_Sweep"
+    )
+    
+    Recommendation newRec = Recommendation.new(
+        recId, 
+        cand, 
+        RS_ACTIVE, 
+        bar_index, 
+        g_current_arbitration.entryPrice, 
+        g_current_arbitration.stopLoss
+    )
+    
+    array.push(g_recommendations, newRec)
+    active_rec := newRec
+    array.push(g_event_log, str.tostring(bar_index) + " - REC_CREATE: Approved " + (g_current_arbitration.direction == TD_LONG ? "LONG" : "SHORT") + " (Entry: " + str.tostring(g_current_arbitration.entryPrice) + ")")
+
+if barstate.islast
+    string rec_status_str = "No Active Rec"
+    string rec_dir_str = "N/A"
+    string rec_entry_str = "N/A"
+    string rec_sltp_str = "N/A"
+    string rec_rr_str = "N/A"
+    string rec_conf_str = "0"
+    
+    if not na(active_rec)
+        string status_name = "Active"
+        if active_rec.status == RS_INVALIDATED
+            status_name := "Invalidated"
+        else if active_rec.status == RS_FULFILLED
+            status_name := "Fulfilled"
+        else if active_rec.status == RS_EXPIRED
+            status_name := "Expired"
+            
+        rec_status_str := "Rec #" + str.tostring(active_rec.id) + " (" + status_name + ")"
+        rec_dir_str := active_rec.candidate.direction == TD_LONG ? "LONG" : "SHORT"
+        rec_entry_str := str.tostring(active_rec.actualEntry, "#.##")
+        rec_sltp_str := str.tostring(active_rec.actualStop, "#.##") + " / " + str.tostring(active_rec.candidate.takeProfit, "#.##")
+        
+        if active_rec.actualEntry != active_rec.actualStop
+            if active_rec.candidate.direction == TD_LONG
+                rec_rr_str := str.tostring((active_rec.candidate.takeProfit - active_rec.actualEntry) / (active_rec.actualEntry - active_rec.actualStop), "#.##")
+            else
+                rec_rr_str := str.tostring((active_rec.actualEntry - active_rec.candidate.takeProfit) / (active_rec.actualStop - active_rec.actualEntry), "#.##")
+        
+        rec_conf_str := str.tostring(g_current_strategy.strategyConfidence, "#.##")
+        
+    table.cell(dash_table, 0, 21, "RECOMMENDATION", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+    table.merge_cells(dash_table, 0, 21, 1, 21)
+    
+    table.cell(dash_table, 0, 22, "Rec Status", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 22, rec_status_str, text_color=not na(active_rec) and active_rec.status == RS_ACTIVE ? color.green : color.gray, text_size=size.tiny)
+    
+    table.cell(dash_table, 0, 23, "Direction", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 23, rec_dir_str, text_color=color.white, text_size=size.tiny)
+    
+    table.cell(dash_table, 0, 24, "Rec Entry", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 24, rec_entry_str, text_color=color.white, text_size=size.tiny)
+    
+    table.cell(dash_table, 0, 25, "Rec SL / TP", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 25, rec_sltp_str, text_color=color.white, text_size=size.tiny)
+    
+    table.cell(dash_table, 0, 26, "Rec Risk:Reward", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 26, rec_rr_str, text_color=color.white, text_size=size.tiny)
+    
+    table.cell(dash_table, 0, 27, "Strat Confidence", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 27, rec_conf_str, text_color=color.white, text_size=size.tiny)
+    
+    table.cell(dash_table, 0, 28, "Arb Reason", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, 28, g_current_arbitration.reason, text_color=color.white, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 14: EVENT LOG
+// =========================================================================
+
+var table event_log_table = table.new(position.bottom_left, 1, 16, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_init_event_log() =>
+    if barstate.isfirst
+        table.cell(event_log_table, 0, 0, "ENGINE EVENT LOG", text_color=color.white, text_size=size.tiny, text_halign=text.align_center, bgcolor=color.new(color.navy, 60))
+        for i = 1 to 15
+            table.cell(event_log_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+
+f_init_event_log()
+
+if barstate.islast
+    int log_size = array.size(g_event_log)
+    int max_display = 15
+    int start_idx = math.max(0, log_size - max_display)
+    
+    int display_idx = 1
+    if log_size > 0
+        for i = start_idx to log_size - 1
+            string log_entry = array.get(g_event_log, i)
+            table.cell(event_log_table, 0, display_idx, log_entry, text_color=color.white, text_size=size.tiny)
+            display_idx += 1
+            
+    if display_idx <= max_display
+        for i = display_idx to max_display
+            table.cell(event_log_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 15: SELECTION AUDIT
+// =========================================================================
+
+type SelectionAuditData
+    int totalBull
+    int totalBear
+    int eligibleBull
+    int eligibleBear
+    string stateFilterBull
+    string stateFilterBear
+    int selectedBullId
+    int selectedBearId
+    int selectedOverallId
+    string finalRejectionReason
+
+f_run_selection_audit(SelectionResult sel) =>
+    int tBull = 0
+    int tBear = 0
+    int eBull = 0
+    int eBear = 0
+    string filterBull = "PASS"
+    string filterBear = "PASS"
+    int selBullId = na(sel.bestBullPool) ? -1 : sel.bestBullPool.id
+    int selBearId = na(sel.bestBearPool) ? -1 : sel.bestBearPool.id
+    int selOverallId = na(sel.bestOverallPool) ? -1 : sel.bestOverallPool.id
+    string finalReason = "Selected (No conflicts)"
+
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            if p.poolType == LT_BUY_SIDE
+                tBull += 1
+                if p.state == LS_ACTIVE or p.state == LS_REINFORCED or p.state == LS_SWEPT
+                    eBull += 1
+                else
+                    filterBull := "FAIL: State is " + f_state_to_string(p.state)
+            else if p.poolType == LT_SELL_SIDE
+                tBear += 1
+                if p.state == LS_ACTIVE or p.state == LS_REINFORCED or p.state == LS_SWEPT
+                    eBear += 1
+                else
+                    filterBear := "FAIL: State is " + f_state_to_string(p.state)
+
+    if selOverallId == -1
+        if eBull == 0 and eBear == 0
+            finalReason := "No eligible pools (All rejected by State filter)"
+        else if eBull == 0
+            finalReason := "No eligible Bull pools"
+        else if eBear == 0
+            finalReason := "No eligible Bear pools"
+        else
+            finalReason := "Unknown selection failure"
+
+    SelectionAuditData.new(tBull, tBear, eBull, eBear, filterBull, filterBear, selBullId, selBearId, selOverallId, finalReason)
+
+var SelectionAuditData g_current_audit = na
+g_current_audit := f_run_selection_audit(g_current_selection)
+
+if g_current_audit.selectedOverallId == -1
+    array.push(g_event_log, str.tostring(bar_index) + " - AUDIT: " + g_current_audit.finalRejectionReason)
+
+var table audit_table = table.new(position.bottom_right, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_init_audit_table() =>
+    if barstate.isfirst
+        table.cell(audit_table, 0, 0, "SELECTION AUDIT", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(audit_table, 0, 0, 1, 0)
+        table.cell(audit_table, 0, 1, "Total Bull / Bear", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 2, "Eligible Bull / Bear", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 3, "State Filter (Bull)", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 4, "State Filter (Bear)", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 5, "Selected Bull ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 6, "Selected Bear ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 7, "Selected Overall ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 8, "Final Reason", text_color=color.gray, text_size=size.tiny)
+
+f_init_audit_table()
+
+if barstate.islast
+    table.cell(audit_table, 1, 1, str.tostring(g_current_audit.totalBull) + " / " + str.tostring(g_current_audit.totalBear), text_color=color.white, text_size=size.tiny)
+    table.cell(audit_table, 1, 2, str.tostring(g_current_audit.eligibleBull) + " / " + str.tostring(g_current_audit.eligibleBear), text_color=g_current_audit.eligibleBull > 0 or g_current_audit.eligibleBear > 0 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(audit_table, 1, 3, g_current_audit.stateFilterBull, text_color=str.contains(g_current_audit.stateFilterBull, "FAIL") ? color.red : color.green, text_size=size.tiny)
+    table.cell(audit_table, 1, 4, g_current_audit.stateFilterBear, text_color=str.contains(g_current_audit.stateFilterBear, "FAIL") ? color.red : color.green, text_size=size.tiny)
+    
+    table.cell(audit_table, 1, 5, g_current_audit.selectedBullId == -1 ? "N/A" : str.tostring(g_current_audit.selectedBullId), text_color=color.white, text_size=size.tiny)
+    table.cell(audit_table, 1, 6, g_current_audit.selectedBearId == -1 ? "N/A" : str.tostring(g_current_audit.selectedBearId), text_color=color.white, text_size=size.tiny)
+    table.cell(audit_table, 1, 7, g_current_audit.selectedOverallId == -1 ? "N/A" : str.tostring(g_current_audit.selectedOverallId), text_color=g_current_audit.selectedOverallId == -1 ? color.red : color.green, text_size=size.tiny)
+    table.cell(audit_table, 1, 8, g_current_audit.finalRejectionReason, text_color=color.yellow, text_size=size.tiny)
+
+
+// =========================================================================
+// MODULE 16: LIFECYCLE AUDIT
+// =========================================================================
+
+type PoolTracker
+    int poolId
+    int lastState
+    int activeStartBar
+    int reinforcedStartBar
+    int sweptStartBar
+
+type LifecycleAuditEntry
+    int poolId
+    int prevState
+    int newState
+    string transitionStr
+    string reason
+    int barIndex
+    int activeDuration
+    int reinforcedDuration
+    int sweptDuration
+
+var array<PoolTracker> g_pool_trackers = array.new<PoolTracker>()
+var array<LifecycleAuditEntry> g_lifecycle_audit_log = array.new<LifecycleAuditEntry>()
+
+if array.size(g_registry) > 0
+    for i = 0 to array.size(g_registry) - 1
+        LiquidityPool p = array.get(g_registry, i)
+        
+        PoolTracker t = na
+        if array.size(g_pool_trackers) > 0
+            for j = 0 to array.size(g_pool_trackers) - 1
+                PoolTracker tracker = array.get(g_pool_trackers, j)
+                if tracker.poolId == p.id
+                    t := tracker
+                    break
+        
+        if na(t)
+            PoolTracker newT = PoolTracker.new(p.id, p.state, bar_index, 0, 0)
+            array.push(g_pool_trackers, newT)
+        else if t.lastState != p.state
+            int prev = t.lastState
+            int curr = p.state
+            string transStr = f_state_to_string(prev) + " -> " + f_state_to_string(curr)
+            
+            int activeDur = 0
+            int reinDur = 0
+            int sweptDur = 0
+            
+            if prev == LS_ACTIVE
+                activeDur := bar_index - t.activeStartBar
+            else if prev == LS_REINFORCED
+                reinDur := bar_index - t.reinforcedStartBar
+            else if prev == LS_SWEPT
+                sweptDur := bar_index - t.sweptStartBar
+                
+            LifecycleAuditEntry entry = LifecycleAuditEntry.new(p.id, prev, curr, transStr, p.sweepReasonCode, bar_index, activeDur, reinDur, sweptDur)
+            array.push(g_lifecycle_audit_log, entry)
+            
+            if curr == LS_ACTIVE
+                t.activeStartBar := bar_index
+            else if curr == LS_REINFORCED
+                t.reinforcedStartBar := bar_index
+            else if curr == LS_SWEPT
+                t.sweptStartBar := bar_index
+                
+            t.lastState := curr 
+            
+if array.size(g_lifecycle_audit_log) > 10
+    array.shift(g_lifecycle_audit_log)
+
+var table lifecycle_audit_table = table.new(position.middle_left, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_init_lifecycle_audit_table() =>
+    if barstate.isfirst
+        table.cell(lifecycle_audit_table, 0, 0, "LIFECYCLE AUDIT", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(lifecycle_audit_table, 0, 0, 1, 0)
+        table.cell(lifecycle_audit_table, 0, 1, "Pool ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 2, "Transition", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 3, "Reason", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 4, "Transit Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 5, "Active Bars", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 6, "Reinforced Bars", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 7, "Swept Bars", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 8, "Diagnosis", text_color=color.gray, text_size=size.tiny)
+
+f_init_lifecycle_audit_table()
+
+if barstate.islast
+    LifecycleAuditEntry lastEntry = array.size(g_lifecycle_audit_log) > 0 ? array.get(g_lifecycle_audit_log, array.size(g_lifecycle_audit_log) - 1) : na
+    
+    if not na(lastEntry)
+        table.cell(lifecycle_audit_table, 1, 1, str.tostring(lastEntry.poolId), text_color=color.white, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 2, lastEntry.transitionStr, text_color=color.yellow, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 3, lastEntry.reason, text_color=color.white, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 4, str.tostring(lastEntry.barIndex), text_color=color.white, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 5, str.tostring(lastEntry.activeDuration), text_color=color.white, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 6, str.tostring(lastEntry.reinforcedDuration), text_color=color.white, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 7, str.tostring(lastEntry.sweptDuration), text_color=color.white, text_size=size.tiny)
+        
+        string diagnosis = "Normal Transition"
+        if lastEntry.newState == LS_INVALIDATED
+            if lastEntry.reason == "TIME_EXPIRY"
+                diagnosis := "Invalidated by Age"
+            else if lastEntry.reason == "POST_SWEEP_INVALIDATION"
+                diagnosis := "Invalidated Post-Sweep"
+            else
+                diagnosis := "Invalidated (Price)"
+                
+        if lastEntry.activeDuration <= 1 and lastEntry.newState == LS_INVALIDATED
+            diagnosis := "Invalidated IMMEDIATELY"
+            
+        table.cell(lifecycle_audit_table, 1, 8, diagnosis, text_color=diagnosis == "Normal Transition" ? color.green : color.red, text_size=size.tiny)
+    else
+        table.cell(lifecycle_audit_table, 1, 1, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 2, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 3, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 4, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 5, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 6, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 7, "N/A", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 1, 8, "Waiting...", text_color=color.gray, text_size=size.tiny)
+
+
+// =========================================================================
+// PHASE 9 — INSTITUTIONAL INTELLIGENCE ENGINE
+// Architecture Version: v9.0
+// Module 1 of 14: MTF Structure Adapter
+// =========================================================================
+
+// --- P9 Shared Infrastructure ---
+type P9Event
+    int    eventId
+    string sourceModule
+    string eventType
+    string payloadRef
+    int    timestamp
+    bool   integrity
+
+var array<P9Event> g_p9_event_log  = array.new<P9Event>()
+var array<int>     g_p9_next_evt_id_arr = array.new<int>(1, 1)
+
+f_p9_log(string src, string evt, string ref, bool integ) =>
+    int newId = array.get(g_p9_next_evt_id_arr, 0)
+    P9Event e = P9Event.new(newId, src, evt, ref, time, integ)
+    array.push(g_p9_event_log, e)
+    array.set(g_p9_next_evt_id_arr, 0, newId + 1)
+    e
+
+type HealthPing
+    string moduleName
+    int    registryLiveCount
+    int    registryCap
+    int    executionTimeMs
+    int    drawingObjectsUsed
+    int    drawingObjectsCap
+    int    droppedCount
+    int    securityCallsUsed
+
+var array<HealthPing> g_p9_health_pings = array.new<HealthPing>()
+
+// --- P9 Module 1 Configuration ---
+GRP_P9_MTF  = "Phase 9 — MTF Structure"
+bool show_mtf_debug = input.bool(true, "Show MTF Debug Panel (Testing Only)", group=GRP_P9_MTF)
+string P9_HTF_1 = input.timeframe("30",  "HTF 1 (e.g. 30M)", group=GRP_P9_MTF)
+string P9_HTF_2 = input.timeframe("60",  "HTF 2 (e.g. 1H)", group=GRP_P9_MTF)
+string P9_HTF_3 = input.timeframe("240", "HTF 3 (e.g. 4H)", group=GRP_P9_MTF)
+string P9_HTF_4 = input.timeframe("D",   "HTF 4 (e.g. 1D)", group=GRP_P9_MTF)
+
+string P9_MTF_CVER   = "MTFStructureContract-1.0"
+int    P9_MTF_RETAIN = 100
+int    P9_MTF_CAP    = 500
+string P9_MTF_MODULE = "MTFStructureAdapter"
+
+// --- Contract Type ---
+type MTFStructureInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    string timeframe
+    int    structuralBias
+    int    lastBOS
+    int    lastCHoCH
+    int    timestamp
+
+// --- Internal State ---
+var array<MTFStructureInstance> g_mtf_registry = array.new<MTFStructureInstance>()
+
+var array<string> g_mtf_base   = array.new<string>()
+var array<int>    g_mtf_ver    = array.new<int>()
+var array<string> g_mtf_tf     = array.new<string>()
+var array<int>    g_mtf_bias   = array.new<int>()
+var array<int>    g_mtf_bos    = array.new<int>()
+var array<int>    g_mtf_choch  = array.new<int>()
+var array<int>    g_mtf_ts     = array.new<int>()
+var array<bool>   g_mtf_integ  = array.new<bool>()
+
+// --- Helpers ---
+f_mtf_find(string baseId) =>
+    int idx = -1
+    int sz = array.size(g_mtf_base)
+    if sz > 0
+        for i = 0 to sz - 1
+            if array.get(g_mtf_base, i) == baseId
+                idx := i
+                break
+    idx
+
+f_mtf_emit(string tf, int bias, int bos, int choch, bool integ) =>
+    int  sb  = na(bias)  ? TD_NEUTRAL : bias
+    int  sbo = na(bos)   ? 0          : bos
+    int  sc  = na(choch) ? 0          : choch
+    bool si  = integ and not na(bias) and not na(bos) and not na(choch)
+
+    string baseId = "MTF-" + tf
+    int idx = f_mtf_find(baseId)
+
+    bool   changed = false
+    string prevId  = ""
+    int    newVer  = 1
+
+    if idx == -1
+        changed := true
+        array.push(g_mtf_base,  baseId)
+        array.push(g_mtf_ver,   1)
+        array.push(g_mtf_tf,    tf)
+        array.push(g_mtf_bias,  sb)
+        array.push(g_mtf_bos,   sbo)
+        array.push(g_mtf_choch, sc)
+        array.push(g_mtf_ts,    bar_index)
+        array.push(g_mtf_integ, si)
+    else
+        int  cb  = array.get(g_mtf_bias,  idx)
+        int  cbo = array.get(g_mtf_bos,   idx)
+        int  cc  = array.get(g_mtf_choch, idx)
+        bool ci  = array.get(g_mtf_integ, idx)
+
+        if cb != sb or cbo != sbo or cc != sc or ci != si
+            changed := true
+            prevId  := baseId + "-v" + str.tostring(array.get(g_mtf_ver, idx))
+            newVer  := array.get(g_mtf_ver, idx) + 1
+
+            array.set(g_mtf_ver,   idx, newVer)
+            array.set(g_mtf_bias,  idx, sb)
+            array.set(g_mtf_bos,   idx, sbo)
+            array.set(g_mtf_choch, idx, sc)
+            array.set(g_mtf_ts,    idx, bar_index)
+            array.set(g_mtf_integ, idx, si)
+
+    MTFStructureInstance inst = na
+    if changed
+        string instId = baseId + "-v" + str.tostring(newVer)
+        inst := MTFStructureInstance.new(
+             baseId, instId, prevId,
+             "MTFStructure", P9_MTF_MODULE,
+             bar_index, "Active", si,
+             P9_MTF_CVER,
+             tf, sb, sbo, sc, time)
+        array.push(g_mtf_registry, inst)
+
+        string ref = instId + (prevId == "" ? "" : "|supersedes:" + prevId)
+        f_p9_log(P9_MTF_MODULE, "MTF_EMIT", ref, si)
+
+    inst
+
+f_mtf_prune() =>
+    int sz = array.size(g_mtf_registry)
+    if sz > P9_MTF_RETAIN
+        int rm = sz - P9_MTF_RETAIN
+        for i = 0 to rm - 1
+            array.shift(g_mtf_registry)
+
+// --- HTF Detection Function ---
+f_htf_structure() =>
+    float ph = ta.pivothigh(high, SWING_LOOKBACK, SWING_LOOKBACK)
+    float pl = ta.pivotlow(low, SWING_LOOKBACK, SWING_LOOKBACK)
+
+    var int   htf_trend   = TD_NEUTRAL
+    var int   htf_bos     = 0
+    var int   htf_choch   = 0
+    var float htf_last_hi = na
+    var float htf_last_lo = na
+    var float bos_price   = na
+    var float choch_price = na
+
+    if not na(htf_last_hi) and close > htf_last_hi
+        if htf_trend == TD_SHORT
+            htf_choch := TD_LONG
+            choch_price := htf_last_hi
+        else
+            htf_bos := TD_LONG
+            bos_price := htf_last_hi
+        htf_trend := TD_LONG
+
+    if not na(htf_last_lo) and close < htf_last_lo
+        if htf_trend == TD_LONG
+            htf_choch := TD_SHORT
+            choch_price := htf_last_lo
+        else
+            htf_bos := TD_SHORT
+            bos_price := htf_last_lo
+        htf_trend := TD_SHORT
+
+    if not na(ph)
+        htf_last_hi := ph
+    if not na(pl)
+        htf_last_lo := pl
+
+    [htf_trend, htf_bos, htf_choch, bos_price, choch_price]
+
+// --- Main Compute ---
+f_compute_mtf_structure() =>
+    int t0 = timenow
+
+    [b1, bo1, c1, bp1, cp1] = request.security(syminfo.tickerid, P9_HTF_1, f_htf_structure())
+    [b2, bo2, c2, bp2, cp2] = request.security(syminfo.tickerid, P9_HTF_2, f_htf_structure())
+    [b3, bo3, c3, bp3, cp3] = request.security(syminfo.tickerid, P9_HTF_3, f_htf_structure())
+    [b4, bo4, c4, bp4, cp4] = request.security(syminfo.tickerid, P9_HTF_4, f_htf_structure())
+
+    bool i1 = not na(b1) and not na(bo1) and not na(c1)
+    bool i2 = not na(b2) and not na(bo2) and not na(c2)
+    bool i3 = not na(b3) and not na(bo3) and not na(c3)
+    bool i4 = not na(b4) and not na(bo4) and not na(c4)
+
+    MTFStructureInstance e1 = f_mtf_emit(P9_HTF_1, b1, bo1, c1, i1)
+    MTFStructureInstance e2 = f_mtf_emit(P9_HTF_2, b2, bo2, c2, i2)
+    MTFStructureInstance e3 = f_mtf_emit(P9_HTF_3, b3, bo3, c3, i3)
+    MTFStructureInstance e4 = f_mtf_emit(P9_HTF_4, b4, bo4, c4, i4)
+
+    f_mtf_prune()
+
+    array<MTFStructureInstance> emitted = array.new<MTFStructureInstance>()
+    if not na(e1)
+        array.push(emitted, e1)
+    if not na(e2)
+        array.push(emitted, e2)
+    if not na(e3)
+        array.push(emitted, e3)
+    if not na(e4)
+        array.push(emitted, e4)
+
+    if bar_index % 50 == 0
+        int elapsed = timenow - t0
+        HealthPing hp = HealthPing.new(
+             P9_MTF_MODULE,
+             array.size(g_mtf_registry),
+             P9_MTF_CAP,
+             elapsed,
+             0, 0, 0, 4)
+        array.push(g_p9_health_pings, hp)
+
+    [emitted, bp1, cp1]
+
+// --- Public Readers ---
+f_mtf_bias(string tf) =>
+    int idx = f_mtf_find("MTF-" + tf)
+    idx == -1 ? TD_NEUTRAL : array.get(g_mtf_bias, idx)
+
+f_mtf_bos(string tf) =>
+    int idx = f_mtf_find("MTF-" + tf)
+    idx == -1 ? 0 : array.get(g_mtf_bos, idx)
+
+f_mtf_choch(string tf) =>
+    int idx = f_mtf_find("MTF-" + tf)
+    idx == -1 ? 0 : array.get(g_mtf_choch, idx)
+
+f_mtf_integ(string tf) =>
+    int idx = f_mtf_find("MTF-" + tf)
+    idx == -1 ? false : array.get(g_mtf_integ, idx)
+
+f_mtf_inst(string tf) =>
+    int idx = f_mtf_find("MTF-" + tf)
+    string res = na
+    if idx != -1
+        res := "MTF-" + tf + "-v" + str.tostring(array.get(g_mtf_ver, idx))
+    res
+
+f_mtf_all_ok() =>
+    bool ok = true
+    int sz = array.size(g_mtf_base)
+    if sz > 0
+        for i = 0 to sz - 1
+            if not array.get(g_mtf_integ, i)
+                ok := false
+                break
+    ok
+
+f_mtf_timeframes() =>
+    array<string> tfs = array.new<string>()
+    array.push(tfs, P9_HTF_1)
+    array.push(tfs, P9_HTF_2)
+    array.push(tfs, P9_HTF_3)
+    array.push(tfs, P9_HTF_4)
+    tfs
+
+// --- Execution ---
+[g_mtf_emitted, debug_bp1, debug_cp1] = f_compute_mtf_structure()
+
+// --- Phase 8 Visibility ---
+if barstate.islast and array.size(g_mtf_emitted) > 0
+    for i = 0 to array.size(g_mtf_emitted) - 1
+        MTFStructureInstance e = array.get(g_mtf_emitted, i)
+        string bs = e.structuralBias == TD_LONG ? "Bullish" : e.structuralBias == TD_SHORT ? "Bearish" : "Neutral"
+        string msg = str.tostring(bar_index) + " — P9_MTF: " + e.instanceId + " | " + e.timeframe + " | Bias=" + bs + " | BOS=" + str.tostring(e.lastBOS) + " | CHoCH=" + str.tostring(e.lastCHoCH) + " | integ=" + str.tostring(e.integrity)
+        array.push(g_event_log, msg)
+
+// --- MTF Debug Panel (Testing Only) ---
+var table mtf_debug_table = table.new(position.top_left, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_init_mtf_debug() =>
+    if barstate.isfirst
+        table.cell(mtf_debug_table, 0, 0, "MTF STRUCTURE ADAPTER", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(mtf_debug_table, 0, 0, 1, 0)
+        
+        for i = 1 to 9
+            table.cell(mtf_debug_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+            table.cell(mtf_debug_table, 1, i, "", text_color=color.gray, text_size=size.tiny)
+
+if barstate.islast and show_mtf_debug
+    f_init_mtf_debug()
+    
+    string bias1_str = f_mtf_bias(P9_HTF_1) == TD_LONG ? "Bullish" : f_mtf_bias(P9_HTF_1) == TD_SHORT ? "Bearish" : "Neutral"
+    string bias2_str = f_mtf_bias(P9_HTF_2) == TD_LONG ? "Bullish" : f_mtf_bias(P9_HTF_2) == TD_SHORT ? "Bearish" : "Neutral"
+    string bias3_str = f_mtf_bias(P9_HTF_3) == TD_LONG ? "Bullish" : f_mtf_bias(P9_HTF_3) == TD_SHORT ? "Bearish" : "Neutral"
+    string bias4_str = f_mtf_bias(P9_HTF_4) == TD_LONG ? "Bullish" : f_mtf_bias(P9_HTF_4) == TD_SHORT ? "Bearish" : "Neutral"
+    
+    table.cell(mtf_debug_table, 0, 1, P9_HTF_4 + " Bias", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 1, bias4_str, text_color=f_mtf_bias(P9_HTF_4) == TD_LONG ? color.green : f_mtf_bias(P9_HTF_4) == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(mtf_debug_table, 0, 2, P9_HTF_3 + " Bias", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 2, bias3_str, text_color=f_mtf_bias(P9_HTF_3) == TD_LONG ? color.green : f_mtf_bias(P9_HTF_3) == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(mtf_debug_table, 0, 3, P9_HTF_2 + " Bias", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 3, bias2_str, text_color=f_mtf_bias(P9_HTF_2) == TD_LONG ? color.green : f_mtf_bias(P9_HTF_2) == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(mtf_debug_table, 0, 4, P9_HTF_1 + " Bias", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 4, bias1_str, text_color=f_mtf_bias(P9_HTF_1) == TD_LONG ? color.green : f_mtf_bias(P9_HTF_1) == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(mtf_debug_table, 0, 5, "Last BOS (" + P9_HTF_1 + ")", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 5, na(debug_bp1) ? "N/A" : str.tostring(debug_bp1, "#.##"), text_color=color.yellow, text_size=size.tiny)
+    
+    table.cell(mtf_debug_table, 0, 6, "Last CHoCH (" + P9_HTF_1 + ")", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 6, na(debug_cp1) ? "N/A" : str.tostring(debug_cp1, "#.##"), text_color=color.orange, text_size=size.tiny)
+    
+    table.cell(mtf_debug_table, 0, 7, "Integrity", text_color=color.white, text_size=size.tiny)
+    table.cell(mtf_debug_table, 1, 7, f_mtf_all_ok() ? "TRUE" : "FALSE", text_color=f_mtf_all_ok() ? color.green : color.red, text_size=size.tiny)
+
+
+// =========================================================================
+// PHASE 9 — MODULE 2: LIQUIDITY HIERARCHY ENGINE
+// =========================================================================
+
+GRP_P9_LIQ = "Phase 9 — Liquidity Hierarchy"
+bool show_liq_debug = input.bool(true, "Show Liquidity Hierarchy Debug Panel", group=GRP_P9_LIQ)
+int LIQ_MAJOR_SCORE = input.int(75, "Major Tier Score Threshold", group=GRP_P9_LIQ)
+int LIQ_INTER_SCORE = input.int(45, "Intermediate Tier Score Threshold", group=GRP_P9_LIQ)
+
+string P9_LIQ_CVER   = "LiquidityHierarchyContract-1.0"
+int    P9_LIQ_RETAIN = 100
+int    P9_LIQ_CAP    = 500
+string P9_LIQ_MODULE = "LiquidityHierarchyEngine"
+
+type LiquidityHierarchyInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    int    poolId
+    string tier                // "Major" | "Intermediate" | "Minor"
+    string originTimeframe     // syminfo.tickerid chart TF
+    float  price
+    bool   swept
+    float  institutionalScore  // 0-100
+
+var array<LiquidityHierarchyInstance> g_liq_registry = array.new<LiquidityHierarchyInstance>()
+
+var array<int>    g_liq_pool_id = array.new<int>()
+var array<string> g_liq_tier    = array.new<string>()
+var array<bool>   g_liq_swept   = array.new<bool>()
+var array<int>    g_liq_ver     = array.new<int>()
+var array<bool>   g_liq_integ   = array.new<bool>()
+var array<float>  g_liq_score   = array.new<float>() // added for debug visibility
+
+f_liq_find(int poolId) =>
+    int idx = -1
+    int sz = array.size(g_liq_pool_id)
+    if sz > 0
+        for i = 0 to sz - 1
+            if array.get(g_liq_pool_id, i) == poolId
+                idx := i
+                break
+    idx
+
+f_liq_emit(int poolId, string tier, float price, bool swept, bool integ, float inst_score) =>
+    string baseId = "LIQ-" + str.tostring(poolId)
+    int idx = f_liq_find(poolId)
+
+    bool   changed = false
+    string prevId  = ""
+    int    newVer  = 1
+
+    if idx == -1
+        changed := true
+        array.push(g_liq_pool_id, poolId)
+        array.push(g_liq_tier, tier)
+        array.push(g_liq_swept, swept)
+        array.push(g_liq_ver, 1)
+        array.push(g_liq_integ, integ)
+        array.push(g_liq_score, inst_score)
+    else
+        string ct = array.get(g_liq_tier, idx)
+        bool cs = array.get(g_liq_swept, idx)
+        bool ci = array.get(g_liq_integ, idx)
+
+        if ct != tier or cs != swept or ci != integ
+            changed := true
+            prevId  := baseId + "-v" + str.tostring(array.get(g_liq_ver, idx))
+            newVer  := array.get(g_liq_ver, idx) + 1
+
+            array.set(g_liq_tier, idx, tier)
+            array.set(g_liq_swept, idx, swept)
+            array.set(g_liq_ver, idx, newVer)
+            array.set(g_liq_integ, idx, integ)
+            array.set(g_liq_score, idx, inst_score)
+
+    LiquidityHierarchyInstance inst = na
+    if changed
+        string instId = baseId + "-v" + str.tostring(newVer)
+        inst := LiquidityHierarchyInstance.new(
+             baseId, instId, prevId,
+             "LiquidityHierarchy", P9_LIQ_MODULE,
+             bar_index, "Active", integ,
+             P9_LIQ_CVER,
+             poolId, tier, timeframe.period, price, swept, inst_score)
+        array.push(g_liq_registry, inst)
+
+        string ref = instId + (prevId == "" ? "" : "|supersedes:" + prevId)
+        f_p9_log(P9_LIQ_MODULE, "LIQ_EMIT", ref, integ)
+
+    inst
+
+f_liq_prune() =>
+    int sz = array.size(g_liq_registry)
+    if sz > P9_LIQ_RETAIN
+        int rm = sz - P9_LIQ_RETAIN
+        for i = 0 to rm - 1
+            array.shift(g_liq_registry)
+
+f_compute_liquidity_hierarchy() =>
+    int t0 = timenow
+    array<LiquidityHierarchyInstance> emitted = array.new<LiquidityHierarchyInstance>()
+
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            
+            if p.state == LS_ACTIVE or p.state == LS_REINFORCED or p.state == LS_SWEPT
+                int age = bar_index - p.createdAtBar
+                
+                // Score: Age (0-40), Touches (0-30), Confidence (0-30)
+                float age_score = math.min(float(age), 200.0) / 200.0 * 40.0
+                float touch_score = math.min(float(p.touchCount), 5.0) / 5.0 * 30.0
+                float conf_score = p.confidence * 30.0
+                float inst_score = age_score + touch_score + conf_score
+                
+                string tier_str = "Minor"
+                if inst_score >= LIQ_MAJOR_SCORE
+                    tier_str := "Major"
+                else if inst_score >= LIQ_INTER_SCORE
+                    tier_str := "Intermediate"
+                
+                bool swept = p.isSwept
+                bool integ = f_mtf_all_ok()
+                
+                LiquidityHierarchyInstance e = f_liq_emit(p.id, tier_str, p.priceLevel, swept, integ, inst_score)
+                if not na(e)
+                    array.push(emitted, e)
+
+    f_liq_prune()
+
+    if bar_index % 50 == 0
+        int elapsed = timenow - t0
+        HealthPing hp = HealthPing.new(
+             P9_LIQ_MODULE,
+             array.size(g_liq_registry),
+             P9_LIQ_CAP,
+             elapsed,
+             0, 0, 0, 0)
+        array.push(g_p9_health_pings, hp)
+
+    emitted
+
+// Public Readers
+f_liq_tier(int poolId) =>
+    int idx = f_liq_find(poolId)
+    idx == -1 ? "Minor" : array.get(g_liq_tier, idx)
+
+f_liq_swept(int poolId) =>
+    int idx = f_liq_find(poolId)
+    idx == -1 ? false : array.get(g_liq_swept, idx)
+
+f_liq_integ(int poolId) =>
+    int idx = f_liq_find(poolId)
+    idx == -1 ? false : array.get(g_liq_integ, idx)
+
+// Execution
+array<LiquidityHierarchyInstance> g_liq_emitted = f_compute_liquidity_hierarchy()
+
+// Visibility
+if barstate.islast and array.size(g_liq_emitted) > 0
+    for i = 0 to array.size(g_liq_emitted) - 1
+        LiquidityHierarchyInstance e = array.get(g_liq_emitted, i)
+        string msg = str.tostring(bar_index) + " — P9_LIQ: " + e.instanceId + " | Pool: " + str.tostring(e.poolId) + " | Tier: " + e.tier + " | Score: " + str.tostring(e.institutionalScore, "#.#") + " | Swept: " + str.tostring(e.swept)
+        array.push(g_event_log, msg)
+
+// --- Liquidity Hierarchy Debug Panel (Testing Only) ---
+var table liq_debug_table = table.new(position.middle_right, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_init_liq_debug() =>
+    if barstate.isfirst
+        table.cell(liq_debug_table, 0, 0, "LIQ HIERARCHY DEBUG", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(liq_debug_table, 0, 0, 1, 0)
+        
+        for i = 1 to 9
+            table.cell(liq_debug_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+            table.cell(liq_debug_table, 1, i, "", text_color=color.gray, text_size=size.tiny)
+
+if barstate.islast and show_liq_debug
+    f_init_liq_debug()
+    
+    int major_cnt = 0
+    int inter_cnt = 0
+    int minor_cnt = 0
+    int sz = array.size(g_liq_tier)
+    if sz > 0
+        for i = 0 to sz - 1
+            string t = array.get(g_liq_tier, i)
+            if t == "Major"
+                major_cnt += 1
+            else if t == "Intermediate"
+                inter_cnt += 1
+            else
+                minor_cnt += 1
+                
+    table.cell(liq_debug_table, 0, 1, "Major Pools", text_color=color.white, text_size=size.tiny)
+    table.cell(liq_debug_table, 1, 1, str.tostring(major_cnt), text_color=color.green, text_size=size.tiny)
+    
+    table.cell(liq_debug_table, 0, 2, "Intermediate Pools", text_color=color.white, text_size=size.tiny)
+    table.cell(liq_debug_table, 1, 2, str.tostring(inter_cnt), text_color=color.yellow, text_size=size.tiny)
+    
+    table.cell(liq_debug_table, 0, 3, "Minor Pools", text_color=color.white, text_size=size.tiny)
+    table.cell(liq_debug_table, 1, 3, str.tostring(minor_cnt), text_color=color.gray, text_size=size.tiny)
+    
+    // Example 1
+    int ex1_id = sz > 0 ? array.get(g_liq_pool_id, 0) : -1
+    string ex1_tier = sz > 0 ? array.get(g_liq_tier, 0) : "N/A"
+    float ex1_score = sz > 0 ? array.get(g_liq_score, 0) : 0.0
+    string ex1_str = ex1_id == -1 ? "N/A" : "ID " + str.tostring(ex1_id) + " (" + ex1_tier + " - " + str.tostring(ex1_score, "#.#") + ")"
+    
+    table.cell(liq_debug_table, 0, 4, "Ex Pool 1", text_color=color.white, text_size=size.tiny)
+    table.cell(liq_debug_table, 1, 4, ex1_str, text_color=color.white, text_size=size.tiny)
+    
+    // Example 2
+    int ex2_id = sz > 1 ? array.get(g_liq_pool_id, 1) : -1
+    string ex2_tier = sz > 1 ? array.get(g_liq_tier, 1) : "N/A"
+    float ex2_score = sz > 1 ? array.get(g_liq_score, 1) : 0.0
+    string ex2_str = ex2_id == -1 ? "N/A" : "ID " + str.tostring(ex2_id) + " (" + ex2_tier + " - " + str.tostring(ex2_score, "#.#") + ")"
+    
+    table.cell(liq_debug_table, 0, 5, "Ex Pool 2", text_color=color.white, text_size=size.tiny)
+    table.cell(liq_debug_table, 1, 5, ex2_str, text_color=color.white, text_size=size.tiny)
+    
+    table.cell(liq_debug_table, 0, 6, "Integrity", text_color=color.white, text_size=size.tiny)
+    table.cell(liq_debug_table, 1, 6, f_mtf_all_ok() ? "TRUE" : "FALSE", text_color=f_mtf_all_ok() ? color.green : color.red, text_size=size.tiny)
+
+
+// =========================================================================
+// PHASE 9 — MODULE 3: PREMIUM/DISCOUNT ARRAY ENGINE
+// =========================================================================
+
+GRP_P9_PD  = "Phase 9 — PD Array"
+bool show_pd_debug = input.bool(true, "Show PD Array Debug Panel", group=GRP_P9_PD)
+
+string P9_PD_CVER   = "PDArrayContract-1.0"
+string P9_PD_MODULE = "PDArrayEngine"
+
+type PDArrayInstance
+    // --- Base Schema (Addendum v1.1 §1.2) ---
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    // --- PDArrayContract specific ---
+    float  rangeHigh
+    float  rangeLow
+    float  rangeSize
+    float  equilibriumPrice
+    float  currentPrice
+    float  positionPercent
+    string currentZone
+    int    timestamp
+
+var array<PDArrayInstance> g_pd_registry = array.new<PDArrayInstance>()
+
+// CE10088 FIX: Use single-element arrays to allow mutation inside functions
+var array<int>    g_pd_ver    = array.new<int>(1, 0)
+var array<float>  g_pd_high   = array.new<float>(1, na)
+var array<float>  g_pd_low    = array.new<float>(1, na)
+var array<string> g_pd_zone   = array.new<string>(1, "N/A")
+var array<bool>   g_pd_integ  = array.new<bool>(1, false)
+
+f_pd_emit(float r_high, float r_low, float r_size, float eq, float cur_price, float pos_pct, string zone, bool integ) =>
+    bool changed = false
+    string prevId = ""
+    int newVer = 1
+    
+    int currentVer = array.get(g_pd_ver, 0)
+    
+    if currentVer == 0
+        changed := true
+    else if array.get(g_pd_high, 0) != r_high or array.get(g_pd_low, 0) != r_low or array.get(g_pd_zone, 0) != zone or array.get(g_pd_integ, 0) != integ
+        changed := true
+        prevId  := "PD-ARRAY-v" + str.tostring(currentVer)
+        newVer  := currentVer + 1
+        
+    PDArrayInstance inst = na
+    if changed
+        array.set(g_pd_ver, 0, newVer)
+        array.set(g_pd_high, 0, r_high)
+        array.set(g_pd_low, 0, r_low)
+        array.set(g_pd_zone, 0, zone)
+        array.set(g_pd_integ, 0, integ)
+        
+        string instId = "PD-ARRAY-v" + str.tostring(newVer)
+        inst := PDArrayInstance.new(
+             "PD-ARRAY", instId, prevId,
+             "PDArray", P9_PD_MODULE,
+             bar_index, "Active", integ,
+             P9_PD_CVER,
+             r_high, r_low, r_size, eq, cur_price, pos_pct, zone, time)
+        array.push(g_pd_registry, inst)
+        
+        f_p9_log(P9_PD_MODULE, "PD_EMIT", instId, integ)
+        
+    inst
+
+f_compute_pd_array() =>
+    int t0 = timenow
+    
+    float r_high = g_last_swing_high_price
+    float r_low = g_last_swing_low_price
+    bool integ = not na(r_high) and not na(r_low) and f_mtf_all_ok()
+    
+    float r_size = na
+    float eq = na
+    float pos_pct = 50.0
+    string zone = "Equilibrium"
+    float cur_price = close
+    
+    if integ
+        r_size := r_high - r_low
+        eq := r_low + (r_size * 0.5)
+        pos_pct := r_size == 0 ? 50.0 : ((cur_price - r_low) / r_size) * 100.0
+        zone := pos_pct > 50.0 ? "Premium" : pos_pct < 50.0 ? "Discount" : "Equilibrium"
+        
+    PDArrayInstance e = f_pd_emit(r_high, r_low, r_size, eq, cur_price, pos_pct, zone, integ)
+    
+    if bar_index % 50 == 0
+        int elapsed = timenow - t0
+        HealthPing hp = HealthPing.new(
+             P9_PD_MODULE,
+             array.size(g_pd_registry),
+             500,
+             elapsed,
+             0, 0, 0, 0)
+        array.push(g_p9_health_pings, hp)
+        
+    // Return live values for debug panel
+    [e, r_high, r_low, eq, cur_price, pos_pct, zone, integ]
+
+// Execution
+[g_pd_emitted, dbg_r_high, dbg_r_low, dbg_eq, dbg_cur_price, dbg_pos_pct, dbg_zone, dbg_integ] = f_compute_pd_array()
+
+// Phase 8 Visibility
+if barstate.islast and not na(g_pd_emitted)
+    string msg = str.tostring(bar_index) + " — P9_PD: " + g_pd_emitted.instanceId + " | Zone: " + g_pd_emitted.currentZone + " | Range: " + str.tostring(g_pd_emitted.rangeLow, "#.##") + " - " + str.tostring(g_pd_emitted.rangeHigh, "#.##")
+    array.push(g_event_log, msg)
+
+// --- PD Array Debug Panel (Testing Only) ---
+var table pd_debug_table = table.new(position.top_center, 2, 9, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+f_init_pd_debug() =>
+    if barstate.isfirst
+        table.cell(pd_debug_table, 0, 0, "PD ARRAY DEBUG", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(pd_debug_table, 0, 0, 1, 0)
+        
+        for i = 1 to 8
+            table.cell(pd_debug_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+            table.cell(pd_debug_table, 1, i, "", text_color=color.gray, text_size=size.tiny)
+
+if barstate.islast and show_pd_debug
+    f_init_pd_debug()
+    
+    table.cell(pd_debug_table, 0, 1, "Range High", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 1, na(dbg_r_high) ? "N/A" : str.tostring(dbg_r_high, "#.##"), text_color=color.red, text_size=size.tiny)
+    
+    table.cell(pd_debug_table, 0, 2, "Range Low", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 2, na(dbg_r_low) ? "N/A" : str.tostring(dbg_r_low, "#.##"), text_color=color.green, text_size=size.tiny)
+    
+    table.cell(pd_debug_table, 0, 3, "Equilibrium", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 3, na(dbg_eq) ? "N/A" : str.tostring(dbg_eq, "#.##"), text_color=color.gray, text_size=size.tiny)
+    
+    table.cell(pd_debug_table, 0, 4, "Current Price", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 4, str.tostring(dbg_cur_price, "#.##"), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(pd_debug_table, 0, 5, "Position %", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 5, str.tostring(dbg_pos_pct, "#.##"), text_color=color.yellow, text_size=size.tiny)
+    
+    table.cell(pd_debug_table, 0, 6, "Current Zone", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 6, dbg_zone, text_color=dbg_zone == "Premium" ? color.red : dbg_zone == "Discount" ? color.green : color.gray, text_size=size.tiny)
+    
+    table.cell(pd_debug_table, 0, 7, "Integrity", text_color=color.white, text_size=size.tiny)
+    table.cell(pd_debug_table, 1, 7, dbg_integ ? "TRUE" : "FALSE", text_color=dbg_integ ? color.green : color.red, text_size=size.tiny)
