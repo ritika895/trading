@@ -1,0 +1,23 @@
+Phase 8.0.1 Maintenance Release & Phase 9 — Module 1: MTF Structure Adapter
+Step 1 — Phase 8.0.1 Freeze & Documentation
+Phase 8.0.1 is now frozen. I have added the explicit inline documentation to the Session Engine explaining the overlap behavior (UI displays "London/NY Overlap" while the internal engine uses ST_NEW_YORK for execution precedence).
+
+Step 2 — Phase 9, Module 1 Explanation
+MTF Structure Adapter is the first Phase 9 module and the sole owner of MTFStructureContract. Its responsibility is to read structural state (bias, BOS, CHoCH) across a configured set of higher timeframes and normalize those readings into immutable, versioned contract instances that downstream modules consume through a current-pointer index.
+
+Architectural Interpretation
+The Architecture Specification states the module "re-invokes the existing Phase 8 Structure Engine per timeframe." Phase 8's Structure Engine is inline code—permanently frozen—so it cannot be refactored into a callable function. The faithful Pine Script interpretation is: define a self-contained function f_htf_structure() that mirrors Phase 8 Module 6's exact detection definitions (pivot detection, BOS, CHoCH), and evaluate that function at each HTF via request.security(). No Phase 8 code is touched.
+
+Key Design Decisions
+Function-based request.security(): Reading Phase 8 var variables via request.security() would re-execute the entire Phase 8 pipeline at each HTF. A self-contained function evaluates only the structure logic at the HTF.
+Immutability (Addendum v1.1): A new instance is created only when bias/BOS/CHoCH/integrity changes. Identical readings produce no emission. State changes create a new instance with a supersedes pointer.
+Current-pointer index: Parallel primitive arrays map baseId → latest instance metadata, allowing downstream modules to query current state in O(1) time.
+Step 3 — Dependencies
+Dependency
+Type
+Status
+Phase 8: Structure Engine definitions	Frozen, read-only	Mirrored exactly in f_htf_structure()
+Phase 8: SWING_LOOKBACK, TD_* constants	Frozen, read-only	Reused for consistency
+Pine built-in: request.security()	Runtime	3 calls (one per HTF) — only this module calls it
+
+Downstream consumers: Liquidity Hierarchy Engine, PD Array Engine, MSS Engine, Confidence Scoring Engine
