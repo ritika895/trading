@@ -1,0 +1,66 @@
+# Gold ICT Pro — Phase 9 Pine Script Optimization Strategy
+
+**Purpose:** Adapt the Phase 9 architecture to Pine Script v6's concrete runtime and object limits, without altering the architecture itself. Every rule here is an *implementation constraint*, not a design change.
+
+---
+
+## 1. Known Pine Script v6 Constraints Relevant to Phase 9
+
+| Constraint | Approx. limit | Affects |
+|---|---|---|
+| Drawing objects per type (line, box, label) | ~500 (configurable up via `max_lines_count`/`max_boxes_count`/`max_labels_count`, hard ceiling still applies) | FVG, Order Block, Breaker Block, POI Aggregator (any visual rendering) |
+| Table cells | Limited grid, expensive to redraw every bar | Statistics Engine dashboard, Confidence/Rating display |
+| `request.security()` calls | Bounded number of unique calls per script | MTF Structure Adapter |
+| Array size | No hard cap but large arrays degrade performance and can hit execution-time limits | All registry-holding modules (FVG, OB, Breaker, POI, Liquidity Hierarchy) |
+| Per-bar execution time budget | Script-wide budget shared across ALL modules combined | Every module — this is the aggregate constraint everything else serves |
+| `var`/`varip` persistent state | Manual management required; no garbage collection | Registries, mitigation-state tracking |
+| Historical reference depth | `[]` indexing has practical bar-back limits | Structure/PD Array range lookups |
+
+---
+
+## 2. Execution Time Budget Strategy
+
+The single script (indicator/strategy) has one shared per-bar execution budget across all ~13+ Phase 9 modules plus all of Phase 8. Strategy:
+
+1. **Enforce the frequency tiers from the Architecture Spec strictly** (every-bar / confirmed-bar / event-triggered / periodic) — this is the primary lever. Moving Confidence Scoring and Trade Rating to event-triggered-only (only when a Recommendation exists) removes them from the per-bar cost entirely on the vast majority of bars.
+2. **Bound every registry's live array size.** "Append-only" at the architecture level does not mean "infinite array in memory." Each registry (FVG, OB, Breaker) should retain only:
+   - All *Active/unmitigated* entries (no cap needed — these are inherently few), plus
+   - A rolling window of the most recent N *Mitigated/Invalidated* entries (suggested N = 50–100), purely for confluence lookback.
+   - Anything older is dropped from the live array. The permanent historical record lives in the lightweight Institutional Event Log (IDs + metadata only, no drawing objects), which is cheap to keep long-lived.
+3. **Avoid O(n²) patterns** — this was already identified and fixed once in the Liquidity Engine (`databaseHasDuplicateIds()`). The same audit must be applied to every new Phase 9 registry before Gate 3 (Runtime Test): any duplicate-check, mitigation-check, or confluence-check that loops the full registry against itself for every new entry must use an indexed/keyed lookup (map-like structure via parallel arrays keyed by ID) instead of nested loops.
+
+---
+
+## 3. Drawing Object Management
+
+- **Object pooling, not object creation-per-event.** Maintain a fixed-size pool of reusable `box`/`line`/`label` objects per visual type (e.g., 100 boxes reserved for Order Blocks). When an OB mitigates and its drawing is no longer needed, the object is repositioned/reused for the next new OB rather than deleting and creating a new one. This keeps the script well under the ~500-per-type ceiling regardless of how many OBs are detected over the chart's full history.
+- **Only draw Active-state POIs.** Mitigated/Invalidated entries beyond the rolling window (Section 2) should have their drawings explicitly deleted (`box.delete()` etc.) to free pool slots, not merely hidden.
+- **Statistics/Dashboard tables** should redraw only on the frequency tier assigned to Statistics Engine (session/trade-close), never per bar — table redraws are comparatively expensive.
+
+---
+
+## 4. MTF Structure Adapter — `request.security()` Consolidation
+
+- One `request.security()` call per configured higher timeframe, full stop — never one call per consuming module. The MTF Structure Adapter is the **only** module permitted to invoke `request.security()`, and its output (`MTFStructureContract`) is what every other module reads.
+- If the architecture's configured HTF set grows (e.g., adding a 4th or 5th timeframe later), evaluate against Pine's per-script security-call ceiling before adding — this is a Tier 2-style parameter (number/choice of timeframes) but the *mechanism* (single consolidated call point) is Tier 1 and frozen.
+- Repainting safety: continue using the Phase 8 convention (`barstate.islastconfirmedhistory`) for any HTF value the MTF Adapter reads, exactly as already fixed once in the Structure Engine.
+
+---
+
+## 5. Registry Storage Pattern
+
+Given Pine has no native objects-with-methods at runtime scale, each registry should be implemented as **parallel arrays keyed by a shared ID array** (the standard Pine idiom), e.g. for Order Blocks:
+```
+ob_ids[], ob_direction[], ob_high[], ob_low[], ob_originBarTime[], ob_mitigationState[], ob_sourceSweepId[]
+```
+rather than a single array of composite objects (Pine v6 user-defined types are usable but add overhead at scale; parallel primitive arrays remain the fastest pattern for hot-path, every-bar-scanned registries like FVG and PD Array). Reserve user-defined types (UDTs) for lower-frequency, lower-volume contracts (e.g. `StatisticsContract`, `InstitutionalAuditContract`) where the readability benefit outweighs the performance cost.
+
+---
+
+## 6. Summary of Non-Negotiable Pine-Specific Rules
+
+1. No module other than MTF Structure Adapter calls `request.security()`.
+2. Every registry has a bounded live-array retention window; unbounded growth is not permitted regardless of the architectural "append-only" language.
+3. Every duplicate/mitigation/confluence check across a registry must be O(n) or better — no nested full-registry loops.
+4. All drawing objects are pooled and reused, never created without bound.
+5. Frequency tiering (Architecture Spec, Section 3 / this document Section 2) is enforced in code, not left to natural call order.
