@@ -1,0 +1,128 @@
+# Gold ICT Pro — Phase 9 Implementation Charter
+
+**Purpose:** Precise build roadmap for GLM. This charter governs *how* Phase 9 gets built, in what order, with what tests, and when a module is allowed to freeze. It does not redefine architecture (see the Phase 9 Architecture Specification) — it operationalizes it.
+
+---
+
+## 1. Build Order (mirrors runtime dependency order)
+
+1. MTF Structure Adapter
+2. Liquidity Hierarchy Engine
+3. Premium/Discount Array Engine
+4. Fair Value Gap Engine
+5. Order Block Engine
+6. Market Structure Shift Engine
+7. Breaker Block Engine
+8. Institutional POI Aggregator
+9. Confidence Scoring Engine
+10. Trade Rating Engine
+11. Institutional Event Log
+12. Institutional Audit
+13. Statistics Engine
+
+No module may begin implementation before all of its upstream dependencies have passed Gate 5 (Audit) below. This is a hard sequencing rule, not a suggestion.
+
+---
+
+## 2. Registry Entry Base Schema (applies to every registry-type contract)
+
+Every registry contract (FVG, Order Block, Breaker, POI, Statistics, and the Phase 8 registries where compatible) must expose this common shape in addition to its own fields:
+
+```
+{
+  id: string,
+  type: string,
+  sourceModule: string,
+  createdAt: timestamp,
+  status: string,          // e.g. Active | Mitigated | Invalidated | Superseded
+  integrity: bool,
+  contractVersion: string
+}
+```
+
+This is required before Gate 1 for any registry-producing module.
+
+---
+
+## 3. Definition of Done — Five-Gate Checklist (per module)
+
+Every module, without exception, must pass all five gates in order before being marked complete and eligible for Tier 1 freeze consideration.
+
+### Gate 1 — Test Contract (unit, isolated)
+- [ ] Module compiles/runs against a **mocked** upstream contract (hand-authored fixture data, not live chart data).
+- [ ] Output matches the module's declared contract schema exactly, including the Registry Entry Base Schema fields.
+- [ ] `integrity = false` input correctly produces `integrity = false` output and zero side effects (no partial writes, no drawings).
+
+### Gate 2 — Integration Test (real upstream, historical data)
+- [ ] Module runs against the **actual** output of its real upstream module(s), not mocks.
+- [ ] Cross-checked manually against at least 10 known ICT-textbook chart examples (e.g. hand-verified FVGs, OBs on a known chart segment) to confirm detection correctness.
+- [ ] No orphaned references (e.g. a Breaker Block referencing a non-existent Order Block ID).
+
+### Gate 3 — Runtime Test (live/replay, non-repaint verification)
+- [ ] Run on TradingView bar replay across at least 3 distinct market sessions (Asia/London/NY) on Gold.
+- [ ] Confirmed using `barstate.islastconfirmedhistory` (per Phase 8 convention) that no value emitted on a historical bar ever changes on later bars — non-repainting verified.
+- [ ] Execution time profiled; module does not push total script execution time toward TradingView's per-bar limit (see Pine Script Optimization Strategy, Section 2).
+
+### Gate 4 — Audit
+- [ ] Institutional Audit module reports `status: OK` for this module's contract with zero mismatches over the full test range.
+- [ ] Any `Mismatch` findings resolved and re-audited before proceeding.
+
+### Gate 5 — Production / Freeze Eligibility
+- [ ] Module owner (Ritika) signs off.
+- [ ] Module's Tier is confirmed per the Freeze Governance table (Architecture Spec, Section 8).
+- [ ] If Tier 1: module is frozen — no further logic changes permitted, only patch-level bugfixes that do not alter contract shape (see Versioning Policy).
+- [ ] If Tier 2/3: module is marked "stable, parameters reopenable" and the specific reopenable parameters are explicitly listed in module documentation.
+
+**No module skips a gate.** A module that fails Gate 3 must return to Gate 1 with the defect fixed — do not patch at Gate 3 and continue forward without re-running Gates 1–2.
+
+---
+
+## 4. Versioning Policy (operational detail)
+
+| Axis | Format | Bumped when |
+|---|---|---|
+| Architecture Version | `vMAJOR.MINOR` (e.g. `v9.0`) | A new phase is designed or existing module boundaries are restructured |
+| Engine Version | `vMAJOR.MINOR.PATCH` (e.g. `v9.1.0`) | Any module within the phase changes build state (new module completed, bugfix shipped) |
+| Module Version | `vMAJOR.MINOR` per module (e.g. `FVG Engine v1.2`) | Internal logic changes; MAJOR bump only if contract shape changes |
+| Contract Version | Stamped field inside every emitted contract instance (e.g. `contractVersion: "FVGContract-1.0"`) | Only when the contract's field set or field semantics change |
+
+Rule: **a contract version bump forces re-validation (Gates 1–4) of every downstream consumer of that contract**, even if those consumers' own logic didn't change.
+
+---
+
+## 5. Dependency Table (for build tracking)
+
+| # | Module | Depends on |
+|---|---|---|
+| 1 | MTF Structure Adapter | Phase 8: Structure Engine |
+| 2 | Liquidity Hierarchy Engine | Phase 8: Selection Engine, Structure Engine; Phase 9: MTF Structure Adapter |
+| 3 | PD Array Engine | Phase 8: Structure Engine; Phase 9: MTF Structure Adapter |
+| 4 | FVG Engine | Phase 8: Context Snapshot |
+| 5 | Order Block Engine | Phase 8: Structure Engine, Sweep Validation, Context Snapshot |
+| 6 | MSS Engine | Phase 8: Structure Engine; Phase 9: MTF Structure Adapter |
+| 7 | Breaker Block Engine | Phase 9: Order Block Engine, MSS Engine |
+| 8 | POI Aggregator | Phase 9: FVG, Order Block, Breaker, PD Array, Liquidity Hierarchy |
+| 9 | Confidence Scoring Engine | Phase 8: Arbitration Engine, Recommendation Engine, Validation Summary; Phase 9: POI Aggregator, MSS Engine |
+| 10 | Trade Rating Engine | Phase 9: Confidence Scoring Engine; Phase 8: Recommendation Engine, Arbitration Engine |
+| 11 | Institutional Event Log | All Phase 9 modules (event emission) |
+| 12 | Institutional Audit | Phase 9: POI Aggregator, Confidence Scoring, Trade Rating, Institutional Event Log |
+| 13 | Statistics Engine | Phase 9: Trade Rating, Institutional Event Log |
+
+---
+
+## 6. Freeze/Change Authority
+
+| Tier | Who can change it | Process |
+|---|---|---|
+| Tier 1 | No one, post-freeze | Requires a formal new phase/version to reopen, not a patch |
+| Tier 2 | Module owner | Documented parameter change + re-run Gates 1–4 for that module only |
+| Tier 3 | Module owner | Free iteration, no re-audit of upstream required |
+
+---
+
+## 7. Exit Criteria for Phase 9 (when GLM can consider Phase 9 "done")
+
+- [ ] All 13 modules have passed all 5 gates.
+- [ ] Institutional Audit shows zero unresolved mismatches across the full historical test range.
+- [ ] Statistics Engine produces at least one full session-boundary report with no missing/null dimensions.
+- [ ] Phase 10 Compatibility Review (separate document) has no unresolved blocking gaps.
