@@ -1,0 +1,194 @@
+# Gold ICT Pro — Phase 9 Architecture Addendum v1.1
+
+**Amends:** Phase 9 Architecture Specification, Phase 9 Implementation Charter, Pine Script Optimization Strategy, Phase 10 Compatibility Review.
+**Type:** Refinement — no module boundaries change, no new trading logic added.
+
+---
+
+## 1. Immutability Model (replaces "append-only" ambiguity)
+
+### 1.1 Rule
+
+Every contract instance is **immutable from the moment it is emitted.** No module may ever mutate a field on an already-emitted instance — including status/mitigation fields. A state change is always a **new instance**, never an edit.
+
+```
+OrderBlock (baseId: OB-21, instanceId: OB-21-v1, status: Active)
+        │
+        │  price mitigates
+        ▼
+OrderBlock (baseId: OB-21, instanceId: OB-21-v2, status: Mitigated, supersedes: OB-21-v1)
+```
+
+This applies to every contract that carries a `status` or `mitigationState` field: `FVGContract`, `OrderBlockContract`, `BreakerBlockContract`, `LiquidityHierarchyContract` (`swept` transition), `MSSContract`, `POIRegistryContract`.
+
+### 1.2 Revised Registry Entry Base Schema
+
+Supersedes Implementation Charter Section 2:
+
+```
+{
+  baseId: string,        // stable identity across the entity's lifetime
+  instanceId: string,    // unique per emission (e.g. baseId + "-v" + n)
+  supersedes: string | null,   // instanceId of the prior version, null if first emission
+  type: string,
+  sourceModule: string,
+  createdAt: timestamp,
+  status: string,
+  integrity: bool,
+  contractVersion: string
+}
+```
+
+### 1.3 "Current state" lookup
+
+Because history is never edited, any module or dashboard that needs "the current state of OB-21" must resolve it via a **current-pointer index**: a lightweight map of `baseId → latest instanceId`, maintained by the *owning* module only (e.g. Order Block Engine maintains the OB index, Breaker Block Engine maintains its own). This index is not itself a new contract — it is an internal lookup structure private to the owning module, rebuilt from the instance stream. Downstream consumers always read through this index rather than scanning full history for "the latest version."
+
+### 1.4 Retention interaction (ties to Pine Script Optimization Strategy Section 2)
+
+The bounded live-array retention window still applies, but now bounds **instance count**, not entity count. Superseded instances beyond the retention window are pruned from the live array; the full instance chain remains recoverable from the Institutional Event Log (which logs every emission, including supersessions), so nothing is lost — it's just not held in hot memory.
+
+### 1.5 Impact on existing modules
+
+No module's detection logic changes. This only changes *how a status change is expressed* — as a new emission rather than a field edit. Order Block Engine, FVG Engine, Breaker Block Engine, MSS Engine, and Liquidity Hierarchy Engine each need their internal state-transition code adjusted before Gate 1, since none has passed Gate 5 yet — zero cost to apply now.
+
+---
+
+## 2. New Module 14: Engine Health Monitor
+
+### 2.1 Responsibility
+
+Report on the **engine's own operating health** — resource usage, not trading correctness. Entirely separate from Institutional Audit, which checks contract *correctness*; Engine Health Monitor checks contract *volume and cost*.
+
+### 2.2 Why it exists
+
+At 13 modules the cost is manageable; by Phase 11–12 with more modules and longer histories, resource exhaustion (drawing object caps, execution time budget, security call ceiling) becomes the more likely failure mode — and it fails silently in Pine unless something is watching for it. This module exists purely to make that visible before it becomes an outage.
+
+### 2.3 Mechanism
+
+Every module may optionally emit a lightweight `HealthPing` each time it runs:
+```
+{ moduleName, registryLiveCount, registryCap, executionTimeMs,
+  drawingObjectsUsed, drawingObjectsCap, droppedCount, securityCallsUsed }
+```
+This is not a new architectural dependency — it's a passive telemetry emission, not a contract other trading modules read. Engine Health Monitor is the only consumer of `HealthPing` events.
+
+### 2.4 Owned contract
+
+`EngineHealthContract`
+```
+{ reportId, generatedAt,
+  perModule: [{ moduleName, registryUsagePct, executionTimeMs,
+                drawingUsagePct, droppedCount, overflowRisk: bool }],
+  aggregate: { totalExecutionTimeMs, totalSecurityCalls, totalDrawingObjectsUsed },
+  integrity }
+```
+
+### 2.5 Execution frequency
+
+Periodic — same class as Institutional Audit and Statistics Engine (e.g. every N bars for resource snapshots; execution-time totals can be sampled every bar internally but only *reported* on the periodic cadence, to avoid the monitor itself becoming a cost problem).
+
+### 2.6 Tier
+
+**Tier 3 (freely evolving).** Purely observational, no trading impact, safe to extend with new metrics at any time without re-auditing any Tier 1 module.
+
+### 2.7 Consumers
+
+None — terminal, dashboard/reporting only, same class as Institutional Audit and Statistics Engine.
+
+### 2.8 Updated execution order (supersedes Architecture Spec Section 5 / Charter Section 1)
+
+```
+1. MTF Structure Adapter
+2. Liquidity Hierarchy Engine
+3. Premium/Discount Array Engine
+4. Fair Value Gap Engine
+5. Order Block Engine
+6. Market Structure Shift Engine
+7. Breaker Block Engine
+8. Institutional POI Aggregator
+9. Confidence Scoring Engine
+10. Trade Rating Engine
+11. Institutional Event Log
+12. Institutional Audit           (periodic)
+13. Statistics Engine             (session/trade-close)
+14. Engine Health Monitor         (periodic)   ← NEW
+```
+
+---
+
+## 3. Confidence Explainability
+
+### 3.1 Rule
+
+`ConfidenceScoreContract`'s existing `scoreBreakdown{}` field is upgraded from a loose debug field to a **formalized, structured factor list** — this is the explainability layer, and it is a Tier 1 mechanism (the *existence and shape* of factor reporting is frozen) even though the individual factor weights remain Tier 2 (reopenable, same as today's scoring weights).
+
+### 3.2 Revised `ConfidenceScoreContract`
+
+```
+{
+  recommendationId, poiId,
+  score: number (0-100),
+  factors: [
+    { code: string, label: string, contribution: signed number, category: string }
+  ],
+  integrity, contractVersion
+}
+```
+
+Example instance:
+```
+score: 91
+factors: [
+  { code: "CONF-001", label: "HTF Alignment",        contribution: +20, category: "structure" },
+  { code: "CONF-002", label: "External Liquidity",   contribution: +15, category: "liquidity" },
+  { code: "CONF-003", label: "Order Block Present",  contribution: +10, category: "poi" },
+  { code: "CONF-004", label: "FVG Present",          contribution: +15, category: "poi" },
+  { code: "CONF-005", label: "Discount Zone",        contribution: +12, category: "pd_array" },
+  { code: "CONF-006", label: "Weak MSS",             contribution: -8,  category: "structure" },
+  { code: "CONF-007", label: "Session Timing",       contribution: -3,  category: "session" }
+]
+```
+
+### 3.3 Standard Factor Code Table (initial set — Tier 2, extensible)
+
+| Code | Label | Category |
+|---|---|---|
+| CONF-001 | HTF Alignment | structure |
+| CONF-002 | External Liquidity | liquidity |
+| CONF-003 | Order Block Present | poi |
+| CONF-004 | FVG Present | poi |
+| CONF-005 | Discount/Premium Zone Alignment | pd_array |
+| CONF-006 | MSS Strength/Weakness | structure |
+| CONF-007 | Session Timing | session |
+| CONF-008 | Breaker Block Present | poi |
+| CONF-009 | Confluence Count (POI stacking) | poi |
+| CONF-010 | Liquidity Tier (Major/Intermediate/Minor) | liquidity |
+
+New codes may be added freely (Tier 2); the `factors[]` array shape itself may not be removed or restructured without a contract version bump (Tier 1 mechanism).
+
+### 3.4 Trade Rating Engine — pass-through, not recomputation
+
+`TradeRatingContract` does not recompute or duplicate the factor breakdown — it references it:
+```
+{ recommendationId, grade, score, confidenceScoreInstanceId, integrity, contractVersion }
+```
+`confidenceScoreInstanceId` lets any downstream consumer (dashboard, or a future LLM-based explanation layer) resolve the full factor breakdown from the Confidence Score instance without duplicating data — consistent with the single-source-of-truth rule.
+
+### 3.5 Forward value
+
+This is explicitly designed so that a future AI layer (e.g. an LLM call) can take `factors[]` as structured input and generate natural-language rationale ("this setup scored 91 primarily due to HTF alignment and a stacked FVG+OB confluence in a discount zone, offset by a weak MSS") without needing access to raw chart data — the factor list is a complete, self-contained explanation surface.
+
+---
+
+## 4. Summary of Changes Requiring Action Before Gate 5
+
+| Module | Change required |
+|---|---|
+| FVG Engine, Order Block Engine, Breaker Block Engine, MSS Engine, Liquidity Hierarchy Engine | Adopt instance-versioned emission (Section 1) instead of in-place status mutation |
+| Institutional Event Log | Log every instance emission including supersessions (already its job — no structural change, just confirms it captures `supersedes`) |
+| Confidence Scoring Engine | Emit structured `factors[]` instead of free-form `scoreBreakdown{}` |
+| Trade Rating Engine | Add `confidenceScoreInstanceId` reference field |
+| **All modules** | Optionally emit `HealthPing` telemetry (Section 2) |
+| **New:** Engine Health Monitor | Build as module 14, Tier 3, periodic |
+
+None of these modules have passed Gate 5 yet, so every change above is free to apply now at zero re-freeze cost — this is the last point at which that's true.
