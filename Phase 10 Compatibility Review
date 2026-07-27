@@ -1,0 +1,73 @@
+# Gold ICT Pro — Phase 10 Compatibility Review
+
+**Purpose:** Verify that every Phase 9 contract exposes enough information for Phase 10 (Risk Management, Position Sizing, MT5/Webhook Execution, Trade Management) to consume it without requiring any modification to Phase 9. Where a gap is found, the fix is specified as an addition to Phase 9 now — not a future patch.
+
+---
+
+## 1. Method
+
+For each Phase 9 contract, check against the four Phase 10 consumer needs:
+- **Risk Management** needs: price levels for invalidation, a stable ID to attach risk state to.
+- **Position Sizing** needs: distance from entry to invalidation (derivable from price levels), instrument context (already in Phase 8 Session/Core Foundation).
+- **Execution (MT5/Webhook)** needs: a stable recommendation/trade identifier, direction, timestamp, no ambiguity about which contract version produced it.
+- **Trade Management** needs: ability to trace a live trade back through its originating POI(s) to know what would invalidate or extend it.
+
+---
+
+## 2. Contract-by-Contract Review
+
+| Contract | Risk Mgmt | Position Sizing | Execution | Trade Mgmt | Verdict |
+|---|---|---|---|---|---|
+| `MTFStructureContract` | Indirect (bias context only) | N/A | N/A | Indirect | OK — informational only, no gap |
+| `LiquidityHierarchyContract` | Yes (tier informs stop placement logic in Phase 10) | Yes (pool price = potential target/stop reference) | N/A | Yes (`poolId`, `swept` flag) | OK |
+| `PDArrayContract` | Yes (zone can gate entries in Phase 10 risk rules) | Yes (equilibrium as reference) | N/A | Yes | OK |
+| `FVGContract` | Yes (`high`/`low` usable as invalidation reference) | Yes | N/A | Yes (`fvgId`) | OK |
+| `OrderBlockContract` | Yes (`high`/`low` = natural stop reference) | Yes | N/A | Yes (`obId`, `validatedBySweepId`) | OK |
+| `MSSContract` | Yes (invalidation trigger reference) | N/A | N/A | Yes (`invalidatedStructureId`) | OK |
+| `BreakerBlockContract` | Yes | Yes | N/A | Partial — has `sourceObId`/`sourceMssId` but no generic multi-hop lineage | **Gap — see 3.1** |
+| `POIRegistryContract` | Yes | Yes | N/A | Partial — same lineage gap, compounded since this is the contract Phase 10 will most likely query directly | **Gap — see 3.1** |
+| `ConfidenceScoreContract` | Yes (usable as a risk-sizing input, e.g. scale position by score) | Yes | Yes (`recommendationId`) | Yes | OK |
+| `TradeRatingContract` | Yes (grade can gate whether Phase 10 even acts) | Yes | Yes (`recommendationId`) | Yes | OK |
+| `InstitutionalEventLogContract` | N/A | N/A | N/A | Yes (full history) | OK — not a live-decision input, correctly excluded from Phase 10 hot path |
+| `InstitutionalAuditContract` | N/A | N/A | N/A | N/A | OK — terminal, no Phase 10 relevance |
+| `StatisticsContract` | Indirect (could inform Phase 10 position-sizing confidence multipliers over time) | Indirect | N/A | N/A | OK |
+
+---
+
+## 3. Identified Gaps and Required Fixes
+
+### 3.1 Lineage chain gap (blocking)
+
+**Problem:** `BreakerBlockContract` carries `sourceObId` and `sourceMssId`, giving one hop of lineage. `POIRegistryContract` aggregates FVG/OB/Breaker/PD/Liquidity but does not carry a normalized multi-hop lineage chain. If Phase 10's Trade Manager needs to answer "what original structure ultimately produced this POI, through however many reclassifications," it would have to walk across multiple contracts manually and understand each one's internal field naming — which means Phase 10 logic would be coupled to Phase 9 internal structure. That violates the isolation goal.
+
+**Fix (added to Phase 9 now, not deferred):** Add a generic field to `POIRegistryContract`:
+```
+lineage: [{ contractType, contractId }]
+```
+populated by the POI Aggregator at aggregation time by walking each source contract's existing specific lineage fields (`sourceObId`, `sourceMssId`, etc.) into this normalized array. This is a POI Aggregator responsibility only — no upstream module changes, no new module needed, and it doesn't touch any Tier 1 detection logic.
+
+**Impact on charter:** Add one field to the POI Aggregator's Gate 1 test contract before that module is marked complete. Since POI Aggregator has not yet passed Gate 5, this is a zero-cost addition — no re-freeze required.
+
+### 3.2 Contract version visibility (non-blocking, hygiene)
+
+**Problem:** Phase 10 must be able to tell, at consumption time, which schema version of a Phase 9 contract it's reading, in case Phase 9 evolves after Phase 10 is built.
+
+**Fix:** Already covered structurally — the Registry Entry Base Schema (Implementation Charter, Section 2) includes `contractVersion` on every registry-type contract. No additional fix needed; this review simply confirms `ConfidenceScoreContract` and `TradeRatingContract` (non-registry, single-object contracts) also carry `contractVersion` even though they're not registries. **Action:** add `contractVersion` field to both — minor addition, no logic impact.
+
+### 3.3 No stop/target computation in Phase 9 (by design, not a gap)
+
+Phase 9 intentionally does not compute suggested stop-loss or take-profit levels — it only exposes raw structural price levels (`high`/`low` on FVG/OB/Breaker, zone boundaries on PD Array). Risk Management in Phase 10 owns the responsibility of turning structural levels into actual risk parameters. This is confirmed as correct separation of concerns, not a gap: giving Phase 9 opinions about stop placement would duplicate a Phase 10 responsibility and violate single-responsibility.
+
+---
+
+## 4. Verdict
+
+**Two required additions before POI Aggregator and the two scoring contracts pass Gate 5:**
+1. `lineage[]` field on `POIRegistryContract` (Section 3.1) — blocking.
+2. `contractVersion` field on `ConfidenceScoreContract` and `TradeRatingContract` (Section 3.2) — non-blocking hygiene, but cheap enough to include now.
+
+With both applied, **every Phase 9 contract is confirmed sufficient for Phase 10 to consume without requiring any Phase 9 modification.** No other gaps identified.
+
+## 5. Recommendation
+
+Apply both fixes at the POI Aggregator / Confidence Scoring / Trade Rating build steps (they haven't reached Gate 5 yet per the Implementation Charter, so this costs nothing). Re-run this compatibility review once Phase 10's own architecture is drafted, since Phase 10's actual module list may surface needs not visible from requirements alone.
