@@ -1,0 +1,3448 @@
+//@version=6
+indicator("Gold ICT Pro - Phase 9 Engine (M12 Institutional Audit)", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ============================================================================
+// MODULE 1: CORE FOUNDATION & TYPES
+// ============================================================================
+
+// --- General Settings ---
+GRP_GENERAL = "General Settings"
+int SWING_LOOKBACK   = input.int(5, "Swing Lookback", group=GRP_GENERAL, minval=2)
+int ATR_LENGTH       = input.int(14, "ATR Length", group=GRP_GENERAL, minval=1)
+float SWEEP_THRESHOLD= input.float(0.2, "Sweep Threshold (ATR multiplier)", group=GRP_GENERAL, step=0.1)
+
+// --- Session Settings (Exchange Time) ---
+GRP_SESSION = "Session Settings (Exchange Time)"
+int ASIAN_START_HR   = input.int(19, "Asian Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_START_MIN  = input.int(0, "Asian Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int ASIAN_END_HR     = input.int(4, "Asian End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_END_MIN    = input.int(0, "Asian End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+int LONDON_START_HR  = input.int(3, "London Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_START_MIN = input.int(0, "London Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int LONDON_END_HR    = input.int(12, "London End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_END_MIN   = input.int(0, "London End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+int NY_START_HR      = input.int(8, "New York Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_START_MIN     = input.int(0, "New York Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int NY_END_HR        = input.int(17, "New York End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_END_MIN       = input.int(0, "New York End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+// --- Engine Limits ---
+GRP_LIMITS = "Engine Limits"
+int MAX_POOLS           = input.int(50, "Max Registry Pools", group=GRP_LIMITS, minval=10)
+
+// --- Phase 9 Visualizations ---
+GRP_P9_VIS = "Phase 9 Visualizations"
+bool show_p9_debug = input.bool(true, "Show P9 Debug Panel", group=GRP_P9_VIS)
+bool show_p9_inspector = input.bool(true, "Show P9 Registry Inspector", group=GRP_P9_VIS)
+bool show_fvg_vis  = input.bool(true, "Show FVG Boxes", group=GRP_P9_VIS)
+bool show_ob_vis   = input.bool(true, "Show OB Boxes", group=GRP_P9_VIS)
+bool show_brk_vis  = input.bool(true, "Show Breaker Boxes", group=GRP_P9_VIS)
+bool show_mss_vis  = input.bool(true, "Show MSS Labels", group=GRP_P9_VIS)
+bool show_pd_vis   = input.bool(true, "Show PD Lines", group=GRP_P9_VIS)
+bool show_poi_vis  = input.bool(true, "Show POI Boxes (M8)", group=GRP_P9_VIS)
+bool show_m10_vis  = input.bool(true, "Show Trade Levels (M10)", group=GRP_P9_VIS)
+bool dev_mode      = input.bool(false, "Enable Developer Mode (Instance IDs)", group=GRP_P9_VIS)
+
+// --- Render Engine Settings ---
+int MAX_VISUALS = input.int(3, "Max Visuals Per Type", minval=1, maxval=10, group="Render Engine")
+float MAX_RENDER_DIST_MULT = input.float(10.0, "Max Render Distance (ATR Mult)", minval=1.0, group="Render Engine")
+
+// --- Module 8 & 9 Weights & Penalties ---
+GRP_M8 = "Module 8 & 9 Weights"
+int W_HTF = input.int(20, "HTF Bias Weight", group=GRP_M8)
+int W_LIQ = input.int(20, "Liquidity Tier Weight", group=GRP_M8)
+int W_PD  = input.int(15, "PD Zone Weight", group=GRP_M8)
+int W_FVG = input.int(15, "FVG Weight", group=GRP_M8)
+int W_OB  = input.int(15, "OB Weight", group=GRP_M8)
+int W_MSS = input.int(10, "MSS Weight", group=GRP_M8)
+int W_BRK = input.int(5,  "Breaker Weight", group=GRP_M8)
+
+GRP_M9 = "Module 9 Penalties"
+int P_HTF_CONF = input.int(-20, "HTF Conflict Penalty", group=GRP_M9)
+int P_PD_CONF  = input.int(-15, "Premium/Discount Conflict Penalty", group=GRP_M9)
+int P_SESS     = input.int(-10, "Against Session Penalty", group=GRP_M9)
+int P_WEAK_DSP = input.int(-8,  "Weak Displacement Penalty", group=GRP_M9)
+int P_LOW_LIQ  = input.int(-5,  "Low Liquidity Penalty", group=GRP_M9)
+
+// --- UI Color Palette ---
+color C_BULL_OB  = color.new(color.blue, 70)
+color C_BEAR_OB  = color.new(color.orange, 70)
+color C_BULL_FVG = color.new(color.green, 80)
+color C_BEAR_FVG = color.new(color.red, 80)
+color C_BRK      = color.new(color.purple, 60)
+color C_MIT      = color.new(color.gray, 70)
+color C_INV      = color.new(color.black, 50)
+color C_MSS_BULL = color.new(color.green, 0)
+color C_MSS_BEAR = color.new(color.red, 0)
+color C_POI      = color.new(color.teal, 50)
+
+// -------------------------------------------------------------------------
+// 1.2 FUNDAMENTAL ENUMS
+// -------------------------------------------------------------------------
+int LS_ACTIVE      = 1
+int LS_SWEPT       = 3
+int LS_INVALIDATED = 4
+int LS_EXPIRED     = 5
+
+int LT_BUY_SIDE  = 0
+int LT_SELL_SIDE = 1
+
+int ST_OFF_SESSION = 0
+int ST_ASIAN       = 1
+int ST_LONDON      = 2
+int ST_NEW_YORK    = 3
+
+int TD_NEUTRAL = 0
+int TD_LONG    = 1
+int TD_SHORT   = 2
+
+int RS_ACTIVE      = 1
+
+// -------------------------------------------------------------------------
+// 1.3 CORE TYPE DEFINITIONS
+// -------------------------------------------------------------------------
+type SwingPoint
+    float price
+    int   barIndex
+    int   timeMs   
+    bool  isHigh
+
+type LiquidityPool
+    int               id
+    int               poolType         
+    int               state            
+    float             priceLevel
+    int               touchCount
+    float             confidence
+    bool              isSwept
+    int               createdAtBar
+    int               sweptAtBar
+    int               invalidatedAtBar
+    string            sweepReasonCode 
+    array<SwingPoint> mitigations      
+
+type ContextSnapshot
+    int   barIndex
+    int   timeMs           
+    float currentPrice
+    float atr
+    int   currentSession 
+    int   marketBias     
+    float premiumZone
+    float discountZone
+
+type StrategyCandidate
+    int             id
+    LiquidityPool   sourcePool
+    ContextSnapshot context
+    int             direction       
+    float           entryPrice
+    float           stopLoss
+    float           takeProfit
+    string          strategyName
+
+type Recommendation
+    int               id
+    StrategyCandidate candidate
+    int               status
+    int               createdBarIndex
+    float             actualEntry
+    float             actualStop
+
+type PoolTracker
+    int poolId
+    int lastState
+    int activeStartBar
+    int reinforcedStartBar
+    int sweptStartBar
+
+type LifecycleAuditEntry
+    int poolId
+    int prevState
+    int newState
+    string transitionStr
+    string reason
+    int barIndex
+    int activeDuration
+    int reinforcedDuration
+    int sweptDuration
+
+type SelectionResult
+    LiquidityPool bestBullPool
+    LiquidityPool bestBearPool
+    LiquidityPool bestOverallPool
+    string        selectionReason
+    float         selectionConfidence
+
+type SelectionAuditData
+    int totalBull
+    int totalBear
+    int eligibleBull
+    int eligibleBear
+    string stateFilterBull
+    string stateFilterBear
+    int selectedBullId
+    int selectedBearId
+    int selectedOverallId
+    string finalRejectionReason
+
+type SweepValidationResult
+    bool          isSwept
+    int           sweepDirection
+    float         sweepConfidence
+    string        sweepReason
+    LiquidityPool sweptPool
+
+type ValidationSummary
+    bool                  isReady
+    string                validationResult
+    string                failureReason
+    string                validationStatus
+    ContextSnapshot       context
+    SelectionResult       selection
+    SweepValidationResult sweep
+    int                   trend
+
+type StrategyResult
+    bool   strategyApproved
+    int    direction
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    float  riskReward
+    float  strategyConfidence
+    string rejectionReason
+
+type ArbitrationResult
+    bool   isApproved
+    int    direction
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    string reason
+
+// P9 Types
+type MTFStructureInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    string timeframe
+    int    structuralBias
+    int    lastBOS
+    int    lastCHoCH
+    int    timestamp
+
+type LiquidityHierarchyInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    int    poolId
+    string tier
+    string originTimeframe
+    float  price
+    bool   swept
+    float  institutionalScore
+
+type PDArrayInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    float  rangeHigh
+    float  rangeLow
+    float  rangeSize
+    float  equilibriumPrice
+    float  currentPrice
+    float  positionPercent
+    string currentZone
+    int    timestamp
+
+type FVGInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    int    direction
+    float  gapTop
+    float  gapBottom
+    float  mitigationPercent
+    int    originMTFBias
+    string originPDZone
+    string originLiquidityTier
+    int    timestamp
+
+type OBInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    int    direction
+    float  obHigh
+    float  obLow
+    float  mitigationPercent
+
+type MSSInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    int    direction
+    int    triggerBarIndex
+    float  triggerPrice
+    float  triggerRange
+    float  displacementStrength
+    string invalidatedStructureId
+    bool   createsBreakerCandidate
+
+type BreakerBlockInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    int    direction
+    float  brkHigh
+    float  brkLow
+    float  mitigationPercent
+    string originOrderBlockId
+    string originOrderBlockInstance
+    string originMSSId
+    string originMSSInstance
+    int    originBarTime
+    int    originMTFBias
+    string originPDZone
+    string originLiquidityTier
+    string confidenceReason
+    float  orig_mss_px  
+    int    orig_mss_bar  
+
+// Module 8 Type
+type POIInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int    createdAt
+    string status
+    bool   integrity
+    string contractVersion
+    string poiType
+    int    direction
+    float  poiHigh
+    float  poiLow
+    float  centerPrice
+    int    session
+    int    htfBias
+    string pdZone
+    string liqTier
+    string fvgLink
+    string obLink
+    string mssLink
+    string brkLink
+    int    confluenceScore
+    string grade
+    string confidenceReason
+    string correlationId
+
+// Module 10 Type: Trade Recommendation
+type TradeRecommendationInstance
+    string baseId
+    string instanceId
+    int    version
+    string action
+    int    direction
+    string rating
+    int    confidence
+    int    previousScore
+    int    scoreDelta
+    int    riskScore
+    float  expectedRR
+    float  entryPrice
+    float  stopLoss
+    float  takeProfit
+    string poiLink
+    string brkLink
+    string mssLink
+    string obLink
+    string fvgLink
+    string liqLink
+    string htfLink
+    string confidenceFactors
+    string reasons
+    string penalties
+    bool   integrity
+    int    createdAt
+    string correlationId
+
+// Module 11 Type: Event Registry
+type EventRegistryInstance
+    int    eventId
+    int    parentEventId
+    string correlationId
+    int    module           
+    string eventType
+    int    severity         
+    string outcome
+    string objectId
+    int    timestamp
+    int    barIndex
+    string timeStr
+    string engineVersion    
+    string schemaVersion    
+    string metadata
+    string description
+    bool   integrity
+    int    createdAt
+
+// Module 12 Type: Audit Result
+type AuditResultInstance
+    int    auditId
+    string auditType
+    int    severity
+    string status
+    string objectId
+    string module
+    string correlationId
+    string message
+    string recommendation
+    bool   integrity
+    string auditVersion
+    int    timestamp
+    int    createdAt
+
+// Module 12 Type: Audit Summary
+type AuditSummaryInstance
+    int    cycleId
+    int    timestamp
+    int    barIndex
+    int    trustScore
+    int    totalAudits
+    int    passed
+    int    warnings
+    int    failures
+    int    skipped
+    string summary
+
+// =========================================================================
+// CENTRALIZED ENGINE STATE
+// =========================================================================
+type EngineState
+    int next_pool_id = 1
+    int next_rec_id = 1
+    int next_fvg_id = 1
+    int next_ob_id = 1
+    int next_mss_id = 1
+    int next_brk_id = 1
+    int next_poi_id = 1
+    int next_trade_rec_id = 1
+    
+    float last_swing_high_price = na
+    int   last_swing_high_bar = na
+    float last_swing_low_price = na
+    int   last_swing_low_bar = na
+    int   current_trend = 0
+    int   last_bos_dir = 0
+    int   last_choch_dir = 0
+    
+    string current_time_str = "00:00"
+    string market_status = "CLOSED"
+    string struct_logs = ""
+    
+    ContextSnapshot current_context = na
+    SelectionResult current_selection = na
+    SweepValidationResult current_sweep_validation = na
+    ValidationSummary current_validation = na
+    StrategyResult current_strategy = na
+    ArbitrationResult current_arbitration = na
+    Recommendation active_rec = na
+    SelectionAuditData current_audit = na
+    
+    int mtf_ver_1 = 0
+    int mtf_ver_2 = 0
+    int mtf_ver_3 = 0
+    int mtf_bias_1 = 0
+    int mtf_bias_2 = 0
+    int mtf_bias_3 = 0
+    int mtf_bos_1 = 0
+    int mtf_bos_2 = 0
+    int mtf_bos_3 = 0
+    int mtf_choch_1 = 0
+    int mtf_choch_2 = 0
+    int mtf_choch_3 = 0
+    float mtf_hi_1 = na
+    float mtf_hi_2 = na
+    float mtf_hi_3 = na
+    float mtf_lo_1 = na
+    float mtf_lo_2 = na
+    float mtf_lo_3 = na
+    int mtf_t_1 = 0
+    int mtf_t_2 = 0
+    int mtf_t_3 = 0
+    bool mtf_integ_1 = false
+    bool mtf_integ_2 = false
+    bool mtf_integ_3 = false
+
+    int mtf_l_bias_1 = 0
+    int mtf_l_bias_2 = 0
+    int mtf_l_bias_3 = 0
+    int mtf_l_bos_1 = 0
+    int mtf_l_bos_2 = 0
+    int mtf_l_bos_3 = 0
+    int mtf_l_choch_1 = 0
+    int mtf_l_choch_2 = 0
+    int mtf_l_choch_3 = 0
+    bool mtf_l_integ_1 = false
+    bool mtf_l_integ_2 = false
+    bool mtf_l_integ_3 = false
+    
+    int pd_ver = 0
+    float pd_high = na
+    float pd_low = na
+    string pd_zone = "N/A"
+    bool pd_integ = false
+    
+    int liq_total_emitted = 0
+    int fvg_total_emitted = 0
+    int ob_total_emitted = 0
+    int mss_total_emitted = 0
+    int brk_total_emitted = 0
+    int poi_total_emitted = 0
+    int trade_rec_total_emitted = 0
+    
+    string mss_diag_reason = "No CHoCH detected"
+    int mss_diag_bar = na
+    int mss_last_eval_bar = na
+    
+    string brk_diag_reason = "Waiting for OB Invalidation"
+    int brk_diag_bar = na
+    int brk_last_eval_bar = na
+    bool brk_diag_ob_inv = false
+    bool brk_diag_mss_found = false
+    int brk_stat_evals = 0
+    int brk_stat_created = 0
+    int brk_stat_rej_no_mss = 0
+    int brk_stat_rej_integrity = 0
+    int brk_stat_rej_direction = 0
+    int brk_stat_waiting = 0
+    
+    int drawn_fvg = 0
+    int drawn_ob = 0
+    int drawn_brk = 0
+    int drawn_poi = 0
+    
+    string poi_latest_grade = "N/A"
+    int poi_latest_score = 0
+    string poi_latest_type = "N/A"
+    int poi_latest_dir = 0
+    int poi_highest_score = 0
+    string poi_latest_rationale = "N/A"
+
+    // Module 10 State
+    string m10_latest_action = "WAIT"
+    string m10_latest_rating = "Reject"
+    int m10_latest_score = 0
+    string m10_latest_risk = "Medium"
+    int m10_latest_risk_score = 50
+    float m10_latest_rr = 0.0
+    float m10_latest_entry = na
+    float m10_latest_sl = na
+    float m10_latest_tp = na
+    string m10_latest_reasons = "N/A"
+    string m10_latest_penalties = "N/A"
+
+    // Module 11 State
+    int next_event_id = 1
+    int event_total_emitted = 0
+    int next_flow_id = 1
+    string current_correlation_id = "INIT"
+    int last_event_id = 0
+
+    // Module 12 State
+    int next_audit_id = 1
+    int audit_total_emitted = 0
+    int next_audit_cycle_id = 1
+    
+    // Lifetime counters
+    int lifetime_audit_failures = 0
+    int lifetime_audit_warnings = 0
+    int lifetime_audit_passed = 0
+    
+    // Current cycle (stateless, recomputed each cycle)
+    int m12_cycle_trust_score = 100
+    int m12_cycle_failures = 0
+    int m12_cycle_warnings = 0
+    int m12_cycle_passed = 0
+    int m12_cycle_skipped = 0
+    string m12_last_summary = "No audits run yet"
+    string audit_last_failure_msg = "None"
+
+var EngineState S = EngineState.new()
+
+// =========================================================================
+// GLOBAL HELPERS & STATE VARIABLES
+// =========================================================================
+f_state_to_string(int state) =>
+    string res = "UNKNOWN"
+    if state == LS_ACTIVE
+        res := "ACTIVE"
+    else if state == LS_SWEPT
+        res := "SWEPT"
+    else if state == LS_INVALIDATED
+        res := "INVALIDATED"
+    else if state == LS_EXPIRED
+        res := "EXPIRED"
+    res
+
+f_score_pool(LiquidityPool p) =>
+    float score = p.confidence
+    if p.state == 2
+        score += 0.5   
+        score += p.touchCount * 0.1 
+    score
+
+var array<LiquidityPool> g_registry = array.new<LiquidityPool>()
+var array<string> g_event_log = array.new<string>()
+var array<PoolTracker> g_pool_trackers = array.new<PoolTracker>()
+var array<LifecycleAuditEntry> g_lifecycle_audit_log = array.new<LifecycleAuditEntry>()
+var array<string> _lc_logs = array.new<string>()
+
+var array<MTFStructureInstance> g_mtf_registry = array.new<MTFStructureInstance>()
+var array<LiquidityHierarchyInstance> g_liq_registry = array.new<LiquidityHierarchyInstance>()
+var array<int>    g_liq_pool_ids  = array.new<int>()
+var array<string> g_liq_tier_map  = array.new<string>()
+var array<bool>   g_liq_swept_map = array.new<bool>()
+var array<int>    g_liq_ver_map   = array.new<int>()
+var array<float>  g_liq_score_map = array.new<float>()
+
+var array<PDArrayInstance> g_pd_registry = array.new<PDArrayInstance>()
+var array<FVGInstance> g_fvg_registry = array.new<FVGInstance>()
+var array<string> g_fvg_base_id = array.new<string>()
+var array<int>    g_fvg_ver     = array.new<int>()
+var array<float>  g_fvg_top     = array.new<float>()
+var array<float>  g_fvg_bot     = array.new<float>()
+var array<int>    g_fvg_dir     = array.new<int>()
+var array<string> g_fvg_state   = array.new<string>()
+var array<float>  g_fvg_mit_pct = array.new<float>()
+
+var array<OBInstance> g_ob_registry = array.new<OBInstance>()
+var array<string> g_ob_base_id    = array.new<string>()
+var array<int>    g_ob_ver        = array.new<int>()
+var array<int>    g_ob_dir        = array.new<int>()
+var array<float>  g_ob_high       = array.new<float>()
+var array<float>  g_ob_low        = array.new<float>()
+var array<string> g_ob_state      = array.new<string>()
+var array<float>  g_ob_mit_pct    = array.new<float>()
+
+var array<MSSInstance> g_mss_registry = array.new<MSSInstance>()
+var array<string> g_mss_base_id    = array.new<string>()
+var array<int>    g_mss_ver        = array.new<int>()
+var array<int>    g_mss_dir        = array.new<int>()
+var array<string> g_mss_state      = array.new<string>()
+var array<float>  g_mss_trigger_px = array.new<float>()
+var array<int>    g_mss_trigger_bar= array.new<int>()
+var array<float>  g_mss_trigger_rg = array.new<float>()
+var array<float>  g_mss_disp_str   = array.new<float>()
+var array<bool>   g_mss_breaker    = array.new<bool>()
+
+var array<BreakerBlockInstance> g_brk_registry = array.new<BreakerBlockInstance>()
+var array<string> g_brk_base_id     = array.new<string>()
+var array<int>    g_brk_ver         = array.new<int>()
+var array<int>    g_brk_dir         = array.new<int>()
+var array<float>  g_brk_high        = array.new<float>()
+var array<float>  g_brk_low         = array.new<float>()
+var array<string> g_brk_state       = array.new<string>()
+var array<float>  g_brk_mit_pct     = array.new<float>()
+var array<string> g_brk_src_ob_base = array.new<string>()
+var array<string> g_brk_src_ob_inst = array.new<string>()
+var array<string> g_brk_src_mss_base = array.new<string>()
+var array<string> g_brk_src_mss_inst = array.new<string>()
+var array<int>    g_brk_orig_time   = array.new<int>()
+var array<int>    g_brk_orig_bias   = array.new<int>()
+var array<string> g_brk_orig_pd     = array.new<string>()
+var array<string> g_brk_orig_liq    = array.new<string>()
+var array<string> g_brk_conf_reason = array.new<string>()
+var array<float>  g_brk_orig_mss_px = array.new<float>()
+var array<int>    g_brk_orig_mss_bar= array.new<int>()
+
+// Module 8 Arrays
+var array<POIInstance> g_poi_registry = array.new<POIInstance>()
+var array<string> g_poi_base_id   = array.new<string>()
+var array<int>    g_poi_ver       = array.new<int>()
+var array<string> g_poi_state     = array.new<string>()
+var array<float>  g_poi_high      = array.new<float>()
+var array<float>  g_poi_low       = array.new<float>()
+var array<int>    g_poi_dir       = array.new<int>()
+var array<int>    g_poi_score     = array.new<int>()
+var array<string> g_poi_grade     = array.new<string>()
+var array<string> g_poi_type      = array.new<string>()
+var array<string> g_poi_links     = array.new<string>()
+var array<string> g_poi_rationale  = array.new<string>()
+
+// Module 10 Arrays
+var array<TradeRecommendationInstance> g_trade_rec_registry = array.new<TradeRecommendationInstance>()
+var array<string> g_trade_rec_base_id = array.new<string>()
+var array<string> g_trade_rec_action  = array.new<string>()
+var array<string> g_trade_rec_rating = array.new<string>()
+var array<int>    g_trade_rec_score  = array.new<int>()
+
+// Module 11 Arrays
+var array<EventRegistryInstance> g_event_registry = array.new<EventRegistryInstance>()
+
+// Module 12 Arrays
+var array<AuditResultInstance> g_audit_registry = array.new<AuditResultInstance>()
+var array<AuditSummaryInstance> g_audit_summary_registry = array.new<AuditSummaryInstance>()
+
+// Module 9 Decision History Array
+var array<string> g_decision_log = array.new<string>()
+
+var array<Recommendation> g_recommendations = array.new<Recommendation>()
+
+var array<box> fvg_boxes = array.new<box>()
+var array<box> ob_boxes = array.new<box>()
+var array<box> brk_boxes = array.new<box>()
+var array<box> poi_boxes = array.new<box>()
+var array<label> mss_labels = array.new<label>()
+var array<line> debug_lines = array.new<line>()
+
+var table dash_table = table.new(position.top_right, 2, 90, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table event_log_table = table.new(position.top_left, 1, 16, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table audit_table = table.new(position.bottom_right, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table lifecycle_audit_table = table.new(position.middle_left, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table p9_debug_table = table.new(position.bottom_right, 2, 20, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table p9_inspector_table = table.new(position.middle_right, 2, 36, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table p9_engine_summary_table = table.new(position.bottom_right, 2, 9, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table profile_table = table.new(position.bottom_left, 3, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+var line pd_line_high = na
+var line pd_line_eq   = na
+var line pd_line_low  = na
+
+// Global session variables
+int asian_start  = ASIAN_START_HR * 60 + ASIAN_START_MIN
+int asian_end    = ASIAN_END_HR * 60 + ASIAN_END_MIN
+int london_start = LONDON_START_HR * 60 + LONDON_START_MIN
+int london_end   = LONDON_END_HR * 60 + LONDON_END_MIN
+int ny_start     = NY_START_HR * 60 + NY_START_MIN
+int ny_end       = NY_END_HR * 60 + NY_END_MIN
+
+// =========================================================================
+// LAYER 2: INFRASTRUCTURE (Constants, Enums, Managers, Assertions)
+// =========================================================================
+
+// 8. Engine Version
+string ENGINE_VERSION = "2.0.0"
+
+// 6. Event Severity Enum
+int SEV_INFO    = 0
+int SEV_WARNING = 1
+int SEV_ERROR   = 2
+int SEV_CRITICAL= 3
+
+// 12. Event Compression (Module IDs)
+int MOD_MTF  = 1
+int MOD_LIQ  = 2
+int MOD_PD   = 3
+int MOD_FVG  = 4
+int MOD_OB   = 5
+int MOD_MSS  = 6
+int MOD_BRK  = 7
+int MOD_POI  = 8
+int MOD_TR   = 9
+int MOD_BUS  = 10
+int MOD_AUDIT= 11
+
+// 3. Engine Constants (Event Types)
+string EVENT_EMIT     = "EMIT"
+string EVENT_CREATE   = "CREATE"
+string EVENT_INVALID  = "INVALIDATE"
+string EVENT_WARNING  = "WARNING"
+string EVENT_ERROR    = "ERROR"
+string EVENT_ASSERT   = "ASSERT_FAIL"
+
+// Module 12 Audit Constants
+string AUDIT_SCHEMA_VERSION = "1.0"
+int    AUDIT_INTERVAL       = 50
+
+string AUDIT_STRUCTURE   = "STRUCTURE"
+string AUDIT_DEPENDENCY  = "DEPENDENCY"
+string AUDIT_REGISTRY    = "REGISTRY"
+string AUDIT_REPLAY      = "REPLAY"
+string AUDIT_ENGINE      = "ENGINE"
+
+string AUDIT_PASS     = "PASS"
+string AUDIT_WARNING  = "WARNING"
+string AUDIT_FAIL     = "FAIL"
+string AUDIT_SKIPPED  = "SKIPPED"
+
+// 2. Standardized ID Formatter (e.g., FVG-000126-v01)
+f_format_id(string prefix, int seq, int ver) =>
+    string seq_str = str.tostring(seq)
+    while str.length(seq_str) < 6
+        seq_str := "0" + seq_str
+    if ver > 0
+        string ver_str = str.tostring(ver)
+        while str.length(ver_str) < 2
+            ver_str := "0" + ver_str
+        prefix + "-" + seq_str + "-v" + ver_str
+    else
+        prefix + "-" + seq_str
+
+// 1. Central Event Bus
+string EVENT_SCHEMA_VERSION = "1.0"
+
+f_bus_emit(int evtId, int pEvtId, string corrId, int modId, string eType, int sev, string outc, string objId, string desc, string meta, bool integ) =>
+    EventRegistryInstance evt = EventRegistryInstance.new(
+        evtId, pEvtId, corrId, modId, eType, sev, outc, objId, time, bar_index, 
+        str.tostring(time, "HH:mm"), ENGINE_VERSION, EVENT_SCHEMA_VERSION, meta, desc, integ, bar_index
+    )
+    array.push(g_event_registry, evt)
+    if array.size(g_event_registry) > 250
+        array.shift(g_event_registry)
+    
+    string sev_str = sev == SEV_INFO ? "INFO" : sev == SEV_WARNING ? "WARN" : sev == SEV_ERROR ? "ERROR" : "SUCCESS"
+    array.push(g_event_log, str.tostring(time, "HH:mm") + " [" + sev_str + "/" + outc + "] " + desc)
+    evt
+
+// 11. Assertions Helper
+f_assert(EngineState state, bool cond, string msg) =>
+    EngineState S = state
+    if not cond
+        int evt_id = S.next_event_id
+        S.next_event_id += 1
+        S.event_total_emitted += 1
+        _ = f_bus_emit(evt_id, S.last_event_id, "FLOW-SYS", MOD_BUS, EVENT_ASSERT, SEV_ERROR, "FAILED", "ASSERT", msg, "Assert: " + msg, false)
+        S.last_event_id := evt_id
+    S
+
+// =========================================================================
+// PHASE 8 COMPUTATION FUNCTION
+// =========================================================================
+f_is_in_range(int cur_mins, int start_mins, int end_mins) =>
+    if start_mins <= end_mins
+        cur_mins >= start_mins and cur_mins < end_mins
+    else
+        cur_mins >= start_mins or cur_mins < end_mins
+
+f_compute_phase8(EngineState state) =>
+    EngineState S = state
+    int cur_hour = hour(time, syminfo.timezone)
+    int cur_min  = minute(time, syminfo.timezone)
+    int cur_mins = cur_hour * 60 + cur_min
+    int cur_day  = dayofweek(time, syminfo.timezone)
+
+    bool is_weekend = false
+    if cur_day == 1
+        if cur_mins < (17 * 60)
+            is_weekend := true
+    else if cur_day == 6
+        if cur_mins >= (17 * 60)
+            is_weekend := true
+
+    int g_current_session = ST_OFF_SESSION
+    S.market_status := "CLOSED"
+
+    if not is_weekend
+        bool is_ny = f_is_in_range(cur_mins, ny_start, ny_end)
+        bool is_london = f_is_in_range(cur_mins, london_start, london_end)
+        bool is_asian = f_is_in_range(cur_mins, asian_start, asian_end)
+        S.market_status := "OPEN"
+        if is_ny
+            g_current_session := ST_NEW_YORK
+        else if is_london
+            g_current_session := ST_LONDON
+        else if is_asian
+            g_current_session := ST_ASIAN
+        else
+            g_current_session := ST_OFF_SESSION
+            S.market_status := "CLOSED"
+
+    string h_str = cur_hour < 10 ? "0" + str.tostring(cur_hour) : str.tostring(cur_hour)
+    string m_str = cur_min < 10 ? "0" + str.tostring(cur_min) : str.tostring(cur_min)
+    S.current_time_str := h_str + ":" + m_str
+
+    float ph = ta.pivothigh(high, SWING_LOOKBACK, SWING_LOOKBACK)
+    float pl = ta.pivotlow(low, SWING_LOOKBACK, SWING_LOOKBACK)
+
+    S.struct_logs := ""
+
+    if barstate.isconfirmed
+        if not na(S.last_swing_high_price) and close > S.last_swing_high_price
+            if S.current_trend == TD_SHORT
+                S.last_choch_dir := TD_LONG 
+                S.current_trend := TD_LONG
+                S.struct_logs += "CHoCH (Bullish) detected. "
+            else
+                S.last_bos_dir := TD_LONG 
+                S.current_trend := TD_LONG
+                S.struct_logs += "BOS (Bullish) detected. "
+                
+        if not na(S.last_swing_low_price) and close < S.last_swing_low_price
+            if S.current_trend == TD_LONG
+                S.last_choch_dir := TD_SHORT 
+                S.current_trend := TD_SHORT
+                S.struct_logs += "CHoCH (Bearish) detected. "
+            else
+                S.last_bos_dir := TD_SHORT 
+                S.current_trend := TD_SHORT
+                S.struct_logs += "BOS (Bearish) detected. "
+
+        if not na(ph)
+            if array.size(g_registry) < MAX_POOLS
+                int newId = S.next_pool_id
+                S.next_pool_id += 1
+                LiquidityPool newPool = LiquidityPool.new(newId, LT_BUY_SIDE, LS_ACTIVE, ph, 0, 1.0, false, bar_index, 0, 0, "INIT", array.new<SwingPoint>())
+                array.push(g_registry, newPool)
+                array.push(g_event_log, str.tostring(time, "HH:mm") + " Pool Created: ID-" + str.tostring(newId))
+            S.last_swing_high_price := ph
+            S.last_swing_high_bar := bar_index - SWING_LOOKBACK
+            S.struct_logs += "Confirmed Swing High: " + str.tostring(ph) + ". "
+            
+        if not na(pl)
+            if array.size(g_registry) < MAX_POOLS
+                int newId = S.next_pool_id
+                S.next_pool_id += 1
+                LiquidityPool newPool = LiquidityPool.new(newId, LT_SELL_SIDE, LS_ACTIVE, pl, 0, 1.0, false, bar_index, 0, 0, "INIT", array.new<SwingPoint>())
+                array.push(g_registry, newPool)
+                array.push(g_event_log, str.tostring(time, "HH:mm") + " Pool Created: ID-" + str.tostring(newId))
+            S.last_swing_low_price := pl
+            S.last_swing_low_bar := bar_index - SWING_LOOKBACK
+            S.struct_logs += "Confirmed Swing Low: " + str.tostring(pl) + ". "
+
+        if S.struct_logs != ""
+            array.push(g_event_log, str.tostring(time, "HH:mm") + " STRUCT: " + S.struct_logs)
+
+    float atr_val = ta.atr(ATR_LENGTH)
+    float high50 = ta.highest(high, 50)
+    float low50 = ta.lowest(low, 50)
+    float priceRange = high50 - low50
+
+    float eq = low50 + (priceRange * 0.5)
+    float premium = low50 + (priceRange * 0.7)
+    float discount = low50 + (priceRange * 0.3)
+
+    S.current_context := ContextSnapshot.new(bar_index, time, close, atr_val, g_current_session, S.current_trend, premium, discount)
+
+    int POOL_EXPIRY_BARS = 200
+
+    int _bull_count = 0
+    int _bear_count = 0
+    int _active_count = 0
+    int _swept_count = 0
+    int _rein_count = 0
+    int _invalid_count = 0
+    int _expired_count = 0
+
+    int _tBull = 0
+    int _tBear = 0
+    int _eBull = 0
+    int _eBear = 0
+
+    while array.size(g_pool_trackers) < array.size(g_registry)
+        int new_idx = array.size(g_pool_trackers)
+        LiquidityPool p_new = array.get(g_registry, new_idx)
+        PoolTracker newT = PoolTracker.new(p_new.id, p_new.state, bar_index, 0, 0)
+        array.push(g_pool_trackers, newT)
+
+    if array.size(g_registry) > 0 and array.size(g_pool_trackers) == array.size(g_registry)
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            if p.state == LS_ACTIVE or p.state == 2
+                if bar_index - p.createdAtBar > POOL_EXPIRY_BARS
+                    int prevState = p.state
+                    p.state := LS_EXPIRED
+                    array.push(_lc_logs, str.tostring(time, "HH:mm") + " Pool " + str.tostring(p.id) + " " + f_state_to_string(prevState) + "->" + f_state_to_string(LS_EXPIRED))
+                        
+            if p.state == LS_ACTIVE or p.state == 2
+                if p.poolType == LT_BUY_SIDE
+                    if close < p.priceLevel
+                        int prevState = p.state
+                        p.state := LS_SWEPT
+                        p.isSwept := true
+                        p.sweptAtBar := bar_index
+                        array.push(_lc_logs, str.tostring(time, "HH:mm") + " Pool " + str.tostring(p.id) + " " + f_state_to_string(prevState) + "->" + f_state_to_string(LS_SWEPT))
+                    else if low <= p.priceLevel and close > p.priceLevel
+                        p.state := 2
+                        p.touchCount += 1
+                        p.confidence := math.min(p.confidence + 0.1, 1.0)
+                        array.push(_lc_logs, str.tostring(time, "HH:mm") + " Pool " + str.tostring(p.id) + " Reinforced")
+                else if p.poolType == LT_SELL_SIDE
+                    if close > p.priceLevel
+                        int prevState = p.state
+                        p.state := LS_SWEPT
+                        p.isSwept := true
+                        p.sweptAtBar := bar_index
+                        array.push(_lc_logs, str.tostring(time, "HH:mm") + " Pool " + str.tostring(p.id) + " " + f_state_to_string(prevState) + "->" + f_state_to_string(LS_SWEPT))
+                    else if high >= p.priceLevel and close < p.priceLevel
+                        p.state := 2
+                        p.touchCount += 1
+                        p.confidence := math.min(p.confidence + 0.1, 1.0)
+                        array.push(_lc_logs, str.tostring(time, "HH:mm") + " Pool " + str.tostring(p.id) + " Reinforced")
+                        
+            if p.state == LS_SWEPT and p.sweptAtBar < bar_index
+                int prevState = p.state
+                p.state := LS_INVALIDATED
+                p.invalidatedAtBar := bar_index
+                array.push(_lc_logs, str.tostring(time, "HH:mm") + " Pool " + str.tostring(p.id) + " " + f_state_to_string(prevState) + "->" + f_state_to_string(LS_INVALIDATED))
+                
+            if i < array.size(g_pool_trackers)
+                PoolTracker t = array.get(g_pool_trackers, i)
+                if t.lastState != p.state
+                    int prev = t.lastState
+                    int curr = p.state
+                    string transStr = f_state_to_string(prev) + " -> " + f_state_to_string(curr)
+                    int activeDur = 0
+                    int reinDur = 0
+                    int sweptDur = 0
+                    if prev == LS_ACTIVE
+                        activeDur := bar_index - t.activeStartBar
+                    else if prev == 2
+                        reinDur := bar_index - t.reinforcedStartBar
+                    else if prev == LS_SWEPT
+                        sweptDur := bar_index - t.sweptStartBar
+                    LifecycleAuditEntry entry = LifecycleAuditEntry.new(p.id, prev, curr, transStr, p.sweepReasonCode, bar_index, activeDur, reinDur, sweptDur)
+                    array.push(g_lifecycle_audit_log, entry)
+                    if curr == LS_ACTIVE
+                        t.activeStartBar := bar_index
+                    else if curr == 2
+                        t.reinforcedStartBar := bar_index
+                    else if curr == LS_SWEPT
+                        t.sweptStartBar := bar_index
+                    t.lastState := curr
+                
+            if p.poolType == LT_BUY_SIDE
+                _tBull += 1
+            else
+                _tBear += 1
+                
+            if p.state == LS_ACTIVE
+                _active_count += 1
+                _eBull += p.poolType == LT_BUY_SIDE ? 1 : 0
+                _eBear += p.poolType == LT_SELL_SIDE ? 1 : 0
+            else if p.state == 2
+                _rein_count += 1
+                _eBull += p.poolType == LT_BUY_SIDE ? 1 : 0
+                _eBear += p.poolType == LT_SELL_SIDE ? 1 : 0
+            else if p.state == LS_SWEPT
+                _swept_count += 1
+                _eBull += p.poolType == LT_BUY_SIDE ? 1 : 0
+                _eBear += p.poolType == LT_SELL_SIDE ? 1 : 0
+            else if p.state == LS_INVALIDATED
+                _invalid_count += 1
+            else if p.state == LS_EXPIRED
+                _expired_count += 1
+
+    if array.size(g_lifecycle_audit_log) > 10
+        array.shift(g_lifecycle_audit_log)
+
+    if array.size(_lc_logs) > 0
+        string final_log = array.join(_lc_logs, " | ")
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " " + final_log)
+        array.clear(_lc_logs)
+
+    if array.size(g_registry) > 0 and array.size(g_registry) == array.size(g_pool_trackers)
+        for i = array.size(g_registry) - 1 to 0
+            LiquidityPool p = array.get(g_registry, i)
+            if p.state == LS_EXPIRED or p.state == LS_INVALIDATED
+                array.remove(g_registry, i)
+                array.remove(g_pool_trackers, i)
+
+    float _bestBullScore = -1.0
+    float _bestBearScore = -1.0
+    LiquidityPool _bestBull = na
+    LiquidityPool _bestBear = na
+
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            if p.state == LS_ACTIVE or p.state == 2 or p.state == LS_SWEPT
+                float score = f_score_pool(p)
+                if p.poolType == LT_BUY_SIDE and score > _bestBullScore
+                    _bestBullScore := score
+                    _bestBull := p
+                else if p.poolType == LT_SELL_SIDE and score > _bestBearScore
+                    _bestBearScore := score
+                    _bestBear := p
+
+    LiquidityPool _bestOverall = na
+    string _selReason = "No eligible pools found."
+    float _selConf = 0.0
+
+    if not na(_bestBull) and not na(_bestBear)
+        if _bestBullScore >= _bestBearScore
+            _bestOverall := _bestBull
+            _selReason := "Bullish selected (Highest Score)."
+            _selConf := _bestBull.confidence
+        else
+            _bestOverall := _bestBear
+            _selReason := "Bearish selected (Highest Score)."
+            _selConf := _bestBear.confidence
+    else if not na(_bestBull)
+        _bestOverall := _bestBull
+        _selReason := "Bullish selected (No Bearish competition)."
+        _selConf := _bestBull.confidence
+    else if not na(_bestBear)
+        _bestOverall := _bestBear
+        _selReason := "Bearish selected (No Bullish competition)."
+        _selConf := _bestBear.confidence
+
+    S.current_selection := SelectionResult.new(_bestBull, _bestBear, _bestOverall, _selReason, _selConf)
+    if S.current_selection.selectionReason != "No eligible pools found."
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " SELECT: " + S.current_selection.selectionReason)
+
+    string _filterBull = "PASS"
+    string _filterBear = "PASS"
+    if _eBull == 0 and _tBull > 0
+        _filterBull := "FAIL: No eligible bull pools"
+    if _eBear == 0 and _tBear > 0
+        _filterBear := "FAIL: No eligible bear pools"
+
+    S.current_audit := SelectionAuditData.new(_tBull, _tBear, _eBull, _eBear, _filterBull, _filterBear, na(_bestBull) ? -1 : _bestBull.id, na(_bestBear) ? -1 : _bestBear.id, na(_bestOverall) ? -1 : _bestOverall.id, na(_bestOverall) ? "No eligible pools" : "Selected (No conflicts)")
+    if S.current_audit.selectedOverallId == -1
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " AUDIT: " + S.current_audit.finalRejectionReason)
+
+    bool _isSwept = false
+    int _sweepDir = TD_NEUTRAL
+    float _sweepConf = 0.0
+    string _sweepReason = "NO_SWEEP_DETECTED"
+    LiquidityPool _sweptPool = na
+
+    if not na(S.current_selection.bestOverallPool) and not na(S.current_context)
+        LiquidityPool p = S.current_selection.bestOverallPool
+        float level = p.priceLevel
+        float atr_v = S.current_context.atr
+        float max_depth = atr_v * SWEEP_THRESHOLD
+        if p.poolType == LT_SELL_SIDE
+            if low <= level and close > level 
+                float sweep_depth = level - low
+                if sweep_depth <= max_depth
+                    _isSwept := true
+                    _sweepDir := TD_LONG
+                    _sweepConf := 0.8 - (sweep_depth / max_depth * 0.3) 
+                    _sweepReason := "BULLISH_SWEEP_WICK"
+                    _sweptPool := p
+                else
+                    _sweepReason := "SWEEP_TOO_DEEP"
+        else if p.poolType == LT_BUY_SIDE
+            if high >= level and close < level 
+                float sweep_depth = high - level
+                if sweep_depth <= max_depth
+                    _isSwept := true
+                    _sweepDir := TD_SHORT
+                    _sweepConf := 0.8 - (sweep_depth / max_depth * 0.3)
+                    _sweepReason := "BEARISH_SWEEP_WICK"
+                    _sweptPool := p
+                else
+                    _sweepReason := "SWEEP_TOO_DEEP"
+
+    S.current_sweep_validation := SweepValidationResult.new(_isSwept, _sweepDir, _sweepConf, _sweepReason, _sweptPool)
+    if S.current_sweep_validation.isSwept
+        string sweep_corr = "FLOW-" + str.tostring(S.next_flow_id)
+        S.next_flow_id += 1
+        S.current_correlation_id := sweep_corr
+        
+        int evt_id = S.next_event_id
+        S.next_event_id += 1
+        S.event_total_emitted += 1
+        
+        string liq_id = f_format_id("LIQ", _sweptPool.id, 1)
+        string meta_str = "Dir=" + str.tostring(_sweepDir) + "|Conf=" + str.tostring(_sweepConf, "#.##")
+        _ = f_bus_emit(evt_id, S.last_event_id, sweep_corr, MOD_LIQ, EVENT_EMIT, SEV_INFO, "SUCCESS", liq_id, "Liquidity Swept: " + _sweepReason, meta_str, true)
+        S.last_event_id := evt_id
+
+    bool _ready = true
+    string _result = "PASS"
+    string _reason = "All conditions met."
+    string _status = "Validated"
+
+    if S.market_status != "OPEN"
+        _ready := false
+        _result := "FAIL"
+        _reason := "Market Closed"
+        _status := "Rejected (Market Closed)"
+    else if na(S.current_selection.bestOverallPool)
+        _ready := false
+        _result := "FAIL"
+        _reason := "No Pool Selected"
+        _status := "Rejected (No Selection)"
+    else if not S.current_sweep_validation.isSwept
+        _ready := false
+        _result := "FAIL"
+        _reason := "No Sweep Detected"
+        _status := "Rejected (No Sweep)"
+    else if S.current_trend == TD_NEUTRAL
+        _ready := false
+        _result := "FAIL"
+        _reason := "Trend Neutral"
+        _status := "Rejected (No Trend)"
+
+    S.current_validation := ValidationSummary.new(_ready, _result, _reason, _status, S.current_context, S.current_selection, S.current_sweep_validation, S.current_trend)
+    if S.current_validation.isReady
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " VALIDATION: PASS - Ready for Strategy")
+    else if S.current_validation.validationResult == "FAIL"
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " VALIDATION: FAIL - " + S.current_validation.failureReason)
+
+    bool _approved = false
+    int _dir = TD_NEUTRAL
+    float _entry = na
+    float _sl = na
+    float _tp = na
+    float _rr = 0.0
+    float _conf = 0.0
+    string _stratReason = "N/A"
+
+    if S.current_validation.isReady
+        SweepValidationResult sweep = S.current_validation.sweep
+        ContextSnapshot snap = S.current_validation.context
+        LiquidityPool pool = S.current_validation.selection.bestOverallPool
+        if sweep.sweepDirection == TD_LONG 
+            _approved := true
+            _dir := TD_LONG
+            _entry := close
+            _sl := pool.priceLevel - (snap.atr * 0.2)
+            _tp := _entry + (snap.atr * 2.0)
+            if _entry != _sl
+                _rr := (_tp - _entry) / (_entry - _sl)
+            _conf := (sweep.sweepConfidence * 0.6) + (pool.confidence * 0.4)
+        else if sweep.sweepDirection == TD_SHORT 
+            _approved := true
+            _dir := TD_SHORT
+            _entry := close
+            _sl := pool.priceLevel + (snap.atr * 0.2)
+            _tp := _entry - (snap.atr * 2.0)
+            if _entry != _sl
+                _rr := (_entry - _tp) / (_sl - _entry)
+            _conf := (sweep.sweepConfidence * 0.6) + (pool.confidence * 0.4)
+        else
+            _stratReason := "Invalid Sweep Direction"
+    else
+        _stratReason := S.current_validation.failureReason
+
+    S.current_strategy := StrategyResult.new(_approved, _dir, _entry, _sl, _tp, _rr, _conf, _stratReason)
+    if S.current_strategy.strategyApproved
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " STRATEGY: Approved " + (S.current_strategy.direction == TD_LONG ? "LONG" : "SHORT"))
+
+    bool _arbApproved = false
+    int _arbDir = TD_NEUTRAL
+    float _arbEntry = na
+    float _arbSl = na
+    float _arbTp = na
+    string _arbReason = "N/A"
+
+    if S.current_strategy.strategyApproved
+        if S.current_strategy.direction == TD_LONG and S.current_context.marketBias == TD_SHORT
+            _arbReason := "Conflict: Long vs Bearish Trend"
+        else if S.current_strategy.direction == TD_SHORT and S.current_context.marketBias == TD_LONG
+            _arbReason := "Conflict: Short vs Bullish Trend"
+        else
+            _arbApproved := true
+            _arbDir := S.current_strategy.direction
+            _arbEntry := S.current_strategy.entryPrice
+            _arbSl := S.current_strategy.stopLoss
+            _arbTp := S.current_strategy.takeProfit
+            _arbReason := "Approved (No Conflicts)"
+    else
+        _arbReason := "Strategy Rejected"
+
+    S.current_arbitration := ArbitrationResult.new(_arbApproved, _arbDir, _arbEntry, _arbSl, _arbTp, _arbReason)
+    if S.current_arbitration.isApproved
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " ARBITRATION: Approved " + (S.current_arbitration.direction == TD_LONG ? "LONG" : "SHORT"))
+
+    if array.size(g_recommendations) > 0
+        for i = 0 to array.size(g_recommendations) - 1
+            Recommendation rec = array.get(g_recommendations, i)
+            if rec.status == RS_ACTIVE
+                if rec.candidate.direction == TD_LONG and low <= rec.actualStop
+                    rec.status := 2
+                else if rec.candidate.direction == TD_SHORT and high >= rec.actualStop
+                    rec.status := 2
+                else if rec.candidate.direction == TD_LONG and high >= rec.candidate.takeProfit
+                    rec.status := 3
+                else if rec.candidate.direction == TD_SHORT and low <= rec.candidate.takeProfit
+                    rec.status := 3
+                else if bar_index - rec.createdBarIndex > 100
+                    rec.status := 4
+
+    bool has_active_rec = false
+    S.active_rec := na
+    if array.size(g_recommendations) > 0
+        for i = array.size(g_recommendations) - 1 to 0
+            Recommendation r = array.get(g_recommendations, i)
+            if r.status == RS_ACTIVE
+                has_active_rec := true
+                S.active_rec := r
+                break
+
+    if S.current_arbitration.isApproved and not has_active_rec
+        int recId = S.next_rec_id
+        S.next_rec_id += 1
+        StrategyCandidate cand = StrategyCandidate.new(recId, S.current_selection.bestOverallPool, S.current_context, S.current_arbitration.direction, S.current_arbitration.entryPrice, S.current_arbitration.stopLoss, S.current_arbitration.takeProfit, "ICT_Liquidity_Sweep")
+        Recommendation newRec = Recommendation.new(recId, cand, RS_ACTIVE, bar_index, S.current_arbitration.entryPrice, S.current_arbitration.stopLoss)
+        array.push(g_recommendations, newRec)
+        S.active_rec := newRec
+        array.push(g_event_log, str.tostring(time, "HH:mm") + " REC_CREATE: Approved " + (S.current_arbitration.direction == TD_LONG ? "LONG" : "SHORT"))
+    S
+
+// =========================================================================
+// PHASE 9 COMPUTATION FUNCTION (Modules 1-9)
+// =========================================================================
+string P9_HTF_1 = input.timeframe("60",  "HTF 1", group="Phase 9 — MTF Structure")
+string P9_HTF_2 = input.timeframe("240", "HTF 2", group="Phase 9 — MTF Structure")
+string P9_HTF_3 = input.timeframe("D",   "HTF 3", group="Phase 9 — MTF Structure")
+
+f_get_htf_data(int lookback) =>
+    float h_ph = ta.pivothigh(high, lookback, lookback)
+    float h_pl = ta.pivotlow(low, lookback, lookback)
+    [h_ph, h_pl, close, time]
+
+[ph1, pl1, c1, t1] = request.security(syminfo.tickerid, P9_HTF_1, f_get_htf_data(SWING_LOOKBACK))
+[ph2, pl2, c2, t2] = request.security(syminfo.tickerid, P9_HTF_2, f_get_htf_data(SWING_LOOKBACK))
+[ph3, pl3, c3, t3] = request.security(syminfo.tickerid, P9_HTF_3, f_get_htf_data(SWING_LOOKBACK))
+
+f_get_latest_mtf_bias(string tf) =>
+    int bias = TD_NEUTRAL
+    int sz = array.size(g_mtf_registry)
+    if sz > 0
+        for i = sz - 1 to 0
+            MTFStructureInstance m = array.get(g_mtf_registry, i)
+            if m.timeframe == tf
+                bias := m.structuralBias
+                break
+    bias
+
+f_compute_p9(EngineState state) =>
+    EngineState S = state
+    bool _p8_integ = not na(S.current_context) and S.current_context.atr > 0
+
+    bool _liq_integ = _p8_integ and (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3)
+    if _p8_integ
+        if not na(ph1)
+            S.mtf_hi_1 := ph1
+        if not na(pl1)
+            S.mtf_lo_1 := pl1
+        if t1 != S.mtf_t_1
+            if not na(S.mtf_hi_1) and c1 > S.mtf_hi_1
+                if S.mtf_bias_1 == TD_SHORT
+                    S.mtf_choch_1 := TD_LONG
+                else
+                    S.mtf_bos_1 := TD_LONG
+                S.mtf_bias_1 := TD_LONG
+            if not na(S.mtf_lo_1) and c1 < S.mtf_lo_1
+                if S.mtf_bias_1 == TD_LONG
+                    S.mtf_choch_1 := TD_SHORT
+                else
+                    S.mtf_bos_1 := TD_SHORT
+                S.mtf_bias_1 := TD_SHORT
+            S.mtf_t_1 := t1
+        S.mtf_integ_1 := _p8_integ
+        bool mtf_changed_1 = S.mtf_bias_1 != S.mtf_l_bias_1 or S.mtf_bos_1 != S.mtf_l_bos_1 or S.mtf_choch_1 != S.mtf_l_choch_1 or S.mtf_integ_1 != S.mtf_l_integ_1 or S.mtf_ver_1 == 0
+        if mtf_changed_1
+            S.mtf_ver_1 := S.mtf_ver_1 == 0 ? 1 : S.mtf_ver_1 + 1
+            string baseId = "MTF-" + P9_HTF_1
+            string instId = baseId + "-v" + str.tostring(S.mtf_ver_1)
+            string prevId = S.mtf_ver_1 == 1 ? "" : baseId + "-v" + str.tostring(S.mtf_ver_1 - 1)
+            MTFStructureInstance inst = MTFStructureInstance.new(baseId, instId, prevId, "MTFStructure", "MTFStructureAdapter", bar_index, "Active", _p8_integ, "MTFStructureContract-1.0", P9_HTF_1, S.mtf_bias_1, S.mtf_bos_1, S.mtf_choch_1, time)
+            array.push(g_mtf_registry, inst)
+            if array.size(g_mtf_registry) > 100
+                array.shift(g_mtf_registry)
+            S.mtf_l_bias_1 := S.mtf_bias_1
+            S.mtf_l_bos_1 := S.mtf_bos_1
+            S.mtf_l_choch_1 := S.mtf_choch_1
+            S.mtf_l_integ_1 := S.mtf_integ_1
+
+        if not na(ph2)
+            S.mtf_hi_2 := ph2
+        if not na(pl2)
+            S.mtf_lo_2 := pl2
+        if t2 != S.mtf_t_2
+            if not na(S.mtf_hi_2) and c2 > S.mtf_hi_2
+                if S.mtf_bias_2 == TD_SHORT
+                    S.mtf_choch_2 := TD_LONG
+                else
+                    S.mtf_bos_2 := TD_LONG
+                S.mtf_bias_2 := TD_LONG
+            if not na(S.mtf_lo_2) and c2 < S.mtf_lo_2
+                if S.mtf_bias_2 == TD_LONG
+                    S.mtf_choch_2 := TD_SHORT
+                else
+                    S.mtf_bos_2 := TD_SHORT
+                S.mtf_bias_2 := TD_SHORT
+            S.mtf_t_2 := t2
+        S.mtf_integ_2 := _p8_integ
+        bool mtf_changed_2 = S.mtf_bias_2 != S.mtf_l_bias_2 or S.mtf_bos_2 != S.mtf_l_bos_2 or S.mtf_choch_2 != S.mtf_l_choch_2 or S.mtf_integ_2 != S.mtf_l_integ_2 or S.mtf_ver_2 == 0
+        if mtf_changed_2
+            S.mtf_ver_2 := S.mtf_ver_2 == 0 ? 1 : S.mtf_ver_2 + 1
+            string baseId = "MTF-" + P9_HTF_2
+            string instId = baseId + "-v" + str.tostring(S.mtf_ver_2)
+            string prevId = S.mtf_ver_2 == 1 ? "" : baseId + "-v" + str.tostring(S.mtf_ver_2 - 1)
+            MTFStructureInstance inst = MTFStructureInstance.new(baseId, instId, prevId, "MTFStructure", "MTFStructureAdapter", bar_index, "Active", _p8_integ, "MTFStructureContract-1.0", P9_HTF_2, S.mtf_bias_2, S.mtf_bos_2, S.mtf_choch_2, time)
+            array.push(g_mtf_registry, inst)
+            if array.size(g_mtf_registry) > 100
+                array.shift(g_mtf_registry)
+            S.mtf_l_bias_2 := S.mtf_bias_2
+            S.mtf_l_bos_2 := S.mtf_bos_2
+            S.mtf_l_choch_2 := S.mtf_choch_2
+            S.mtf_l_integ_2 := S.mtf_integ_2
+
+        if not na(ph3)
+            S.mtf_hi_3 := ph3
+        if not na(pl3)
+            S.mtf_lo_3 := pl3
+        if t3 != S.mtf_t_3
+            if not na(S.mtf_hi_3) and c3 > S.mtf_hi_3
+                if S.mtf_bias_3 == TD_SHORT
+                    S.mtf_choch_3 := TD_LONG
+                else
+                    S.mtf_bos_3 := TD_LONG
+                S.mtf_bias_3 := TD_LONG
+            if not na(S.mtf_lo_3) and c3 < S.mtf_lo_3
+                if S.mtf_bias_3 == TD_LONG
+                    S.mtf_choch_3 := TD_SHORT
+                else
+                    S.mtf_bos_3 := TD_SHORT
+                S.mtf_bias_3 := TD_SHORT
+            S.mtf_t_3 := t3
+        S.mtf_integ_3 := _p8_integ
+        bool mtf_changed_3 = S.mtf_bias_3 != S.mtf_l_bias_3 or S.mtf_bos_3 != S.mtf_l_bos_3 or S.mtf_choch_3 != S.mtf_l_choch_3 or S.mtf_integ_3 != S.mtf_l_integ_3 or S.mtf_ver_3 == 0
+        if mtf_changed_3
+            S.mtf_ver_3 := S.mtf_ver_3 == 0 ? 1 : S.mtf_ver_3 + 1
+            string baseId = "MTF-" + P9_HTF_3
+            string instId = baseId + "-v" + str.tostring(S.mtf_ver_3)
+            string prevId = S.mtf_ver_3 == 1 ? "" : baseId + "-v" + str.tostring(S.mtf_ver_3 - 1)
+            MTFStructureInstance inst = MTFStructureInstance.new(baseId, instId, prevId, "MTFStructure", "MTFStructureAdapter", bar_index, "Active", _p8_integ, "MTFStructureContract-1.0", P9_HTF_3, S.mtf_bias_3, S.mtf_bos_3, S.mtf_choch_3, time)
+            array.push(g_mtf_registry, inst)
+            if array.size(g_mtf_registry) > 100
+                array.shift(g_mtf_registry)
+            S.mtf_l_bias_3 := S.mtf_bias_3
+            S.mtf_l_bos_3 := S.mtf_bos_3
+            S.mtf_l_choch_3 := S.mtf_choch_3
+            S.mtf_l_integ_3 := S.mtf_integ_3
+
+    int LIQ_MAJOR_SCORE = 75
+    int LIQ_INTER_SCORE = 45
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool p = array.get(g_registry, i)
+            if _liq_integ and barstate.isconfirmed
+                if p.state == LS_ACTIVE
+                    int age = bar_index - p.createdAtBar
+                    float age_score = math.min(float(age), 200.0) / 200.0 * 40.0
+                    float touch_score = math.min(float(p.touchCount), 5.0) / 5.0 * 30.0
+                    float conf_score = p.confidence * 30.0
+                    float inst_score = age_score + touch_score + conf_score
+                    string tier_str = "Minor"
+                    if inst_score >= LIQ_MAJOR_SCORE
+                        tier_str := "Major"
+                    else if inst_score >= LIQ_INTER_SCORE
+                        tier_str := "Intermediate"
+                    int idx = array.indexof(g_liq_pool_ids, p.id)
+                    string ct = idx == -1 ? "" : array.get(g_liq_tier_map, idx)
+                    bool cs = idx == -1 ? false : array.get(g_liq_swept_map, idx)
+                    int curVer = idx == -1 ? 0 : array.get(g_liq_ver_map, idx)
+                    bool changed = false
+                    string prevId = ""
+                    int newVer = 1
+                    if curVer == 0
+                        changed := true
+                        array.push(g_liq_pool_ids, p.id)
+                        array.push(g_liq_tier_map, tier_str)
+                        array.push(g_liq_swept_map, p.isSwept)
+                        array.push(g_liq_ver_map, 1)
+                        array.push(g_liq_score_map, inst_score)
+                    else
+                        if ct != tier_str or cs != p.isSwept
+                            changed := true
+                            prevId  := "LIQ-" + str.tostring(p.id) + "-v" + str.tostring(curVer)
+                            newVer  := curVer + 1
+                            array.set(g_liq_tier_map, idx, tier_str)
+                            array.set(g_liq_swept_map, idx, p.isSwept)
+                            array.set(g_liq_ver_map, idx, newVer)
+                            array.set(g_liq_score_map, idx, inst_score)
+                    if changed
+                        string baseId = "LIQ-" + str.tostring(p.id)
+                        string instId = baseId + "-v" + str.tostring(newVer)
+                        LiquidityHierarchyInstance inst = LiquidityHierarchyInstance.new(baseId, instId, prevId, "LiquidityHierarchy", "LiquidityHierarchyEngine", bar_index, "Active", _liq_integ, "LiquidityHierarchyContract-1.0", p.id, tier_str, timeframe.period, p.priceLevel, p.isSwept, inst_score)
+                        array.push(g_liq_registry, inst)
+                        S.liq_total_emitted += 1
+                        if array.size(g_liq_registry) > 100
+                            array.shift(g_liq_registry)
+
+    bool pd_integ = _p8_integ and (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3)
+    if pd_integ and barstate.isconfirmed
+        float r_high = S.last_swing_high_price
+        float r_low = S.last_swing_low_price
+        float r_size = na
+        float eq_v = na
+        float pos_pct = 50.0
+        string zone = "Equilibrium"
+        if not na(r_high) and not na(r_low)
+            r_size := r_high - r_low
+            eq_v := r_low + (r_size * 0.5)
+            pos_pct := r_size == 0 ? 50.0 : ((close - r_low) / r_size) * 100.0
+            zone := pos_pct > 50.0 ? "Premium" : pos_pct < 50.0 ? "Discount" : "Equilibrium"
+        bool changed = false
+        string prevId = ""
+        int newVer = 1
+        int currentVer = S.pd_ver
+        if currentVer == 0
+            changed := true
+        else if S.pd_high != r_high or S.pd_low != r_low or S.pd_zone != zone or S.pd_integ != pd_integ
+            changed := true
+            prevId  := "PD-ARRAY-v" + str.tostring(currentVer)
+            newVer  := currentVer + 1
+        if changed
+            S.pd_ver := newVer
+            S.pd_high := r_high
+            S.pd_low := r_low
+            S.pd_zone := zone
+            S.pd_integ := pd_integ
+            string instId = "PD-ARRAY-v" + str.tostring(newVer)
+            PDArrayInstance inst = PDArrayInstance.new("PD-ARRAY", instId, prevId, "PDArray", "PDArrayEngine", bar_index, "Active", pd_integ, "PDArrayContract-1.0", r_high, r_low, r_size, eq_v, close, pos_pct, zone, time)
+            array.push(g_pd_registry, inst)
+            if array.size(g_pd_registry) > 100
+                array.shift(g_pd_registry)
+
+    bool fvg_integ = _p8_integ and (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3)
+    if fvg_integ and barstate.isconfirmed
+        if not na(high[3]) and not na(low[3])
+            if low[1] > high[3]
+                int newId = S.next_fvg_id
+                S.next_fvg_id += 1
+                string baseId = f_format_id("FVG", newId, 1)
+                array.push(g_fvg_base_id, baseId)
+                array.push(g_fvg_ver, 1)
+                array.push(g_fvg_top, low[1])
+                array.push(g_fvg_bot, high[3])
+                array.push(g_fvg_dir, TD_LONG)
+                array.push(g_fvg_state, "Active")
+                array.push(g_fvg_mit_pct, 0.0)
+                string instId = baseId
+                FVGInstance inst = FVGInstance.new(baseId, instId, "", "FVG", "FVGEngine", bar_index, "Active", fvg_integ, "FVGContract-1.0", TD_LONG, low[1], high[3], 0.0, 0, "", "", time)
+                array.push(g_fvg_registry, inst)
+                S.fvg_total_emitted += 1
+                
+                if S.current_correlation_id == "INIT"
+                    S.current_correlation_id := "FLOW-" + str.tostring(S.next_flow_id)
+                    S.next_flow_id += 1
+                
+                int evt_id = S.next_event_id
+                S.next_event_id += 1
+                S.event_total_emitted += 1
+                string meta_str = "Dir=LONG|Top=" + str.tostring(low[1]) + "|Bot=" + str.tostring(high[3])
+                _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_FVG, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "Bull FVG Created", meta_str, fvg_integ)
+                S.last_event_id := evt_id
+
+                if array.size(g_fvg_registry) > 200
+                    array.shift(g_fvg_registry)
+            else if high[1] < low[3]
+                int newId = S.next_fvg_id
+                S.next_fvg_id += 1
+                string baseId = f_format_id("FVG", newId, 1)
+                array.push(g_fvg_base_id, baseId)
+                array.push(g_fvg_ver, 1)
+                array.push(g_fvg_top, low[3])
+                array.push(g_fvg_bot, high[1])
+                array.push(g_fvg_dir, TD_SHORT)
+                array.push(g_fvg_state, "Active")
+                array.push(g_fvg_mit_pct, 0.0)
+                string instId = baseId
+                FVGInstance inst = FVGInstance.new(baseId, instId, "", "FVG", "FVGEngine", bar_index, "Active", fvg_integ, "FVGContract-1.0", TD_SHORT, low[3], high[1], 0.0, 0, "", "", time)
+                array.push(g_fvg_registry, inst)
+                S.fvg_total_emitted += 1
+                
+                if S.current_correlation_id == "INIT"
+                    S.current_correlation_id := "FLOW-" + str.tostring(S.next_flow_id)
+                    S.next_flow_id += 1
+                    
+                int evt_id = S.next_event_id
+                S.next_event_id += 1
+                S.event_total_emitted += 1
+                string meta_str = "Dir=SHORT|Top=" + str.tostring(low[3]) + "|Bot=" + str.tostring(high[1])
+                _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_FVG, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "Bear FVG Created", meta_str, fvg_integ)
+                S.last_event_id := evt_id
+
+                if array.size(g_fvg_registry) > 200
+                    array.shift(g_fvg_registry)
+                    
+        if array.size(g_fvg_base_id) > 0
+            for i = 0 to array.size(g_fvg_base_id) - 1
+                string state = array.get(g_fvg_state, i)
+                if state != "Full"
+                    int dir = array.get(g_fvg_dir, i)
+                    float top = array.get(g_fvg_top, i)
+                    float bot = array.get(g_fvg_bot, i)
+                    if (dir == TD_LONG and low < top + S.current_context.atr) or (dir == TD_SHORT and high > bot - S.current_context.atr)
+                        float cur_mit = array.get(g_fvg_mit_pct, i)
+                        float new_mit = cur_mit
+                        string new_state = state
+                        if dir == TD_LONG
+                            if low <= bot
+                                new_mit := 100.0
+                                new_state := "Full"
+                            else if low < top
+                                float gap_size = top - bot
+                                float pct = gap_size == 0 ? 0.0 : (top - low) / gap_size * 100.0
+                                if pct > new_mit
+                                    new_mit := pct
+                                    new_state := "Partial"
+                        else if dir == TD_SHORT
+                            if high >= top
+                                new_mit := 100.0
+                                new_state := "Full"
+                            else if high > bot
+                                float gap_size = top - bot
+                                float pct = gap_size == 0 ? 0.0 : (high - bot) / gap_size * 100.0
+                                if pct > new_mit
+                                    new_mit := pct
+                                    new_state := "Partial"
+                        if new_mit != cur_mit
+                            string baseId = array.get(g_fvg_base_id, i)
+                            int currentVer = array.get(g_fvg_ver, i)
+                            int newVer = currentVer + 1
+                            string prevId = baseId + "-v" + str.tostring(currentVer)
+                            string instId = baseId + "-v" + str.tostring(newVer)
+                            array.set(g_fvg_ver, i, newVer)
+                            array.set(g_fvg_state, i, new_state)
+                            array.set(g_fvg_mit_pct, i, new_mit)
+                            FVGInstance inst = FVGInstance.new(baseId, instId, prevId, "FVG", "FVGEngine", bar_index, new_state, fvg_integ, "FVGContract-1.0", dir, top, bot, new_mit, 0, "", "", time)
+                            array.push(g_fvg_registry, inst)
+                            S.fvg_total_emitted += 1
+                            if array.size(g_fvg_registry) > 200
+                                array.shift(g_fvg_registry)
+
+        if array.size(g_fvg_base_id) > 0
+            for i = array.size(g_fvg_base_id) - 1 to 0
+                if array.get(g_fvg_state, i) == "Full"
+                    array.remove(g_fvg_base_id, i)
+                    array.remove(g_fvg_ver, i)
+                    array.remove(g_fvg_top, i)
+                    array.remove(g_fvg_bot, i)
+                    array.remove(g_fvg_dir, i)
+                    array.remove(g_fvg_state, i)
+                    array.remove(g_fvg_mit_pct, i)
+
+    bool ob_integ = _p8_integ and (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3)
+    if ob_integ and barstate.isconfirmed
+        if str.contains(S.struct_logs, "BOS (Bullish)")
+            int ob_bar = -1
+            float ob_h = na
+            float ob_l = na
+            for i = 1 to 20
+                if close[i] < open[i]
+                    ob_bar := i
+                    ob_h := high[i]
+                    ob_l := low[i]
+                    break
+            if ob_bar != -1
+                int newId = S.next_ob_id
+                S.next_ob_id += 1
+                string baseId = f_format_id("OB", newId, 1)
+                array.push(g_ob_base_id, baseId)
+                array.push(g_ob_ver, 1)
+                array.push(g_ob_dir, TD_LONG)
+                array.push(g_ob_high, ob_h)
+                array.push(g_ob_low, ob_l)
+                array.push(g_ob_state, "Active")
+                array.push(g_ob_mit_pct, 0.0)
+                string instId = baseId
+                OBInstance inst = OBInstance.new(baseId, instId, "", "OB", "OrderBlockEngine", bar_index, "Active", ob_integ, "OrderBlockContract-1.0", TD_LONG, ob_h, ob_l, 0.0)
+                array.push(g_ob_registry, inst)
+                S.ob_total_emitted += 1
+                
+                if S.current_correlation_id == "INIT"
+                    S.current_correlation_id := "FLOW-" + str.tostring(S.next_flow_id)
+                    S.next_flow_id += 1
+                    
+                int evt_id = S.next_event_id
+                S.next_event_id += 1
+                S.event_total_emitted += 1
+                string meta_str = "Dir=LONG|High=" + str.tostring(ob_h) + "|Low=" + str.tostring(ob_l)
+                _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_OB, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "Bull OB Created", meta_str, ob_integ)
+                S.last_event_id := evt_id
+
+                if array.size(g_ob_registry) > 200
+                    array.shift(g_ob_registry)
+        else if str.contains(S.struct_logs, "BOS (Bearish)")
+            int ob_bar = -1
+            float ob_h = na
+            float ob_l = na
+            for i = 1 to 20
+                if close[i] > open[i]
+                    ob_bar := i
+                    ob_h := high[i]
+                    ob_l := low[i]
+                    break
+            if ob_bar != -1
+                int newId = S.next_ob_id
+                S.next_ob_id += 1
+                string baseId = f_format_id("OB", newId, 1)
+                array.push(g_ob_base_id, baseId)
+                array.push(g_ob_ver, 1)
+                array.push(g_ob_dir, TD_SHORT)
+                array.push(g_ob_high, ob_h)
+                array.push(g_ob_low, ob_l)
+                array.push(g_ob_state, "Active")
+                array.push(g_ob_mit_pct, 0.0)
+                string instId = baseId
+                OBInstance inst = OBInstance.new(baseId, instId, "", "OB", "OrderBlockEngine", bar_index, "Active", ob_integ, "OrderBlockContract-1.0", TD_SHORT, ob_h, ob_l, 0.0)
+                array.push(g_ob_registry, inst)
+                S.ob_total_emitted += 1
+                
+                if S.current_correlation_id == "INIT"
+                    S.current_correlation_id := "FLOW-" + str.tostring(S.next_flow_id)
+                    S.next_flow_id += 1
+                    
+                int evt_id = S.next_event_id
+                S.next_event_id += 1
+                S.event_total_emitted += 1
+                string meta_str = "Dir=SHORT|High=" + str.tostring(ob_h) + "|Low=" + str.tostring(ob_l)
+                _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_OB, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "Bear OB Created", meta_str, ob_integ)
+                S.last_event_id := evt_id
+
+                if array.size(g_ob_registry) > 200
+                    array.shift(g_ob_registry)
+                
+        if array.size(g_ob_base_id) > 0
+            for i = 0 to array.size(g_ob_base_id) - 1
+                string state = array.get(g_ob_state, i)
+                if state != "Invalidated"
+                    int dir = array.get(g_ob_dir, i)
+                    float ob_h = array.get(g_ob_high, i)
+                    float ob_l = array.get(g_ob_low, i)
+                    if (dir == TD_LONG and low < ob_h + S.current_context.atr) or (dir == TD_SHORT and high > ob_l - S.current_context.atr)
+                        float cur_mit = array.get(g_ob_mit_pct, i)
+                        float new_mit = cur_mit
+                        string new_state = state
+                        if dir == TD_LONG
+                            if close < ob_l
+                                new_state := "Invalidated"
+                            else
+                                if low <= ob_l
+                                    new_mit := 100.0
+                                else if low < ob_h
+                                    float ob_size = ob_h - ob_l
+                                    new_mit := ob_size == 0 ? 0.0 : (ob_h - low) / ob_size * 100.0
+                                if new_mit > 0
+                                    new_state := new_mit == 100.0 ? "Fully Mitigated" : "Mitigated"
+                        else if dir == TD_SHORT
+                            if close > ob_h
+                                new_state := "Invalidated"
+                            else
+                                if high >= ob_h
+                                    new_mit := 100.0
+                                else if high > ob_l
+                                    float ob_size = ob_h - ob_l
+                                    new_mit := ob_size == 0 ? 0.0 : (high - ob_l) / ob_size * 100.0
+                                if new_mit > 0
+                                    new_state := new_mit == 100.0 ? "Fully Mitigated" : "Mitigated"
+                        if new_mit != cur_mit or new_state != state
+                            string baseId = array.get(g_ob_base_id, i)
+                            int currentVer = array.get(g_ob_ver, i)
+                            int newVer = currentVer + 1
+                            string prevId = baseId + "-v" + str.tostring(currentVer)
+                            string instId = baseId + "-v" + str.tostring(newVer)
+                            array.set(g_ob_ver, i, newVer)
+                            array.set(g_ob_state, i, new_state)
+                            array.set(g_ob_mit_pct, i, new_mit)
+                            OBInstance inst = OBInstance.new(baseId, instId, prevId, "OB", "OrderBlockEngine", bar_index, new_state, ob_integ, "OrderBlockContract-1.0", dir, ob_h, ob_l, new_mit)
+                            array.push(g_ob_registry, inst)
+                            S.ob_total_emitted += 1
+                            if array.size(g_ob_registry) > 200
+                                array.shift(g_ob_registry)
+
+        if array.size(g_ob_base_id) > 0
+            for i = array.size(g_ob_base_id) - 1 to 0
+                if array.get(g_ob_state, i) == "Invalidated"
+                    array.remove(g_ob_base_id, i)
+                    array.remove(g_ob_ver, i)
+                    array.remove(g_ob_dir, i)
+                    array.remove(g_ob_high, i)
+                    array.remove(g_ob_low, i)
+                    array.remove(g_ob_state, i)
+                    array.remove(g_ob_mit_pct, i)
+
+    bool p9_mss_integ = _p8_integ and (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3)
+    if p9_mss_integ and barstate.isconfirmed
+        S.mss_last_eval_bar := bar_index
+        float disp_close_pct = 0.25
+        float min_swing_atr = 0.5
+        
+        if str.contains(S.struct_logs, "CHoCH (Bullish)")
+            S.mss_diag_bar := bar_index
+            float trig_px = S.last_swing_high_price
+            float trig_rg = high - low
+            float disp_dist = math.abs(close - trig_px)
+            float disp_str = S.current_context.atr == 0 ? 0.0 : disp_dist / S.current_context.atr
+            bool valid_disp = close >= (low + (trig_rg * disp_close_pct))
+            bool valid_dist = disp_dist >= (min_swing_atr * S.current_context.atr)
+            if not valid_disp
+                S.mss_diag_reason := "Failed: Insufficient displacement close"
+            else if not valid_dist
+                S.mss_diag_reason := "Failed: Min swing distance not met"
+            else
+                S.mss_diag_reason := "SUCCESS: MSS Created (Bullish)"
+                bool brk_cand = false
+                if array.size(g_ob_registry) > 0
+                    int start_idx = math.max(0, array.size(g_ob_registry) - 20)
+                    for i = array.size(g_ob_registry) - 1 to start_idx
+                        OBInstance ob = array.get(g_ob_registry, i)
+                        if ob.status == "Invalidated" and ob.createdAt == bar_index and ob.direction != TD_LONG
+                            brk_cand := true
+                            break
+                int newId = S.next_mss_id
+                S.next_mss_id += 1
+                string baseId = f_format_id("MSS", newId, 1)
+                array.push(g_mss_base_id, baseId)
+                array.push(g_mss_ver, 1)
+                array.push(g_mss_dir, TD_LONG)
+                array.push(g_mss_state, "Active")
+                array.push(g_mss_trigger_px, trig_px)
+                array.push(g_mss_trigger_bar, bar_index)
+                array.push(g_mss_trigger_rg, trig_rg)
+                array.push(g_mss_disp_str, disp_str)
+                array.push(g_mss_breaker, brk_cand)
+                string instId = baseId
+                MSSInstance inst = MSSInstance.new(baseId, instId, "", "MSS", "MSSEngine", bar_index, "Active", p9_mss_integ, "MSSContract-1.0", TD_LONG, bar_index, trig_px, trig_rg, disp_str, "", brk_cand)
+                array.push(g_mss_registry, inst)
+                S.mss_total_emitted += 1
+                
+                S.current_correlation_id := "FLOW-" + str.tostring(S.next_flow_id)
+                S.next_flow_id += 1
+                
+                int evt_id = S.next_event_id
+                S.next_event_id += 1
+                S.event_total_emitted += 1
+                string meta_str = "Dir=LONG|Trig=" + str.tostring(trig_px)
+                _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_MSS, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "Bull MSS Created", meta_str, p9_mss_integ)
+                S.last_event_id := evt_id
+
+                if array.size(g_mss_registry) > 200
+                    array.shift(g_mss_registry)
+        else if str.contains(S.struct_logs, "CHoCH (Bearish)")
+            S.mss_diag_bar := bar_index
+            float trig_px = S.last_swing_low_price
+            float trig_rg = high - low
+            float disp_dist = math.abs(close - trig_px)
+            float disp_str = S.current_context.atr == 0 ? 0.0 : disp_dist / S.current_context.atr
+            bool valid_disp = close <= (high - (trig_rg * disp_close_pct))
+            bool valid_dist = disp_dist >= (min_swing_atr * S.current_context.atr)
+            if not valid_disp
+                S.mss_diag_reason := "Failed: Insufficient displacement close"
+            else if not valid_dist
+                S.mss_diag_reason := "Failed: Min swing distance not met"
+            else
+                S.mss_diag_reason := "SUCCESS: MSS Created (Bearish)"
+                bool brk_cand = false
+                if array.size(g_ob_registry) > 0
+                    int start_idx = math.max(0, array.size(g_ob_registry) - 20)
+                    for i = array.size(g_ob_registry) - 1 to start_idx
+                        OBInstance ob = array.get(g_ob_registry, i)
+                        if ob.status == "Invalidated" and ob.createdAt == bar_index and ob.direction != TD_SHORT
+                            brk_cand := true
+                            break
+                int newId = S.next_mss_id
+                S.next_mss_id += 1
+                string baseId = f_format_id("MSS", newId, 1)
+                array.push(g_mss_base_id, baseId)
+                array.push(g_mss_ver, 1)
+                array.push(g_mss_dir, TD_SHORT)
+                array.push(g_mss_state, "Active")
+                array.push(g_mss_trigger_px, trig_px)
+                array.push(g_mss_trigger_bar, bar_index)
+                array.push(g_mss_trigger_rg, trig_rg)
+                array.push(g_mss_disp_str, disp_str)
+                array.push(g_mss_breaker, brk_cand)
+                string instId = baseId
+                MSSInstance inst = MSSInstance.new(baseId, instId, "", "MSS", "MSSEngine", bar_index, "Active", p9_mss_integ, "MSSContract-1.0", TD_SHORT, bar_index, trig_px, trig_rg, disp_str, "", brk_cand)
+                array.push(g_mss_registry, inst)
+                S.mss_total_emitted += 1
+                
+                S.current_correlation_id := "FLOW-" + str.tostring(S.next_flow_id)
+                S.next_flow_id += 1
+                
+                int evt_id = S.next_event_id
+                S.next_event_id += 1
+                S.event_total_emitted += 1
+                string meta_str = "Dir=SHORT|Trig=" + str.tostring(trig_px)
+                _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_MSS, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "Bear MSS Created", meta_str, p9_mss_integ)
+                S.last_event_id := evt_id
+
+                if array.size(g_mss_registry) > 200
+                    array.shift(g_mss_registry)
+        else
+            if na(S.mss_diag_bar)
+                S.mss_diag_reason := "No CHoCH detected"
+            else
+                S.mss_diag_reason := "Waiting for next CHoCH... (Last CHoCH eval bar: " + str.tostring(S.mss_diag_bar) + ")"
+                
+        if array.size(g_mss_base_id) > 0
+            for i = 0 to array.size(g_mss_base_id) - 1
+                string state = array.get(g_mss_state, i)
+                if state == "Active"
+                    int dir = array.get(g_mss_dir, i)
+                    float trig_px = array.get(g_mss_trigger_px, i)
+                    string new_state = state
+                    if dir == TD_LONG
+                        if close < trig_px
+                            new_state := "Invalidated"
+                    else if dir == TD_SHORT
+                        if close > trig_px
+                            new_state := "Invalidated"
+                    if new_state != state
+                        string baseId = array.get(g_mss_base_id, i)
+                        int currentVer = array.get(g_mss_ver, i)
+                        int newVer = currentVer + 1
+                        string prevId = baseId + "-v" + str.tostring(currentVer)
+                        string instId = baseId + "-v" + str.tostring(newVer)
+                        array.set(g_mss_ver, i, newVer)
+                        array.set(g_mss_state, i, new_state)
+                        MSSInstance inst = MSSInstance.new(baseId, instId, prevId, "MSS", "MSSEngine", bar_index, new_state, p9_mss_integ, "MSSContract-1.0", dir, array.get(g_mss_trigger_bar, i), array.get(g_mss_trigger_px, i), array.get(g_mss_trigger_rg, i), array.get(g_mss_disp_str, i), "", array.get(g_mss_breaker, i))
+                        array.push(g_mss_registry, inst)
+                        S.mss_total_emitted += 1
+                        if array.size(g_mss_registry) > 200
+                            array.shift(g_mss_registry)
+
+        if array.size(g_mss_base_id) > 0
+            for i = array.size(g_mss_base_id) - 1 to 0
+                if array.get(g_mss_state, i) == "Invalidated"
+                    array.remove(g_mss_base_id, i)
+                    array.remove(g_mss_ver, i)
+                    array.remove(g_mss_dir, i)
+                    array.remove(g_mss_state, i)
+                    array.remove(g_mss_trigger_px, i)
+                    array.remove(g_mss_trigger_bar, i)
+                    array.remove(g_mss_trigger_rg, i)
+                    array.remove(g_mss_disp_str, i)
+                    array.remove(g_mss_breaker, i)
+
+    bool p9_brk_integ = _p8_integ and (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3)
+    if p9_brk_integ and barstate.isconfirmed
+        S.brk_diag_bar := bar_index
+        S.brk_last_eval_bar := bar_index
+        S.brk_diag_ob_inv := false
+        S.brk_diag_mss_found := false
+        S.brk_stat_evals += 1
+        
+        if array.size(g_ob_base_id) > 0
+            for i = 0 to array.size(g_ob_base_id) - 1
+                string ob_state = array.get(g_ob_state, i)
+                string ob_base = array.get(g_ob_base_id, i)
+                int ob_ver = array.get(g_ob_ver, i)
+                string ob_inst = ob_base + "-v" + str.tostring(ob_ver)
+                bool just_inv = false
+                if array.size(g_ob_registry) > 0
+                    int start_idx = math.max(0, array.size(g_ob_registry) - 20)
+                    for j = array.size(g_ob_registry) - 1 to start_idx
+                        OBInstance last_ob = array.get(g_ob_registry, j)
+                        if last_ob.instanceId == ob_inst and last_ob.status == "Invalidated" and last_ob.createdAt == bar_index
+                            just_inv := true
+                            break
+                if just_inv
+                    S.brk_diag_ob_inv := true
+                    int ob_dir = array.get(g_ob_dir, i)
+                    float ob_h = array.get(g_ob_high, i)
+                    float ob_l = array.get(g_ob_low, i)
+                    int brk_dir = ob_dir == TD_LONG ? TD_SHORT : TD_LONG
+                    
+                    string src_mss_base = ""
+                    string src_mss_inst = ""
+                    int mss_dir = -1
+                    float mss_px = na
+                    int mss_bar = na
+                    if array.size(g_mss_registry) > 0
+                        for j = array.size(g_mss_registry) - 1 to 0
+                            MSSInstance m = array.get(g_mss_registry, j)
+                            if m.triggerBarIndex == bar_index
+                                src_mss_base := m.baseId
+                                src_mss_inst := m.instanceId
+                                mss_dir := m.direction
+                                mss_px := m.triggerPrice
+                                mss_bar := m.triggerBarIndex
+                                break
+                    
+                    if src_mss_base == ""
+                        S.brk_diag_mss_found := false
+                        S.brk_diag_reason := "Rejected: No MSS on invalidation bar"
+                        S.brk_stat_rej_no_mss += 1
+                    else if mss_dir != brk_dir
+                        S.brk_diag_reason := "Rejected: MSS direction mismatch"
+                        S.brk_stat_rej_direction += 1
+                    else
+                        S.brk_diag_mss_found := true
+                        string mss_type_str = mss_dir == TD_LONG ? "Bullish MSS" : "Bearish MSS"
+                        string conf_reason = "OB invalidated + " + mss_type_str
+                        S.brk_diag_reason := "Created BRK-" + str.tostring(S.next_brk_id) + "-v1 | " + conf_reason
+                        S.brk_stat_created += 1
+                        
+                        int newId = S.next_brk_id
+                        S.next_brk_id += 1
+                        string baseId = f_format_id("BRK", newId, 1)
+                        array.push(g_brk_base_id, baseId)
+                        array.push(g_brk_ver, 1)
+                        array.push(g_brk_dir, brk_dir)
+                        array.push(g_brk_high, ob_h)
+                        array.push(g_brk_low, ob_l)
+                        array.push(g_brk_state, "Active")
+                        array.push(g_brk_mit_pct, 0.0)
+                        array.push(g_brk_src_ob_base, ob_base)
+                        array.push(g_brk_src_ob_inst, ob_inst)
+                        array.push(g_brk_src_mss_base, src_mss_base)
+                        array.push(g_brk_src_mss_inst, src_mss_inst)
+                        array.push(g_brk_orig_time, time)
+                        array.push(g_brk_orig_bias, S.mtf_bias_3)
+                        array.push(g_brk_orig_pd, S.pd_zone)
+                        array.push(g_brk_orig_liq, "None")
+                        array.push(g_brk_conf_reason, conf_reason)
+                        array.push(g_brk_orig_mss_px, mss_px)
+                        array.push(g_brk_orig_mss_bar, mss_bar)
+                        
+                        string instId = baseId
+                        BreakerBlockInstance inst = BreakerBlockInstance.new(baseId, instId, "", "BreakerBlock", "BreakerBlockEngine", bar_index, "Active", p9_brk_integ, "BreakerBlockContract-1.0", brk_dir, ob_h, ob_l, 0.0, ob_base, ob_inst, src_mss_base, src_mss_inst, time, S.mtf_bias_3, S.pd_zone, "None", conf_reason, mss_px, mss_bar)
+                        array.push(g_brk_registry, inst)
+                        S.brk_total_emitted += 1
+                        
+                        int evt_id = S.next_event_id
+                        S.next_event_id += 1
+                        S.event_total_emitted += 1
+                        string meta_str = "ObBase=" + ob_base + "|MssBase=" + src_mss_base
+                        _ = f_bus_emit(evt_id, S.last_event_id, S.current_correlation_id, MOD_BRK, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, (brk_dir == TD_LONG ? "Bull" : "Bear") + " Breaker Created", meta_str, p9_brk_integ)
+                        S.last_event_id := evt_id
+
+                        if array.size(g_brk_registry) > 200
+                            array.shift(g_brk_registry)
+
+        if not S.brk_diag_ob_inv
+            S.brk_diag_reason := "Waiting for OB Invalidation"
+            S.brk_stat_waiting += 1
+                
+        if array.size(g_brk_base_id) > 0
+            for i = 0 to array.size(g_brk_base_id) - 1
+                string state = array.get(g_brk_state, i)
+                if state != "Invalidated"
+                    int dir = array.get(g_brk_dir, i)
+                    float brk_h = array.get(g_brk_high, i)
+                    float brk_l = array.get(g_brk_low, i)
+                    if (dir == TD_LONG and low < brk_h + S.current_context.atr) or (dir == TD_SHORT and high > brk_l - S.current_context.atr)
+                        float cur_mit = array.get(g_brk_mit_pct, i)
+                        float new_mit = cur_mit
+                        string new_state = state
+                        if dir == TD_LONG
+                            if close < brk_l
+                                new_state := "Invalidated"
+                            else
+                                if low <= brk_l
+                                    new_mit := 100.0
+                                else if low < brk_h
+                                    float brk_size = brk_h - brk_l
+                                    new_mit := brk_size == 0 ? 0.0 : (brk_h - low) / brk_size * 100.0
+                                if new_mit > 0
+                                    new_state := new_mit == 100.0 ? "Fully Mitigated" : "Mitigated"
+                        else if dir == TD_SHORT
+                            if close > brk_h
+                                new_state := "Invalidated"
+                            else
+                                if high >= brk_h
+                                    new_mit := 100.0
+                                else if high > brk_l
+                                    float brk_size = brk_h - brk_l
+                                    new_mit := brk_size == 0 ? 0.0 : (high - brk_l) / brk_size * 100.0
+                                if new_mit > 0
+                                    new_state := new_mit == 100.0 ? "Fully Mitigated" : "Mitigated"
+                        if new_mit != cur_mit or new_state != state
+                            string baseId = array.get(g_brk_base_id, i)
+                            int currentVer = array.get(g_brk_ver, i)
+                            int newVer = currentVer + 1
+                            string prevId = baseId + "-v" + str.tostring(currentVer)
+                            string instId = baseId + "-v" + str.tostring(newVer)
+                            array.set(g_brk_ver, i, newVer)
+                            array.set(g_brk_state, i, new_state)
+                            array.set(g_brk_mit_pct, i, new_mit)
+                            BreakerBlockInstance inst = BreakerBlockInstance.new(baseId, instId, prevId, "BreakerBlock", "BreakerBlockEngine", bar_index, new_state, p9_brk_integ, "BreakerBlockContract-1.0", dir, brk_h, brk_l, new_mit, array.get(g_brk_src_ob_base, i), array.get(g_brk_src_ob_inst, i), array.get(g_brk_src_mss_base, i), array.get(g_brk_src_mss_inst, i), array.get(g_brk_orig_time, i), array.get(g_brk_orig_bias, i), array.get(g_brk_orig_pd, i), array.get(g_brk_orig_liq, i), array.get(g_brk_conf_reason, i), array.get(g_brk_orig_mss_px, i), array.get(g_brk_orig_mss_bar, i))
+                            array.push(g_brk_registry, inst)
+                            S.brk_total_emitted += 1
+                            if array.size(g_brk_registry) > 200
+                                array.shift(g_brk_registry)
+
+        if array.size(g_brk_base_id) > 0
+            for i = array.size(g_brk_base_id) - 1 to 0
+                if array.get(g_brk_state, i) == "Invalidated"
+                    array.remove(g_brk_base_id, i)
+                    array.remove(g_brk_ver, i)
+                    array.remove(g_brk_dir, i)
+                    array.remove(g_brk_high, i)
+                    array.remove(g_brk_low, i)
+                    array.remove(g_brk_state, i)
+                    array.remove(g_brk_mit_pct, i)
+                    array.remove(g_brk_src_ob_base, i)
+                    array.remove(g_brk_src_ob_inst, i)
+                    array.remove(g_brk_src_mss_base, i)
+                    array.remove(g_brk_src_mss_inst, i)
+                    array.remove(g_brk_orig_time, i)
+                    array.remove(g_brk_orig_bias, i)
+                    array.remove(g_brk_orig_pd, i)
+                    array.remove(g_brk_orig_liq, i)
+                    array.remove(g_brk_conf_reason, i)
+                    array.remove(g_brk_orig_mss_px, i)
+                    array.remove(g_brk_orig_mss_bar, i)
+    else
+        if barstate.isconfirmed
+            S.brk_diag_reason := "Rejected: Integrity failed"
+            S.brk_stat_rej_integrity += 1
+            S.brk_last_eval_bar := bar_index
+
+    // =====================================================================
+    // MODULE 8: POI AGGREGATOR ENGINE
+    // =====================================================================
+    if barstate.isconfirmed and array.size(g_ob_base_id) > 0 and array.size(g_fvg_base_id) > 0
+        int ob_idx = array.size(g_ob_base_id) - 1
+        int fvg_idx = array.size(g_fvg_base_id) - 1
+        
+        float ob_h = array.get(g_ob_high, ob_idx)
+        float ob_l = array.get(g_ob_low, ob_idx)
+        float fvg_t = array.get(g_fvg_top, fvg_idx)
+        float fvg_b = array.get(g_fvg_bot, fvg_idx)
+        
+        if ob_h <= fvg_t and ob_l >= fvg_b
+            int poi_dir = array.get(g_ob_dir, ob_idx)
+            string poi_base = "POI-OB" + str.tostring(array.get(g_ob_base_id, ob_idx)) + "-FVG" + str.tostring(array.get(g_fvg_base_id, fvg_idx))
+            
+            if array.indexof(g_poi_base_id, poi_base) == -1
+                int gross_score = 0
+                int penalty_score = 0
+                string rationale = ""
+                array<string> pos_reasons = array.new<string>()
+                array<string> pen_reasons = array.new<string>()
+                
+                int htf_b = f_get_latest_mtf_bias(P9_HTF_3)
+                if htf_b == poi_dir
+                    gross_score += W_HTF
+                    array.push(pos_reasons, "HTF Aligned(+" + str.tostring(W_HTF) + ")")
+                else if htf_b != TD_NEUTRAL
+                    penalty_score += P_HTF_CONF
+                    array.push(pen_reasons, "HTF Conflict(" + str.tostring(P_HTF_CONF) + ")")
+                    
+                string liq_tier = "Minor"
+                if array.size(g_liq_pool_ids) > 0
+                    int liq_idx = array.indexof(g_liq_pool_ids, S.current_selection.bestOverallPool.id)
+                    if liq_idx != -1
+                        liq_tier := array.get(g_liq_tier_map, liq_idx)
+                if liq_tier == "Major"
+                    gross_score += W_LIQ
+                    array.push(pos_reasons, "Liq Major(+" + str.tostring(W_LIQ) + ")")
+                else if liq_tier == "Intermediate"
+                    gross_score += int(W_LIQ / 2)
+                    array.push(pos_reasons, "Liq Inter(+" + str.tostring(int(W_LIQ / 2)) + ")")
+                else
+                    penalty_score += P_LOW_LIQ
+                    array.push(pen_reasons, "Low Liq(" + str.tostring(P_LOW_LIQ) + ")")
+                    
+                if (poi_dir == TD_LONG and S.pd_zone == "Discount") or (poi_dir == TD_SHORT and S.pd_zone == "Premium")
+                    gross_score += W_PD
+                    array.push(pos_reasons, "PD Aligned(+" + str.tostring(W_PD) + ")")
+                else if (poi_dir == TD_LONG and S.pd_zone == "Premium") or (poi_dir == TD_SHORT and S.pd_zone == "Discount")
+                    penalty_score += P_PD_CONF
+                    array.push(pen_reasons, "PD Conflict(" + str.tostring(P_PD_CONF) + ")")
+                    
+                gross_score += W_FVG
+                array.push(pos_reasons, "FVG(+" + str.tostring(W_FVG) + ")")
+                gross_score += W_OB
+                array.push(pos_reasons, "OB(+" + str.tostring(W_OB) + ")")
+                
+                bool mss_valid = false
+                if array.size(g_mss_registry) > 0
+                    MSSInstance last_mss = array.get(g_mss_registry, array.size(g_mss_registry) - 1)
+                    if last_mss.direction == poi_dir and (bar_index - last_mss.triggerBarIndex < 100)
+                        mss_valid := true
+                if mss_valid
+                    gross_score += W_MSS
+                    array.push(pos_reasons, "MSS(+" + str.tostring(W_MSS) + ")")
+                else
+                    penalty_score += P_WEAK_DSP
+                    array.push(pen_reasons, "Weak Disp(" + str.tostring(P_WEAK_DSP) + ")")
+                    
+                bool brk_valid = false
+                if array.size(g_brk_registry) > 0
+                    BreakerBlockInstance last_brk = array.get(g_brk_registry, array.size(g_brk_registry) - 1)
+                    if last_brk.direction == poi_dir
+                        brk_valid := true
+                if brk_valid
+                    gross_score += W_BRK
+                    array.push(pos_reasons, "BRK(+" + str.tostring(W_BRK) + ")")
+                    
+                if S.current_context.currentSession == ST_OFF_SESSION
+                    penalty_score += P_SESS
+                    array.push(pen_reasons, "Off Sess(" + str.tostring(P_SESS) + ")")
+                    
+                int net_score = gross_score + penalty_score
+                
+                string grade = "Reject"
+                if net_score >= 95
+                    grade := "A+"
+                else if net_score >= 90
+                    grade := "A"
+                else if net_score >= 85
+                    grade := "A-"
+                else if net_score >= 80
+                    grade := "B+"
+                else if net_score >= 75
+                    grade := "B"
+                else if net_score >= 70
+                    grade := "B-"
+                else if net_score >= 60
+                    grade := "C"
+                    
+                if grade != "Reject"
+                    rationale := "Gross: " + str.tostring(gross_score) + " | Penalties: " + str.tostring(penalty_score) + " | Net: " + str.tostring(net_score) + "\nPos: " + array.join(pos_reasons, ", ") + "\nPen: " + array.join(pen_reasons, ", ")
+                    
+                    string instId = poi_base + "-v1"
+                    float poi_h = math.max(ob_h, fvg_t)
+                    float poi_l = math.min(ob_l, fvg_b)
+                    float center = (poi_h + poi_l) / 2.0
+                    
+                    string poi_corr = S.current_correlation_id == "INIT" ? "FLOW-" + str.tostring(S.next_flow_id) : S.current_correlation_id
+                    if S.current_correlation_id == "INIT"
+                        S.next_flow_id += 1
+                        S.current_correlation_id := poi_corr
+                        
+                    POIInstance poi_inst = POIInstance.new(poi_base, instId, "", "POI", "POIAggregator", bar_index, "Active", true, "POIContract-1.0", "OB+FVG", poi_dir, poi_h, poi_l, center, S.current_context.currentSession, htf_b, S.pd_zone, liq_tier, array.get(g_fvg_base_id, fvg_idx), array.get(g_ob_base_id, ob_idx), mss_valid ? array.get(g_mss_base_id, array.size(g_mss_base_id)-1) : "", brk_valid ? array.get(g_brk_base_id, array.size(g_brk_base_id)-1) : "", net_score, grade, rationale, poi_corr)
+                    array.push(g_poi_registry, poi_inst)
+                    array.push(g_poi_base_id, poi_base)
+                    array.push(g_poi_ver, 1)
+                    array.push(g_poi_state, "Active")
+                    array.push(g_poi_high, poi_h)
+                    array.push(g_poi_low, poi_l)
+                    array.push(g_poi_dir, poi_dir)
+                    array.push(g_poi_score, net_score)
+                    array.push(g_poi_grade, grade)
+                    array.push(g_poi_type, "OB+FVG")
+                    array.push(g_poi_links, array.get(g_ob_base_id, ob_idx) + " | " + array.get(g_fvg_base_id, fvg_idx))
+                    array.push(g_poi_rationale, rationale)
+                    
+                    S.poi_total_emitted += 1
+                    S.poi_latest_grade := grade
+                    S.poi_latest_score := net_score
+                    S.poi_latest_type := "OB+FVG"
+                    S.poi_latest_dir := poi_dir
+                    S.poi_latest_rationale := rationale
+                    if net_score > S.poi_highest_score
+                        S.poi_highest_score := net_score
+                        
+                    int evt_id = S.next_event_id
+                    S.next_event_id += 1
+                    S.event_total_emitted += 1
+                    string meta_str = "Score=" + str.tostring(net_score) + "|Grade=" + grade
+                    _ = f_bus_emit(evt_id, S.last_event_id, poi_corr, MOD_POI, EVENT_CREATE, SEV_INFO, "SUCCESS", instId, "POI Created: " + grade, meta_str, true)
+                    S.last_event_id := evt_id
+                    
+                    if array.size(g_poi_registry) > 50
+                        array.shift(g_poi_registry)
+                        array.shift(g_poi_base_id)
+                        array.shift(g_poi_ver)
+                        array.shift(g_poi_state)
+                        array.shift(g_poi_high)
+                        array.shift(g_poi_low)
+                        array.shift(g_poi_dir)
+                        array.shift(g_poi_score)
+                        array.shift(g_poi_grade)
+                        array.shift(g_poi_type)
+                        array.shift(g_poi_links)
+                        array.shift(g_poi_rationale)
+    S
+
+// =========================================================================
+// MODULE 10: TRADE RATING ENGINE COMPUTATION
+// =========================================================================
+f_compute_m10(EngineState state) =>
+    EngineState S = state
+    if barstate.isconfirmed
+        string action = "WAIT"
+        int dir = S.current_arbitration.direction
+        float entry = S.current_arbitration.entryPrice
+        float sl = S.current_arbitration.stopLoss
+        float tp = S.current_arbitration.takeProfit
+        float rr = S.current_strategy.riskReward
+        string rating = S.poi_latest_grade
+        int score = S.poi_latest_score
+        
+        int risk_score = rr <= 0 ? 100 : math.max(0, math.min(100, int((4.0 - rr) / 4.0 * 100.0)))
+        
+        string reasons = ""
+        string penalties = ""
+        array<string> _conf_factors_arr = array.new<string>()
+        
+        int htf_b = f_get_latest_mtf_bias(P9_HTF_3)
+        if htf_b == dir
+            reasons += "HTF Aligned "
+            array.push(_conf_factors_arr, "HTF Alignment")
+        else if htf_b != TD_NEUTRAL
+            penalties += "HTF Conflict "
+            
+        if (dir == TD_LONG and S.pd_zone == "Discount") or (dir == TD_SHORT and S.pd_zone == "Premium")
+            reasons += "PD Aligned "
+            array.push(_conf_factors_arr, "Discount Zone")
+        else if (dir == TD_LONG and S.pd_zone == "Premium") or (dir == TD_SHORT and S.pd_zone == "Discount")
+            penalties += "PD Conflict "
+            
+        if S.current_sweep_validation.isSwept
+            reasons += "Liq Sweep "
+            array.push(_conf_factors_arr, "Sweep")
+        else
+            penalties += "No Sweep "
+            
+        bool poi_valid = array.size(g_poi_base_id) > 0 and array.get(g_poi_state, array.size(g_poi_base_id)-1) == "Active"
+        if poi_valid
+            reasons += "POI Active "
+            array.push(_conf_factors_arr, "POI")
+        else
+            penalties += "No POI "
+
+        if poi_valid and array.size(g_poi_registry) > 0
+            POIInstance last_poi = array.get(g_poi_registry, array.size(g_poi_registry)-1)
+            if last_poi.baseId == array.get(g_poi_base_id, array.size(g_poi_base_id)-1)
+                if last_poi.brkLink != ""
+                    array.push(_conf_factors_arr, "Breaker")
+                if last_poi.mssLink != ""
+                    array.push(_conf_factors_arr, "MSS")
+                if last_poi.obLink != ""
+                    array.push(_conf_factors_arr, "OB")
+                if last_poi.fvgLink != ""
+                    array.push(_conf_factors_arr, "FVG")
+            
+        if S.current_arbitration.isApproved and score >= 60
+            action := dir == TD_LONG ? "BUY" : "SELL"
+        else if not S.current_validation.isReady
+            action := "AVOID"
+            penalties += "Validation Failed "
+        else if not S.current_arbitration.isApproved
+            action := "WAIT"
+            penalties += "Arb Rejected "
+        else if score < 60
+            action := "AVOID"
+            penalties += "Low Confidence "
+            
+        bool should_emit = true
+        string current_poi_id = array.size(g_poi_base_id) > 0 ? array.get(g_poi_base_id, array.size(g_poi_base_id)-1) : "N/A"
+        
+        if array.size(g_trade_rec_registry) > 0
+            TradeRecommendationInstance last_rec = array.get(g_trade_rec_registry, array.size(g_trade_rec_registry)-1)
+            if last_rec.action == action and last_rec.confidence == score and last_rec.poiLink == current_poi_id
+                should_emit := false
+                
+        if should_emit
+            string p_poi = current_poi_id
+            string p_brk = "N/A"
+            string p_mss = "N/A"
+            string p_ob  = "N/A"
+            string p_fvg = "N/A"
+            
+            if p_poi != "N/A" and array.size(g_poi_registry) > 0
+                POIInstance last_poi = array.get(g_poi_registry, array.size(g_poi_registry)-1)
+                if last_poi.baseId == p_poi
+                    p_brk := last_poi.brkLink == "" ? "N/A" : last_poi.brkLink
+                    p_mss := last_poi.mssLink == "" ? "N/A" : last_poi.mssLink
+                    p_ob  := last_poi.obLink  == "" ? "N/A" : last_poi.obLink
+                    p_fvg := last_poi.fvgLink == "" ? "N/A" : last_poi.fvgLink
+
+            string p_liq = "N/A"
+            if not na(S.current_selection.bestOverallPool)
+                p_liq := "LIQ-" + str.tostring(S.current_selection.bestOverallPool.id)
+                
+            string p_htf = "N/A"
+            if array.size(g_mtf_registry) > 0
+                for i = array.size(g_mtf_registry) - 1 to 0
+                    MTFStructureInstance m = array.get(g_mtf_registry, i)
+                    if m.timeframe == P9_HTF_3
+                        p_htf := m.baseId
+                        break
+
+            string conf_factors_str = array.join(_conf_factors_arr, "|")
+            bool rec_integrity = (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3) and S.current_arbitration.isApproved and S.current_validation.isReady and score >= 60 and poi_valid
+
+            string newBaseId = na
+            int newVer = 1
+            int prevScore = 0
+            int scoreDelta = score
+            
+            if array.size(g_trade_rec_registry) > 0
+                TradeRecommendationInstance last_rec = array.get(g_trade_rec_registry, array.size(g_trade_rec_registry)-1)
+                bool is_same_opp = (last_rec.action == action) and (last_rec.direction == dir) and (last_rec.poiLink == p_poi) and (action == "BUY" or action == "SELL")
+                
+                if is_same_opp
+                    newBaseId := last_rec.baseId
+                    newVer := last_rec.version + 1
+                    prevScore := last_rec.confidence
+                    scoreDelta := score - prevScore
+                else
+                    newBaseId := f_format_id("TR", S.next_trade_rec_id, 1)
+                    S.next_trade_rec_id += 1
+                    newVer := 1
+                    prevScore := 0
+                    scoreDelta := score
+            else
+                newBaseId := f_format_id("TR", S.next_trade_rec_id, 1)
+                S.next_trade_rec_id += 1
+                newVer := 1
+                prevScore := 0
+                scoreDelta := score
+
+            string instId = newBaseId + "-v" + str.tostring(newVer)
+            
+            string tr_corr = "N/A"
+            if array.size(g_poi_registry) > 0 and p_poi != "N/A"
+                tr_corr := array.get(g_poi_registry, array.size(g_poi_registry)-1).correlationId
+            tr_corr := tr_corr == "INIT" ? "FLOW-" + str.tostring(S.next_flow_id) : tr_corr
+            if tr_corr == "FLOW-" + str.tostring(S.next_flow_id)
+                S.next_flow_id += 1
+                S.current_correlation_id := tr_corr
+            
+            TradeRecommendationInstance inst = TradeRecommendationInstance.new(newBaseId, instId, newVer, action, dir, rating, score, prevScore, scoreDelta, risk_score, rr, entry, sl, tp, p_poi, p_brk, p_mss, p_ob, p_fvg, p_liq, p_htf, conf_factors_str, reasons, penalties, rec_integrity, bar_index, tr_corr)
+            array.push(g_trade_rec_registry, inst)
+            array.push(g_trade_rec_base_id, instId)
+            array.push(g_trade_rec_action, action)
+            array.push(g_trade_rec_rating, rating)
+            array.push(g_trade_rec_score, score)
+            
+            S.trade_rec_total_emitted += 1
+            S.m10_latest_action := action
+            S.m10_latest_rating := rating
+            S.m10_latest_score := score
+            S.m10_latest_risk_score := risk_score
+            S.m10_latest_risk := risk_score <= 30 ? "Low" : risk_score <= 70 ? "Medium" : "High"
+            S.m10_latest_rr := rr
+            S.m10_latest_entry := entry
+            S.m10_latest_sl := sl
+            S.m10_latest_tp := tp
+            S.m10_latest_reasons := reasons
+            S.m10_latest_penalties := penalties
+            
+            int tr_sev = action == "BUY" or action == "SELL" ? SEV_INFO : SEV_WARNING
+            string tr_out = action == "BUY" or action == "SELL" ? "SUCCESS" : action == "AVOID" ? "REJECTED" : "SKIPPED"
+            
+            int evt_id = S.next_event_id
+            S.next_event_id += 1
+            S.event_total_emitted += 1
+            string meta_str = "RR=" + str.tostring(rr, "#.#") + "|Score=" + str.tostring(score) + "|Risk=" + str.tostring(risk_score)
+            _ = f_bus_emit(evt_id, S.last_event_id, tr_corr, MOD_TR, EVENT_EMIT, tr_sev, tr_out, instId, action + " " + rating + " (Score:" + str.tostring(score) + ", Δ" + str.tostring(scoreDelta) + ")", meta_str, rec_integrity)
+            S.last_event_id := evt_id
+
+            if array.size(g_trade_rec_registry) > 20
+                array.shift(g_trade_rec_registry)
+                array.shift(g_trade_rec_base_id)
+                array.shift(g_trade_rec_action)
+                array.shift(g_trade_rec_rating)
+                array.shift(g_trade_rec_score)
+    S
+
+// =========================================================================
+// MODULE 12: INSTITUTIONAL AUDIT ENGINE
+// =========================================================================
+// Pure helper to record ANY audit result (PASS, WARNING, FAIL, SKIPPED)
+f_record_audit_result(EngineState state, string type, int sev, string status, string objId, string mod, string corrId, string msg, string rec) =>
+    EngineState S = state
+    int aId = S.next_audit_id
+    S.next_audit_id += 1
+    S.audit_total_emitted += 1
+    
+    AuditResultInstance audit = AuditResultInstance.new(aId, type, sev, status, objId, mod, corrId, msg, rec, status == AUDIT_PASS, AUDIT_SCHEMA_VERSION, time, bar_index)
+    array.push(g_audit_registry, audit)
+    if array.size(g_audit_registry) > 250
+        array.shift(g_audit_registry)
+    
+    // Track per-cycle and lifetime counters
+    if status == AUDIT_FAIL
+        S.m12_cycle_failures += 1
+        S.lifetime_audit_failures += 1
+        if sev == SEV_ERROR or sev == SEV_CRITICAL
+            S.audit_last_failure_msg := type + ": " + msg
+    else if status == AUDIT_WARNING
+        S.m12_cycle_warnings += 1
+        S.lifetime_audit_warnings += 1
+    else if status == AUDIT_PASS
+        S.m12_cycle_passed += 1
+        S.lifetime_audit_passed += 1
+    else if status == AUDIT_SKIPPED
+        S.m12_cycle_skipped += 1
+    
+    // Emit event for critical failures only
+    if status == AUDIT_FAIL and (sev == SEV_ERROR or sev == SEV_CRITICAL)
+        int evt_id = S.next_event_id
+        S.next_event_id += 1
+        S.event_total_emitted += 1
+        _ = f_bus_emit(evt_id, S.last_event_id, corrId, MOD_AUDIT, EVENT_ERROR, sev, "FAILED", objId, "Audit Fail: " + msg, "Type=" + type + "|Rec=" + rec, false)
+        S.last_event_id := evt_id
+    S
+
+f_compute_m12(EngineState state) =>
+    EngineState S = state
+    if barstate.isconfirmed
+        // Reset cycle counters at start of each audit cycle (stateless trust score)
+        S.m12_cycle_failures := 0
+        S.m12_cycle_warnings := 0
+        S.m12_cycle_passed := 0
+        S.m12_cycle_skipped := 0
+        
+        bool is_heavy_cycle = bar_index % AUDIT_INTERVAL == 0
+        
+        // === LIGHTWEIGHT AUDIT (Every confirmed bar) ===
+        // Structural & Dependency Audit on latest Trade Recommendation
+        
+        if array.size(g_trade_rec_registry) > 0
+            TradeRecommendationInstance last_tr = array.get(g_trade_rec_registry, array.size(g_trade_rec_registry)-1)
+            
+            // Assertions
+            if last_tr.confidence < 0 or last_tr.confidence > 100
+                S := f_record_audit_result(S, AUDIT_STRUCTURE, SEV_ERROR, AUDIT_FAIL, last_tr.instanceId, "M10", last_tr.correlationId, "Score out of bounds (0-100)", "Recalculate score")
+            else
+                S := f_record_audit_result(S, AUDIT_STRUCTURE, SEV_INFO, AUDIT_PASS, last_tr.instanceId, "M10", last_tr.correlationId, "Score within bounds", "None")
+                
+            if last_tr.version <= 0
+                S := f_record_audit_result(S, AUDIT_STRUCTURE, SEV_ERROR, AUDIT_FAIL, last_tr.instanceId, "M10", last_tr.correlationId, "Invalid version number", "Re-emit recommendation")
+            else
+                S := f_record_audit_result(S, AUDIT_STRUCTURE, SEV_INFO, AUDIT_PASS, last_tr.instanceId, "M10", last_tr.correlationId, "Version valid", "None")
+            
+            // Full Dependency Traversal: Trade -> POI -> Breaker -> MSS -> OB -> FVG -> Liquidity -> HTF
+            bool poi_found = false
+            if array.size(g_poi_registry) > 0
+                POIInstance last_poi = array.get(g_poi_registry, array.size(g_poi_registry)-1)
+                if last_poi.baseId == last_tr.poiLink
+                    poi_found := true
+                    
+                    // Verify POI integrity
+                    if last_poi.integrity
+                        S := f_record_audit_result(S, AUDIT_STRUCTURE, SEV_INFO, AUDIT_PASS, last_poi.instanceId, "M8", last_tr.correlationId, "POI integrity verified", "None")
+                    else
+                        S := f_record_audit_result(S, AUDIT_STRUCTURE, SEV_WARNING, AUDIT_FAIL, last_poi.instanceId, "M8", last_tr.correlationId, "POI integrity flag is false", "Review POI creation")
+                    
+                    // Verify OB link
+                    if last_poi.obLink != "" and array.indexof(g_ob_base_id, last_poi.obLink) != -1
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_PASS, last_poi.obLink, "M5", last_tr.correlationId, "OB dependency exists", "None")
+                    else
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_ERROR, AUDIT_FAIL, last_poi.instanceId, "M8", last_tr.correlationId, "Missing Order Block dependency", "Invalidate POI")
+                        
+                    // Verify FVG link
+                    if last_poi.fvgLink != "" and array.indexof(g_fvg_base_id, last_poi.fvgLink) != -1
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_PASS, last_poi.fvgLink, "M4", last_tr.correlationId, "FVG dependency exists", "None")
+                    else
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_ERROR, AUDIT_FAIL, last_poi.instanceId, "M8", last_tr.correlationId, "Missing FVG dependency", "Invalidate POI")
+                        
+                    // Verify MSS link
+                    if last_poi.mssLink != ""
+                        if array.size(g_mss_base_id) > 0 and array.indexof(g_mss_base_id, last_poi.mssLink) != -1
+                            S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_PASS, last_poi.mssLink, "M6", last_tr.correlationId, "MSS dependency exists", "None")
+                        else
+                            S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_WARNING, AUDIT_FAIL, last_poi.instanceId, "M8", last_tr.correlationId, "MSS reference broken", "Update POI links")
+                    else
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_SKIPPED, last_poi.instanceId, "M6", last_tr.correlationId, "No MSS link (optional)", "None")
+                        
+                    // Verify Breaker link
+                    if last_poi.brkLink != ""
+                        if array.size(g_brk_base_id) > 0 and array.indexof(g_brk_base_id, last_poi.brkLink) != -1
+                            S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_PASS, last_poi.brkLink, "M7", last_tr.correlationId, "Breaker dependency exists", "None")
+                        else
+                            S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_WARNING, AUDIT_FAIL, last_poi.instanceId, "M8", last_tr.correlationId, "Breaker reference broken", "Update POI links")
+                    else
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_SKIPPED, last_poi.instanceId, "M7", last_tr.correlationId, "No Breaker link (optional)", "None")
+                        
+                    // Verify Liquidity link
+                    if last_tr.liqLink != "N/A"
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_PASS, last_tr.liqLink, "M2", last_tr.correlationId, "Liquidity dependency exists", "None")
+                    else
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_WARNING, AUDIT_FAIL, last_tr.instanceId, "M2", last_tr.correlationId, "Missing Liquidity dependency", "Review trade creation")
+                        
+                    // Verify HTF link
+                    if last_tr.htfLink != "N/A"
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_INFO, AUDIT_PASS, last_tr.htfLink, "M1", last_tr.correlationId, "HTF dependency exists", "None")
+                    else
+                        S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_WARNING, AUDIT_FAIL, last_tr.instanceId, "M1", last_tr.correlationId, "Missing HTF dependency", "Review trade creation")
+                        
+            if not poi_found and last_tr.poiLink != "N/A"
+                S := f_record_audit_result(S, AUDIT_DEPENDENCY, SEV_ERROR, AUDIT_FAIL, last_tr.instanceId, "M10", last_tr.correlationId, "Missing POI dependency for Trade", "Reject Trade")
+        
+        // === HEAVY AUDIT (Every AUDIT_INTERVAL bars) ===
+        if is_heavy_cycle
+            // Registry Audit - check all registries for consistency
+            
+            // Check Event Registry consistency
+            if array.size(g_event_registry) > 0
+                int last_evt_id = array.get(g_event_registry, array.size(g_event_registry)-1).eventId
+                if last_evt_id == S.event_total_emitted
+                    S := f_record_audit_result(S, AUDIT_REGISTRY, SEV_INFO, AUDIT_PASS, "EVENT_REGISTRY", "M11", "SYS", "Event ID sequence valid", "None")
+                else
+                    S := f_record_audit_result(S, AUDIT_REGISTRY, SEV_WARNING, AUDIT_FAIL, "EVENT_REGISTRY", "M11", "SYS", "Event ID mismatch detected", "Review event emission logic")
+            
+            // Check POI registry for orphaned links - scan ALL, no break
+            if array.size(g_poi_registry) > 0
+                for i = 0 to array.size(g_poi_registry) - 1
+                    POIInstance p = array.get(g_poi_registry, i)
+                    if p.obLink != "" and array.indexof(g_ob_base_id, p.obLink) == -1
+                        S := f_record_audit_result(S, AUDIT_REGISTRY, SEV_ERROR, AUDIT_FAIL, p.instanceId, "M8", p.correlationId, "POI contains orphaned OB link", "Invalidate POI")
+                    if p.fvgLink != "" and array.indexof(g_fvg_base_id, p.fvgLink) == -1
+                        S := f_record_audit_result(S, AUDIT_REGISTRY, SEV_ERROR, AUDIT_FAIL, p.instanceId, "M8", p.correlationId, "POI contains orphaned FVG link", "Invalidate POI")
+                        
+            // Registry scan complete
+            S := f_record_audit_result(S, AUDIT_REGISTRY, SEV_INFO, AUDIT_PASS, "ALL_REGISTRIES", "M12", "SYS", "Registry scan complete", "None")
+            
+        // === COMPUTE TRUST SCORE FOR THIS CYCLE (stateless) ===
+        int cycle_score = 100
+        cycle_score := math.max(0, cycle_score - (S.m12_cycle_failures * 10))
+        cycle_score := math.max(0, cycle_score - (S.m12_cycle_warnings * 5))
+        S.m12_cycle_trust_score := cycle_score
+        
+        // Build and store audit summary
+        int cycle_total = S.m12_cycle_passed + S.m12_cycle_warnings + S.m12_cycle_failures + S.m12_cycle_skipped
+        string summary_str = "Cycle " + str.tostring(S.next_audit_cycle_id) + " | Pass=" + str.tostring(S.m12_cycle_passed) + " | Warn=" + str.tostring(S.m12_cycle_warnings) + " | Fail=" + str.tostring(S.m12_cycle_failures) + " | Skip=" + str.tostring(S.m12_cycle_skipped) + " | Trust=" + str.tostring(cycle_score)
+        S.m12_last_summary := summary_str
+        
+        AuditSummaryInstance summary = AuditSummaryInstance.new(S.next_audit_cycle_id, time, bar_index, cycle_score, cycle_total, S.m12_cycle_passed, S.m12_cycle_warnings, S.m12_cycle_failures, S.m12_cycle_skipped, summary_str)
+        array.push(g_audit_summary_registry, summary)
+        if array.size(g_audit_summary_registry) > 100
+            array.shift(g_audit_summary_registry)
+        
+        S.next_audit_cycle_id += 1
+        
+    S
+
+// =========================================================================
+// RENDER ENGINE FUNCTION
+// =========================================================================
+f_get_closest_indices(array<float> src_dist, int max_count, float max_d) =>
+    array<int> result = array.new<int>()
+    if array.size(src_dist) > 0 and not na(max_d)
+        array<float> temp_dist = array.copy(src_dist)
+        int sz = array.size(temp_dist)
+        for k = 0 to math.min(max_count, sz) - 1
+            int min_idx = -1
+            float min_dist = 9999999.0
+            for i = 0 to sz - 1
+                float d = array.get(temp_dist, i)
+                if not na(d) and d < min_dist and d <= max_d
+                    min_dist := d
+                    min_idx := i
+            if min_idx == -1
+                break
+            array.push(result, min_idx)
+            array.set(temp_dist, min_idx, 9999999.0)
+    result
+
+f_render_engine(EngineState state) =>
+    EngineState S = state
+    float max_render_dist = na(S.current_context.atr) ? 0.0 : MAX_RENDER_DIST_MULT * S.current_context.atr
+
+    if array.size(debug_lines) > 0
+        for i = 0 to array.size(debug_lines) - 1
+            line.delete(array.get(debug_lines, i))
+        array.clear(debug_lines)
+
+    S.drawn_fvg := 0
+    if array.size(fvg_boxes) > 0
+        for i = 0 to array.size(fvg_boxes) - 1
+            box.set_bgcolor(array.get(fvg_boxes, i), color.new(color.black, 100))
+            box.set_text(array.get(fvg_boxes, i), "")
+
+    if show_fvg_vis and array.size(g_fvg_base_id) > 0
+        array<float> fvg_dist = array.new<float>()
+        for i = 0 to array.size(g_fvg_base_id) - 1
+            float mid = (array.get(g_fvg_top, i) + array.get(g_fvg_bot, i)) / 2.0
+            array.push(fvg_dist, math.abs(close - mid))
+        array<int> indices = f_get_closest_indices(fvg_dist, MAX_VISUALS, max_render_dist)
+        if array.size(indices) > 0
+            while array.size(fvg_boxes) < array.size(indices)
+                array.push(fvg_boxes, box.new(na, na, na, na, text="", text_halign=text.align_center, text_size=size.tiny, text_color=color.white))
+            for k = 0 to array.size(indices) - 1
+                int i = array.get(indices, k)
+                if i < array.size(g_fvg_base_id)
+                    box b = array.get(fvg_boxes, k)
+                    string state = array.get(g_fvg_state, i)
+                    int dir = array.get(g_fvg_dir, i)
+                    color c = dir == TD_LONG ? C_BULL_FVG : C_BEAR_FVG
+                    if state == "Full"
+                        c := C_INV
+                    else if state == "Partial"
+                        c := C_MIT
+                    box.set_bgcolor(b, c)
+                    box.set_lefttop(b, bar_index - 50, array.get(g_fvg_top, i))
+                    box.set_rightbottom(b, bar_index, array.get(g_fvg_bot, i))
+                    string txt = (dir == TD_LONG ? "Bull FVG" : "Bear FVG") + "\n" + array.get(g_fvg_base_id, i) + "\n" + state
+                    box.set_text(b, txt)
+                    S.drawn_fvg += 1
+
+    S.drawn_ob := 0
+    if array.size(ob_boxes) > 0
+        for i = 0 to array.size(ob_boxes) - 1
+            box.set_bgcolor(array.get(ob_boxes, i), color.new(color.black, 100))
+            box.set_text(array.get(ob_boxes, i), "")
+
+    if show_ob_vis and array.size(g_ob_base_id) > 0
+        array<float> ob_dist = array.new<float>()
+        for i = 0 to array.size(g_ob_base_id) - 1
+            float mid = (array.get(g_ob_high, i) + array.get(g_ob_low, i)) / 2.0
+            array.push(ob_dist, math.abs(close - mid))
+        array<int> indices = f_get_closest_indices(ob_dist, MAX_VISUALS, max_render_dist)
+        if array.size(indices) > 0
+            while array.size(ob_boxes) < array.size(indices)
+                array.push(ob_boxes, box.new(na, na, na, na, text="", text_halign=text.align_center, text_size=size.tiny, text_color=color.white))
+            for k = 0 to array.size(indices) - 1
+                int i = array.get(indices, k)
+                if i < array.size(g_ob_base_id)
+                    box b = array.get(ob_boxes, k)
+                    string state = array.get(g_ob_state, i)
+                    int dir = array.get(g_ob_dir, i)
+                    color c = dir == TD_LONG ? C_BULL_OB : C_BEAR_OB
+                    if state == "Invalidated"
+                        c := C_INV
+                    else if state == "Mitigated" or state == "Fully Mitigated"
+                        c := C_MIT
+                    box.set_bgcolor(b, c)
+                    box.set_lefttop(b, bar_index - 50, array.get(g_ob_high, i))
+                    box.set_rightbottom(b, bar_index, array.get(g_ob_low, i))
+                    string txt = (dir == TD_LONG ? "Bull OB" : "Bear OB") + "\n" + array.get(g_ob_base_id, i) + "\n" + state
+                    box.set_text(b, txt)
+                    S.drawn_ob += 1
+
+    S.drawn_brk := 0
+    if array.size(brk_boxes) > 0
+        for i = 0 to array.size(brk_boxes) - 1
+            box.set_bgcolor(array.get(brk_boxes, i), color.new(color.black, 100))
+            box.set_text(array.get(brk_boxes, i), "")
+
+    if show_brk_vis and array.size(g_brk_base_id) > 0
+        array<float> brk_dist = array.new<float>()
+        for i = 0 to array.size(g_brk_base_id) - 1
+            float mid = (array.get(g_brk_high, i) + array.get(g_brk_low, i)) / 2.0
+            array.push(brk_dist, math.abs(close - mid))
+        array<int> indices = f_get_closest_indices(brk_dist, MAX_VISUALS, max_render_dist)
+        if array.size(indices) > 0
+            while array.size(brk_boxes) < array.size(indices)
+                array.push(brk_boxes, box.new(na, na, na, na, text="", text_halign=text.align_center, text_size=size.tiny, text_color=color.white))
+            for k = 0 to array.size(indices) - 1
+                int i = array.get(indices, k)
+                if i < array.size(g_brk_base_id)
+                    box b = array.get(brk_boxes, k)
+                    string state = array.get(g_brk_state, i)
+                    int dir = array.get(g_brk_dir, i)
+                    color c = C_BRK
+                    if state == "Invalidated"
+                        c := C_INV
+                    else if state == "Mitigated" or state == "Fully Mitigated"
+                        c := C_MIT
+                    box.set_bgcolor(b, c)
+                    box.set_lefttop(b, bar_index - 50, array.get(g_brk_high, i))
+                    box.set_rightbottom(b, bar_index, array.get(g_brk_low, i))
+                    string txt = (dir == TD_LONG ? "Bull BRK" : "Bear BRK") + "\n" + array.get(g_brk_base_id, i) + "\n" + state
+                    box.set_text(b, txt)
+                    S.drawn_brk += 1
+
+    S.drawn_poi := 0
+    if array.size(poi_boxes) > 0
+        for i = 0 to array.size(poi_boxes) - 1
+            box.set_bgcolor(array.get(poi_boxes, i), color.new(color.black, 100))
+            box.set_text(array.get(poi_boxes, i), "")
+
+    if show_poi_vis and array.size(g_poi_base_id) > 0
+        array<float> poi_dist = array.new<float>()
+        for i = 0 to array.size(g_poi_base_id) - 1
+            float mid = (array.get(g_poi_high, i) + array.get(g_poi_low, i)) / 2.0
+            array.push(poi_dist, math.abs(close - mid))
+        array<int> indices = f_get_closest_indices(poi_dist, MAX_VISUALS, max_render_dist)
+        if array.size(indices) > 0
+            while array.size(poi_boxes) < array.size(indices)
+                array.push(poi_boxes, box.new(na, na, na, na, text="", text_halign=text.align_center, text_size=size.tiny, text_color=color.white))
+            for k = 0 to array.size(indices) - 1
+                int i = array.get(indices, k)
+                if i < array.size(g_poi_base_id)
+                    box b = array.get(poi_boxes, k)
+                    string state = array.get(g_poi_state, i)
+                    if state == "Active"
+                        int dir = array.get(g_poi_dir, i)
+                        string grade = array.get(g_poi_grade, i)
+                        string ptype = array.get(g_poi_type, i)
+                        int score = array.get(g_poi_score, i)
+                        color c = C_POI
+                        box.set_bgcolor(b, c)
+                        box.set_lefttop(b, bar_index - 50, array.get(g_poi_high, i))
+                        box.set_rightbottom(b, bar_index, array.get(g_poi_low, i))
+                        string txt = grade + " " + (dir == TD_LONG ? "Bull" : "Bear") + "\n" + ptype + "\n" + str.tostring(score) + "pts"
+                        box.set_text(b, txt)
+                        S.drawn_poi += 1
+
+    if array.size(g_mss_base_id) > 0
+        while array.size(mss_labels) < array.size(g_mss_base_id)
+            mss_labels.push(label.new(na, na, text="", style=label.style_label_up, textcolor=color.white, size=size.tiny))
+        while array.size(mss_labels) > array.size(g_mss_base_id)
+            label.delete(array.pop(mss_labels))
+        for i = 0 to array.size(g_mss_base_id) - 1
+            label lbl = array.get(mss_labels, i)
+            string state = array.get(g_mss_state, i)
+            int dir = array.get(g_mss_dir, i)
+            float trig_px = array.get(g_mss_trigger_px, i)
+            int trig_bar = array.get(g_mss_trigger_bar, i)
+            if state == "Active"
+                if bar_index - trig_bar < 4900
+                    label.set_xy(lbl, trig_bar, trig_px)
+                    string txt = dir == TD_LONG ? "MSS↑" : "MSS↓"
+                    label.set_text(lbl, txt)
+                    label.set_color(lbl, dir == TD_LONG ? C_MSS_BULL : C_MSS_BEAR)
+                    label.set_style(lbl, dir == TD_LONG ? label.style_arrowup : label.style_arrowdown)
+                else
+                    label.set_text(lbl, "")
+            else
+                label.set_text(lbl, "")
+    else
+        while array.size(mss_labels) > 0
+            label.delete(array.pop(mss_labels))
+
+    if show_m10_vis and (S.m10_latest_action == "BUY" or S.m10_latest_action == "SELL")
+        if not na(S.m10_latest_entry) and not na(S.m10_latest_sl) and not na(S.m10_latest_tp)
+            line entry_line = line.new(bar_index - 10, S.m10_latest_entry, bar_index + 10, S.m10_latest_entry, color=color.blue, width=2)
+            line sl_line = line.new(bar_index - 10, S.m10_latest_sl, bar_index + 10, S.m10_latest_sl, color=color.red, width=2)
+            line tp_line = line.new(bar_index - 10, S.m10_latest_tp, bar_index + 10, S.m10_latest_tp, color=color.green, width=2)
+            array.push(debug_lines, entry_line)
+            array.push(debug_lines, sl_line)
+            array.push(debug_lines, tp_line)
+            label lbl = label.new(bar_index + 10, S.m10_latest_entry, text=S.m10_latest_action + " " + S.m10_latest_rating + " (" + str.tostring(S.m10_latest_score) + ")", style=label.style_label_left, color=color.blue, textcolor=color.white, size=size.small)
+    S
+
+// =========================================================================
+// DASHBOARD UI FUNCTION
+// =========================================================================
+f_dash_header(int row, string headerText) =>
+    table.cell(dash_table, 0, row, headerText, text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+    table.merge_cells(dash_table, 0, row, 1, row)
+    
+f_dash_data(int row, string label, string value) =>
+    table.cell(dash_table, 0, row, label, text_color=color.gray, text_size=size.tiny)
+    table.cell(dash_table, 1, row, value, text_color=color.white, text_size=size.tiny)
+
+f_update_dashboards(EngineState state) =>
+    EngineState S = state
+    if barstate.isfirst
+        table.cell(dash_table, 0, 0, "GOLD ICT PRO - PHASE 9", text_color=color.yellow, text_size=size.small, text_halign=text.align_center)
+        table.merge_cells(dash_table, 0, 0, 1, 0)
+        
+        f_dash_header(1, "ENGINE STATUS")
+        f_dash_data(2, "Engine Version", ENGINE_VERSION)
+        f_dash_data(3, "Build Status", "Stable")
+        f_dash_data(4, "Current Module", "M12: Institutional Audit")
+        f_dash_data(5, "Engine Health", "Online")
+        
+        f_dash_header(6, "MARKET STRUCTURE")
+        f_dash_data(7, "Current Session", "Waiting...")
+        f_dash_data(8, "Market Status", "N/A")
+        f_dash_data(9, "Time", "00:00")
+        f_dash_data(10, "Trend", "Neutral")
+        f_dash_data(11, "BOS", "Waiting...")
+        f_dash_data(12, "CHoCH", "Waiting...")
+        f_dash_data(13, "Market Zone", "N/A")
+        
+        f_dash_header(14, "LIQUIDITY STATUS")
+        f_dash_data(15, "Bullish Pools", "0")
+        f_dash_data(16, "Bearish Pools", "0")
+        f_dash_data(17, "Active Pools", "0")
+        f_dash_data(18, "Swept Pools", "0")
+        f_dash_data(19, "Reinforced Pools", "0")
+        f_dash_data(20, "Invalidated Pools", "0")
+        f_dash_data(21, "Expired Pools", "0")
+        
+        f_dash_header(22, "STRATEGY & ARBITRATION")
+        f_dash_data(23, "Strat Status", "Inactive")
+        f_dash_data(24, "Strat Direction", "N/A")
+        f_dash_data(25, "Strat Entry", "N/A")
+        f_dash_data(26, "Strat SL / TP", "N/A")
+        f_dash_data(27, "Strat Risk:Reward", "0")
+        f_dash_data(28, "Strat Confidence", "0")
+        f_dash_data(29, "Arb Status", "N/A")
+        f_dash_data(30, "Arb Reason", "N/A")
+        
+        f_dash_header(31, "RECOMMENDATION")
+        f_dash_data(32, "Rec Status", "No Active Rec")
+        f_dash_data(33, "Rec Direction", "N/A")
+        f_dash_data(34, "Rec Entry", "N/A")
+        f_dash_data(35, "Rec SL / TP", "N/A")
+        f_dash_data(36, "Rec Risk:Reward", "N/A")
+        
+        f_dash_header(37, "SYSTEM STATUS")
+        f_dash_data(38, "Validation Status", "N/A")
+        f_dash_data(39, "Sweep Status", "N/A")
+        f_dash_data(40, "Selected Pool", "None")
+        
+        f_dash_header(41, "MODULE 8 - POI AGGREGATOR")
+        f_dash_data(42, "Total POIs", "0")
+        f_dash_data(43, "Active POIs", "0")
+        f_dash_data(44, "Highest Confidence", "0")
+        f_dash_data(45, "Latest POI", "N/A")
+        f_dash_data(46, "Latest Grade", "N/A")
+        f_dash_data(47, "Latest Direction", "N/A")
+        f_dash_data(48, "Latest HTF Bias", "N/A")
+        f_dash_data(49, "Latest PD Zone", "N/A")
+        f_dash_data(50, "Latest FVG", "N/A")
+        f_dash_data(51, "Latest OB", "N/A")
+        f_dash_data(52, "Latest MSS", "N/A")
+        f_dash_data(53, "Latest Breaker", "N/A")
+
+        f_dash_header(54, "MODULE 9 - DECISION HISTORY")
+        f_dash_data(55, "History 1", "N/A")
+        f_dash_data(56, "History 2", "N/A")
+        f_dash_data(57, "History 3", "N/A")
+        f_dash_data(58, "History 4", "N/A")
+        f_dash_data(59, "History 5", "N/A")
+
+        f_dash_header(60, "MODULE 10 - TRADE RATING")
+        f_dash_data(61, "Current Decision", "WAIT")
+        f_dash_data(62, "Trade Rating", "N/A")
+        f_dash_data(63, "Confidence", "0")
+        f_dash_data(64, "Risk", "N/A")
+        f_dash_data(65, "Expected RR", "0")
+        f_dash_data(66, "Entry", "N/A")
+        f_dash_data(67, "SL / TP", "N/A")
+        f_dash_data(68, "Reasons", "N/A")
+        f_dash_data(69, "Penalties", "N/A")
+
+        f_dash_header(70, "MODULE 11 - EVENT REGISTRY")
+        f_dash_data(71, "Total Events", "0")
+        f_dash_data(72, "Registry Size", "0")
+        f_dash_data(73, "Latest Event ID", "N/A")
+        f_dash_data(74, "Parent Event ID", "N/A")
+        f_dash_data(75, "Module", "N/A")
+        f_dash_data(76, "Severity / Outcome", "N/A")
+        f_dash_data(77, "Object ID", "N/A")
+        f_dash_data(78, "Description", "N/A")
+        f_dash_data(79, "Correlation ID", "N/A")
+
+        f_dash_header(80, "MODULE 12 - INSTITUTIONAL AUDIT")
+        f_dash_data(81, "Engine Trust Score", "100/100")
+        f_dash_data(82, "Total Audits (Lifetime)", "0")
+        f_dash_data(83, "Lifetime Failures", "0")
+        f_dash_data(84, "Lifetime Warnings", "0")
+        f_dash_data(85, "Lifetime Passed", "0")
+        f_dash_data(86, "Audit Registry Size", "0")
+        f_dash_data(87, "Last Failure", "None")
+        f_dash_data(88, "Last Summary", "No audits run yet")
+
+        table.cell(event_log_table, 0, 0, "EVENT TIMELINE", text_color=color.yellow, text_size=size.tiny, text_halign=text.align_center, bgcolor=color.new(color.navy, 60))
+        for i = 1 to 15
+            table.cell(event_log_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(audit_table, 0, 0, "SELECTION AUDIT", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(audit_table, 0, 0, 1, 0)
+        table.cell(audit_table, 0, 1, "Total Bull / Bear", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 2, "Eligible Bull / Bear", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 3, "State Filter (Bull)", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 4, "State Filter (Bear)", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 5, "Selected Bull ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 6, "Selected Bear ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 7, "Selected Overall ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(audit_table, 0, 8, "Final Reason", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(lifecycle_audit_table, 0, 0, "LIFECYCLE AUDIT", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(lifecycle_audit_table, 0, 0, 1, 0)
+        table.cell(lifecycle_audit_table, 0, 1, "Pool ID", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 2, "Transition", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 3, "Reason", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 4, "Transit Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 5, "Active Bars", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 6, "Reinforced Bars", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 7, "Swept Bars", text_color=color.gray, text_size=size.tiny)
+        table.cell(lifecycle_audit_table, 0, 8, "Diagnosis", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(p9_debug_table, 0, 0, "PHASE 9 DEBUG", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_debug_table, 0, 0, 1, 0)
+        table.cell(p9_debug_table, 0, 1, "MTF Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 2, "MTF 1H Bias", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 3, "MTF 4H Bias", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 4, "MTF 1D Bias", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 5, "Liq Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 6, "PD Instance", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 7, "PD Zone", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 8, "FVG Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 9, "OB Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 10, "BRK Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 11, "MSS Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 12, "POI Registry", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_debug_table, 0, 13, "Integrity", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(p9_inspector_table, 0, 0, "P9 REGISTRY INSPECTOR", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_inspector_table, 0, 0, 1, 0)
+        table.cell(p9_inspector_table, 0, 1, "PD Current Pointer", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 2, "PD Total Emitted", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 3, "PD Created Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 4, "PD Status", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 5, "FVG Current Pointer", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 6, "FVG Total Emitted", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 7, "FVG Created Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 8, "FVG Status", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 9, "OB Current Pointer", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 10, "OB Total Emitted", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 11, "OB Created Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 12, "OB Status", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 13, "BRK Current Pointer", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 14, "BRK Total Emitted", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 15, "BRK Created Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 16, "BRK Status", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 17, "MSS Current Pointer", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 18, "MSS Total Emitted", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 19, "MSS Created Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 20, "MSS Status", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 22, "MSS Diagnostics", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_inspector_table, 0, 22, 1, 22)
+        table.cell(p9_inspector_table, 0, 23, "Current Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 24, "Last Eval Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 25, "Last CHoCH Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 26, "Reason", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 28, "BRK Diagnostics", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_inspector_table, 0, 28, 1, 28)
+        table.cell(p9_inspector_table, 0, 29, "Current Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 30, "Last Eval Bar", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 31, "OB Inv (Y/N)", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 32, "MSS Found (Y/N)", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 33, "BRK Eval Result", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_inspector_table, 0, 34, "Stats", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(p9_engine_summary_table, 0, 0, "PHASE 9 ENGINE", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_engine_summary_table, 0, 0, 1, 0)
+        table.cell(p9_engine_summary_table, 0, 1, "PD Total", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 0, 2, "Liquidity Total", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 0, 3, "FVG Total", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 0, 4, "OB Total", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 0, 5, "MSS Total", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 0, 6, "Breaker Total", text_color=color.gray, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 0, 7, "Grand Total", text_color=color.yellow, text_size=size.tiny)
+
+        table.cell(profile_table, 0, 0, "P9 PROFILE", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(profile_table, 0, 0, 2, 0)
+        table.cell(profile_table, 0, 1, "Type", text_color=color.gray, text_size=size.tiny)
+        table.cell(profile_table, 1, 1, "Memory", text_color=color.gray, text_size=size.tiny)
+        table.cell(profile_table, 2, 1, "Drawn", text_color=color.gray, text_size=size.tiny)
+
+    if barstate.islast
+        int now_hour = hour(timenow, syminfo.timezone)
+        int now_min  = minute(timenow, syminfo.timezone)
+        int now_mins = now_hour * 60 + now_min
+        int now_day  = dayofweek(timenow, syminfo.timezone)
+        
+        bool is_weekend_now = false
+        if now_day == 1
+            if now_mins < (17 * 60)
+                is_weekend_now := true
+        else if now_day == 6
+            if now_mins >= (17 * 60)
+                is_weekend_now := true
+                
+        string display_session_name = "Off Session"
+        string display_status = "CLOSED"
+        string display_time_str = S.current_time_str
+        
+        if is_weekend_now
+            display_session_name := "Off Session"
+            display_status := "CLOSED"
+            string h_str2 = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+            string m_str2 = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+            display_time_str := h_str2 + ":" + m_str2 + " (Wknd)"
+        else
+            bool now_is_ny = f_is_in_range(now_mins, ny_start, ny_end)
+            bool now_is_london = f_is_in_range(now_mins, london_start, london_end)
+            bool now_is_asian = f_is_in_range(now_mins, asian_start, asian_end)
+            
+            if now_is_ny and now_is_london
+                display_session_name := "London/NY Overlap"
+                display_status := "OPEN"
+            else if now_is_ny
+                display_session_name := "New York"
+                display_status := "OPEN"
+            else if now_is_london
+                display_session_name := "London"
+                display_status := "OPEN"
+            else if now_is_asian
+                display_session_name := "Asian"
+                display_status := "OPEN"
+                
+            string h_str2 = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+            string m_str2 = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+            display_time_str := h_str2 + ":" + m_str2
+
+        table.cell(dash_table, 1, 7, display_session_name, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 8, display_status, text_color=display_status == "OPEN" ? color.green : color.red, text_size=size.tiny)
+        table.cell(dash_table, 1, 9, display_time_str, text_color=color.white, text_size=size.tiny)
+        
+        int bull_count = 0
+        int bear_count = 0
+        int active_count = 0
+        int swept_count = 0
+        int rein_count = 0
+        int invalid_count = 0
+        int expired_count = 0
+        if array.size(g_registry) > 0
+            for i = 0 to array.size(g_registry) - 1
+                LiquidityPool p = array.get(g_registry, i)
+                if p.poolType == LT_BUY_SIDE
+                    bull_count += 1
+                else
+                    bear_count += 1
+                if p.state == LS_ACTIVE
+                    active_count += 1
+                else if p.state == 2
+                    rein_count += 1
+                else if p.state == LS_SWEPT
+                    swept_count += 1
+                else if p.state == LS_INVALIDATED
+                    invalid_count += 1
+                else if p.state == LS_EXPIRED
+                    expired_count += 1
+
+        table.cell(dash_table, 1, 15, str.tostring(bull_count), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 16, str.tostring(bear_count), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 17, str.tostring(active_count), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 18, str.tostring(swept_count), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 19, str.tostring(rein_count), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 20, str.tostring(invalid_count), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 21, str.tostring(expired_count), text_color=color.white, text_size=size.tiny)
+        
+        string trend_str = S.current_validation.trend == TD_LONG ? "Bullish" : S.current_validation.trend == TD_SHORT ? "Bearish" : "Neutral"
+        string bos_str = S.last_bos_dir == TD_LONG ? "Bullish BOS" : S.last_bos_dir == TD_SHORT ? "Bearish BOS" : "None"
+        string choch_str = S.last_choch_dir == TD_LONG ? "Bullish CHoCH" : S.last_choch_dir == TD_SHORT ? "Bearish CHoCH" : "None"
+        table.cell(dash_table, 1, 10, trend_str, text_color=S.current_validation.trend == TD_LONG ? color.green : S.current_validation.trend == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 11, bos_str, text_color=S.last_bos_dir != 0 ? color.yellow : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 12, choch_str, text_color=S.last_choch_dir != 0 ? color.orange : color.gray, text_size=size.tiny)
+
+        string pd_str = "N/A"
+        if not na(S.current_context) and not na(S.current_context.currentPrice)
+            if S.current_context.currentPrice >= S.current_context.premiumZone
+                pd_str := "Premium"
+            else if S.current_context.currentPrice <= S.current_context.discountZone
+                pd_str := "Discount"
+            else
+                pd_str := "Equilibrium"
+        table.cell(dash_table, 1, 13, pd_str, text_color=pd_str == "Premium" ? color.red : pd_str == "Discount" ? color.green : color.gray, text_size=size.tiny)
+
+        string strat_dir_str = S.current_strategy.direction == TD_LONG ? "LONG" : S.current_strategy.direction == TD_SHORT ? "SHORT" : "N/A"
+        table.cell(dash_table, 1, 23, S.current_strategy.strategyApproved ? "Approved" : "Rejected", text_color=S.current_strategy.strategyApproved ? color.green : color.red, text_size=size.tiny)
+        table.cell(dash_table, 1, 24, strat_dir_str, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 25, str.tostring(S.current_strategy.entryPrice, "#.##"), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 26, str.tostring(S.current_strategy.stopLoss, "#.##") + " / " + str.tostring(S.current_strategy.takeProfit, "#.##"), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 27, str.tostring(S.current_strategy.riskReward, "#.##"), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 28, str.tostring(S.current_strategy.strategyConfidence, "#.##"), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 29, S.current_arbitration.isApproved ? "Approved" : "Rejected", text_color=S.current_arbitration.isApproved ? color.green : color.red, text_size=size.tiny)
+        table.cell(dash_table, 1, 30, S.current_arbitration.reason, text_color=color.white, text_size=size.tiny)
+
+        string rec_status_str = "No Active Rec"
+        string rec_dir_str = "N/A"
+        string rec_entry_str = "N/A"
+        string rec_sltp_str = "N/A"
+        string rec_rr_str = "N/A"
+        
+        if not na(S.active_rec)
+            string status_name = "Active"
+            if S.active_rec.status == 2
+                status_name := "Invalidated"
+            else if S.active_rec.status == 3
+                status_name := "Fulfilled"
+            else if S.active_rec.status == 4
+                status_name := "Expired"
+            rec_status_str := "Rec #" + str.tostring(S.active_rec.id) + " (" + status_name + ")"
+            rec_dir_str := S.active_rec.candidate.direction == TD_LONG ? "LONG" : "SHORT"
+            rec_entry_str := str.tostring(S.active_rec.actualEntry, "#.##")
+            rec_sltp_str := str.tostring(S.active_rec.actualStop, "#.##") + " / " + str.tostring(S.active_rec.candidate.takeProfit, "#.##")
+            if S.active_rec.actualEntry != S.active_rec.actualStop
+                if S.active_rec.candidate.direction == TD_LONG
+                    rec_rr_str := str.tostring((S.active_rec.candidate.takeProfit - S.active_rec.actualEntry) / (S.active_rec.actualEntry - S.active_rec.actualStop), "#.##")
+                else
+                    rec_rr_str := str.tostring((S.active_rec.actualEntry - S.active_rec.candidate.takeProfit) / (S.active_rec.actualStop - S.active_rec.actualEntry), "#.##")
+
+        table.cell(dash_table, 1, 32, rec_status_str, text_color=not na(S.active_rec) and S.active_rec.status == RS_ACTIVE ? color.green : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 33, rec_dir_str, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 34, rec_entry_str, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 35, rec_sltp_str, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 36, rec_rr_str, text_color=color.white, text_size=size.tiny)
+
+        string sweep_status_str = S.current_sweep_validation.isSwept ? "Validated" : "Waiting..."
+        table.cell(dash_table, 1, 39, sweep_status_str, text_color=S.current_sweep_validation.isSwept ? color.yellow : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 38, S.current_validation.validationStatus, text_color=S.current_validation.isReady ? color.green : color.red, text_size=size.tiny)
+        string sel_str = "None"
+        if not na(S.current_selection) and not na(S.current_selection.bestOverallPool)
+            sel_str := str.tostring(S.current_selection.bestOverallPool.id) + " (Conf: " + str.tostring(S.current_selection.selectionConfidence, "#.##") + ")"
+        table.cell(dash_table, 1, 40, sel_str, text_color=color.yellow, text_size=size.tiny)
+
+        int active_pois = 0
+        if array.size(g_poi_base_id) > 0
+            for i = 0 to array.size(g_poi_base_id) - 1
+                if array.get(g_poi_state, i) == "Active"
+                    active_pois += 1
+        table.cell(dash_table, 1, 42, str.tostring(S.poi_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 43, str.tostring(active_pois), text_color=color.green, text_size=size.tiny)
+        table.cell(dash_table, 1, 44, str.tostring(S.poi_highest_score) + "pts", text_color=color.yellow, text_size=size.tiny)
+        
+        string latest_poi_str = array.size(g_poi_base_id) > 0 ? array.get(g_poi_base_id, array.size(g_poi_base_id) - 1) : "N/A"
+        table.cell(dash_table, 1, 45, latest_poi_str, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 46, S.poi_latest_grade, text_color=S.poi_latest_grade == "A+" ? color.green : S.poi_latest_grade == "A" ? color.lime : S.poi_latest_grade == "B" ? color.yellow : color.orange, text_size=size.tiny)
+        table.cell(dash_table, 1, 47, S.poi_latest_dir == TD_LONG ? "LONG" : S.poi_latest_dir == TD_SHORT ? "SHORT" : "N/A", text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 48, f_get_latest_mtf_bias(P9_HTF_3) == TD_LONG ? "Bull" : f_get_latest_mtf_bias(P9_HTF_3) == TD_SHORT ? "Bear" : "Neutral", text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 49, S.pd_zone, text_color=color.white, text_size=size.tiny)
+        
+        string latest_fvg = array.size(g_fvg_base_id) > 0 ? array.get(g_fvg_base_id, array.size(g_fvg_base_id) - 1) : "N/A"
+        string latest_ob = array.size(g_ob_base_id) > 0 ? array.get(g_ob_base_id, array.size(g_ob_base_id) - 1) : "N/A"
+        string latest_mss = array.size(g_mss_base_id) > 0 ? array.get(g_mss_base_id, array.size(g_mss_base_id) - 1) : "N/A"
+        string latest_brk = array.size(g_brk_base_id) > 0 ? array.get(g_brk_base_id, array.size(g_brk_base_id) - 1) : "N/A"
+        table.cell(dash_table, 1, 50, latest_fvg, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 51, latest_ob, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 52, latest_mss, text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 53, latest_brk, text_color=color.white, text_size=size.tiny)
+
+        int log_size = array.size(g_decision_log)
+        int start_idx = math.max(0, log_size - 5)
+        int display_idx = 55
+        if log_size > 0
+            for i = start_idx to log_size - 1
+                string log_entry = array.get(g_decision_log, i)
+                table.cell(dash_table, 1, display_idx, log_entry, text_color=color.white, text_size=size.tiny)
+                display_idx += 1
+        if display_idx <= 59
+            for i = display_idx to 59
+                table.cell(dash_table, 1, i, "N/A", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(dash_table, 1, 61, S.m10_latest_action, text_color=S.m10_latest_action == "BUY" ? color.green : S.m10_latest_action == "SELL" ? color.red : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 62, S.m10_latest_rating, text_color=S.m10_latest_rating == "A+" ? color.green : S.m10_latest_rating == "A" ? color.lime : S.m10_latest_rating == "B" ? color.yellow : color.orange, text_size=size.tiny)
+        table.cell(dash_table, 1, 63, str.tostring(S.m10_latest_score) + "pts", text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 64, S.m10_latest_risk + " (" + str.tostring(S.m10_latest_risk_score) + "/100)", text_color=S.m10_latest_risk == "Low" ? color.green : S.m10_latest_risk == "Medium" ? color.yellow : color.red, text_size=size.tiny)
+        table.cell(dash_table, 1, 65, "1:" + str.tostring(S.m10_latest_rr, "#.#"), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 66, str.tostring(S.m10_latest_entry, "#.##"), text_color=color.blue, text_size=size.tiny)
+        table.cell(dash_table, 1, 67, str.tostring(S.m10_latest_sl, "#.##") + " / " + str.tostring(S.m10_latest_tp, "#.##"), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 68, S.m10_latest_reasons, text_color=color.green, text_size=size.tiny)
+        table.cell(dash_table, 1, 69, S.m10_latest_penalties, text_color=color.red, text_size=size.tiny)
+
+        // Module 11 Event Registry Updates
+        table.cell(dash_table, 1, 71, str.tostring(S.event_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 72, str.tostring(array.size(g_event_registry)), text_color=color.white, text_size=size.tiny)
+        EventRegistryInstance latest_evt = array.size(g_event_registry) > 0 ? array.get(g_event_registry, array.size(g_event_registry)-1) : na
+        if not na(latest_evt)
+            string mod_name = latest_evt.module == MOD_MTF ? "MTF" : latest_evt.module == MOD_LIQ ? "Liquidity" : latest_evt.module == MOD_FVG ? "FVG" : latest_evt.module == MOD_OB ? "OB" : latest_evt.module == MOD_MSS ? "MSS" : latest_evt.module == MOD_BRK ? "Breaker" : latest_evt.module == MOD_POI ? "POI" : latest_evt.module == MOD_TR ? "Trade" : latest_evt.module == MOD_AUDIT ? "Audit" : "System"
+            string sev_name = latest_evt.severity == SEV_INFO ? "INFO" : latest_evt.severity == SEV_WARNING ? "WARN" : latest_evt.severity == SEV_ERROR ? "ERROR" : "SUCCESS"
+            
+            table.cell(dash_table, 1, 73, str.tostring(latest_evt.eventId), text_color=color.yellow, text_size=size.tiny)
+            table.cell(dash_table, 1, 74, str.tostring(latest_evt.parentEventId), text_color=color.gray, text_size=size.tiny)
+            table.cell(dash_table, 1, 75, mod_name, text_color=color.white, text_size=size.tiny)
+            table.cell(dash_table, 1, 76, sev_name + " / " + latest_evt.outcome, text_color=latest_evt.outcome == "SUCCESS" ? color.green : latest_evt.outcome == "REJECTED" ? color.red : color.yellow, text_size=size.tiny)
+            table.cell(dash_table, 1, 77, latest_evt.objectId, text_color=color.white, text_size=size.tiny)
+            table.cell(dash_table, 1, 78, latest_evt.description, text_color=color.white, text_size=size.tiny)
+            table.cell(dash_table, 1, 79, latest_evt.correlationId, text_color=color.aqua, text_size=size.tiny)
+        else
+            for i = 73 to 79
+                table.cell(dash_table, 1, i, "N/A", text_color=color.gray, text_size=size.tiny)
+
+        // Module 12 Audit Updates
+        table.cell(dash_table, 1, 81, str.tostring(S.m12_cycle_trust_score) + "/100", text_color=S.m12_cycle_trust_score > 90 ? color.green : S.m12_cycle_trust_score > 70 ? color.yellow : color.red, text_size=size.tiny)
+        table.cell(dash_table, 1, 82, str.tostring(S.audit_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 83, str.tostring(S.lifetime_audit_failures), text_color=S.lifetime_audit_failures == 0 ? color.green : color.red, text_size=size.tiny)
+        table.cell(dash_table, 1, 84, str.tostring(S.lifetime_audit_warnings), text_color=S.lifetime_audit_warnings == 0 ? color.green : color.yellow, text_size=size.tiny)
+        table.cell(dash_table, 1, 85, str.tostring(S.lifetime_audit_passed), text_color=S.lifetime_audit_passed > 0 ? color.green : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 86, str.tostring(array.size(g_audit_registry)), text_color=color.white, text_size=size.tiny)
+        table.cell(dash_table, 1, 87, S.audit_last_failure_msg, text_color=S.lifetime_audit_failures > 0 ? color.red : color.gray, text_size=size.tiny)
+        table.cell(dash_table, 1, 88, S.m12_last_summary, text_color=color.aqua, text_size=size.tiny)
+
+        int event_log_size = array.size(g_event_log)
+        int event_max_display = 15
+        int event_start_idx = math.max(0, event_log_size - event_max_display)
+        int event_display_idx = 1
+        if event_log_size > 0
+            for i = event_start_idx to event_log_size - 1
+                string log_entry = array.get(g_event_log, i)
+                table.cell(event_log_table, 0, event_display_idx, log_entry, text_color=color.white, text_size=size.tiny)
+                event_display_idx += 1
+        if event_display_idx <= event_max_display
+            for i = event_display_idx to event_max_display
+                table.cell(event_log_table, 0, i, "", text_color=color.gray, text_size=size.tiny)
+
+        table.cell(audit_table, 1, 1, str.tostring(S.current_audit.totalBull) + " / " + str.tostring(S.current_audit.totalBear), text_color=color.white, text_size=size.tiny)
+        table.cell(audit_table, 1, 2, str.tostring(S.current_audit.eligibleBull) + " / " + str.tostring(S.current_audit.eligibleBear), text_color=S.current_audit.eligibleBull > 0 or S.current_audit.eligibleBear > 0 ? color.green : color.red, text_size=size.tiny)
+        table.cell(audit_table, 1, 3, S.current_audit.stateFilterBull, text_color=str.contains(S.current_audit.stateFilterBull, "FAIL") ? color.red : color.green, text_size=size.tiny)
+        table.cell(audit_table, 1, 4, S.current_audit.stateFilterBear, text_color=str.contains(S.current_audit.stateFilterBear, "FAIL") ? color.red : color.green, text_size=size.tiny)
+        table.cell(audit_table, 1, 5, S.current_audit.selectedBullId == -1 ? "N/A" : str.tostring(S.current_audit.selectedBullId), text_color=color.white, text_size=size.tiny)
+        table.cell(audit_table, 1, 6, S.current_audit.selectedBearId == -1 ? "N/A" : str.tostring(S.current_audit.selectedBearId), text_color=color.white, text_size=size.tiny)
+        table.cell(audit_table, 1, 7, S.current_audit.selectedOverallId == -1 ? "N/A" : str.tostring(S.current_audit.selectedOverallId), text_color=S.current_audit.selectedOverallId == -1 ? color.red : color.green, text_size=size.tiny)
+        table.cell(audit_table, 1, 8, S.current_audit.finalRejectionReason, text_color=color.yellow, text_size=size.tiny)
+
+        LifecycleAuditEntry lastEntry = array.size(g_lifecycle_audit_log) > 0 ? array.get(g_lifecycle_audit_log, array.size(g_lifecycle_audit_log) - 1) : na
+        if not na(lastEntry)
+            table.cell(lifecycle_audit_table, 1, 1, str.tostring(lastEntry.poolId), text_color=color.white, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 2, lastEntry.transitionStr, text_color=color.yellow, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 3, lastEntry.reason, text_color=color.white, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 4, str.tostring(lastEntry.barIndex), text_color=color.white, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 5, str.tostring(lastEntry.activeDuration), text_color=color.white, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 6, str.tostring(lastEntry.reinforcedDuration), text_color=color.white, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 7, str.tostring(lastEntry.sweptDuration), text_color=color.white, text_size=size.tiny)
+            string diagnosis = "Normal Transition"
+            if lastEntry.newState == LS_INVALIDATED
+                if lastEntry.reason == "TIME_EXPIRY"
+                    diagnosis := "Invalidated by Age"
+                else if lastEntry.reason == "POST_SWEEP_INVALIDATION"
+                    diagnosis := "Invalidated Post-Sweep"
+                else
+                    diagnosis := "Invalidated (Price)"
+            if lastEntry.activeDuration <= 1 and lastEntry.newState == LS_INVALIDATED
+                diagnosis := "Invalidated IMMEDIATELY"
+            table.cell(lifecycle_audit_table, 1, 8, diagnosis, text_color=diagnosis == "Normal Transition" ? color.green : color.red, text_size=size.tiny)
+        else
+            table.cell(lifecycle_audit_table, 1, 1, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 2, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 3, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 4, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 5, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 6, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 7, "N/A", text_color=color.gray, text_size=size.tiny)
+            table.cell(lifecycle_audit_table, 1, 8, "Waiting...", text_color=color.gray, text_size=size.tiny)
+
+        if show_p9_debug
+            int m1_b = f_get_latest_mtf_bias(P9_HTF_1)
+            int m2_b = f_get_latest_mtf_bias(P9_HTF_2)
+            int m3_b = f_get_latest_mtf_bias(P9_HTF_3)
+            string m1_bias = m1_b == TD_LONG ? "Bull" : m1_b == TD_SHORT ? "Bear" : "Neutral"
+            string m2_bias = m2_b == TD_LONG ? "Bull" : m2_b == TD_SHORT ? "Bear" : "Neutral"
+            string m3_bias = m3_b == TD_LONG ? "Bull" : m3_b == TD_SHORT ? "Bear" : "Neutral"
+            int active_fvg = 0
+            int active_ob = 0
+            int active_brk = 0
+            int active_mss = 0
+            if array.size(g_fvg_state) > 0
+                for i = 0 to array.size(g_fvg_state) - 1
+                    if array.get(g_fvg_state, i) != "Full"
+                        active_fvg += 1
+            if array.size(g_ob_state) > 0
+                for i = 0 to array.size(g_ob_state) - 1
+                    if array.get(g_ob_state, i) != "Invalidated"
+                        active_ob += 1
+            if array.size(g_brk_state) > 0
+                for i = 0 to array.size(g_brk_state) - 1
+                    if array.get(g_brk_state, i) != "Invalidated"
+                        active_brk += 1
+            if array.size(g_mss_state) > 0
+                for i = 0 to array.size(g_mss_state) - 1
+                    if array.get(g_mss_state, i) == "Active"
+                        active_mss += 1
+            table.cell(p9_debug_table, 1, 1, str.tostring(array.size(g_mtf_registry)), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 2, m1_bias, text_color=m1_b == TD_LONG ? color.green : m1_b == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 3, m2_bias, text_color=m2_b == TD_LONG ? color.green : m2_b == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 4, m3_bias, text_color=m3_b == TD_LONG ? color.green : m3_b == TD_SHORT ? color.red : color.gray, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 5, str.tostring(array.size(g_liq_registry)), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 6, "PD-v" + str.tostring(S.pd_ver), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 7, S.pd_zone, text_color=S.pd_zone == "Premium" ? color.red : S.pd_zone == "Discount" ? color.green : color.gray, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 8, str.tostring(array.size(g_fvg_registry)) + " (" + str.tostring(active_fvg) + " act)", text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 9, str.tostring(array.size(g_ob_registry)) + " (" + str.tostring(active_ob) + " act)", text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 10, str.tostring(array.size(g_brk_registry)) + " (" + str.tostring(active_brk) + " act)", text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 11, str.tostring(array.size(g_mss_registry)) + " (" + str.tostring(active_mss) + " act)", text_color=color.white, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 12, str.tostring(array.size(g_poi_registry)) + " (" + str.tostring(S.drawn_poi) + " drawn)", text_color=color.teal, text_size=size.tiny)
+            table.cell(p9_debug_table, 1, 13, (S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3) ? "TRUE" : "FALSE", text_color=(S.mtf_integ_1 and S.mtf_integ_2 and S.mtf_integ_3) ? color.green : color.red, text_size=size.tiny)
+
+        if show_p9_inspector
+            string pd_ptr = S.pd_ver > 0 ? "PD-ARRAY-v" + str.tostring(S.pd_ver) : "None"
+            int pd_cbar = array.size(g_pd_registry) > 0 ? array.get(g_pd_registry, array.size(g_pd_registry) - 1).createdAt : na
+            string pd_stat = array.size(g_pd_registry) > 0 ? array.get(g_pd_registry, array.size(g_pd_registry) - 1).status : "N/A"
+            string fvg_ptr = array.size(g_fvg_base_id) > 0 ? array.get(g_fvg_base_id, array.size(g_fvg_base_id) - 1) + "-v" + str.tostring(array.get(g_fvg_ver, array.size(g_fvg_ver) - 1)) : "None"
+            int fvg_cbar = array.size(g_fvg_registry) > 0 ? array.get(g_fvg_registry, array.size(g_fvg_registry) - 1).createdAt : na
+            string fvg_stat = array.size(g_fvg_state) > 0 ? array.get(g_fvg_state, array.size(g_fvg_state) - 1) : "N/A"
+            string ob_ptr = array.size(g_ob_base_id) > 0 ? array.get(g_ob_base_id, array.size(g_ob_base_id) - 1) + "-v" + str.tostring(array.get(g_ob_ver, array.size(g_ob_ver) - 1)) : "None"
+            int ob_cbar = array.size(g_ob_registry) > 0 ? array.get(g_ob_registry, array.size(g_ob_registry) - 1).createdAt : na
+            string ob_stat = array.size(g_ob_state) > 0 ? array.get(g_ob_state, array.size(g_ob_state) - 1) : "N/A"
+            string brk_ptr = array.size(g_brk_base_id) > 0 ? array.get(g_brk_base_id, array.size(g_brk_base_id) - 1) + "-v" + str.tostring(array.get(g_brk_ver, array.size(g_brk_ver) - 1)) : "None"
+            int brk_cbar = array.size(g_brk_registry) > 0 ? array.get(g_brk_registry, array.size(g_brk_registry) - 1).createdAt : na
+            string brk_stat = array.size(g_brk_state) > 0 ? array.get(g_brk_state, array.size(g_brk_state) - 1) : "N/A"
+            string mss_ptr = array.size(g_mss_base_id) > 0 ? array.get(g_mss_base_id, array.size(g_mss_base_id) - 1) + "-v" + str.tostring(array.get(g_mss_ver, array.size(g_mss_ver) - 1)) : "None"
+            int mss_cbar = array.size(g_mss_registry) > 0 ? array.get(g_mss_registry, array.size(g_mss_registry) - 1).createdAt : na
+            string mss_stat = array.size(g_mss_state) > 0 ? array.get(g_mss_state, array.size(g_mss_state) - 1) : "N/A"
+            table.cell(p9_inspector_table, 1, 1, pd_ptr, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 2, str.tostring(array.size(g_pd_registry)), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 3, na(pd_cbar) ? "N/A" : str.tostring(pd_cbar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 4, pd_stat, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 5, fvg_ptr, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 6, str.tostring(S.fvg_total_emitted), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 7, na(fvg_cbar) ? "N/A" : str.tostring(fvg_cbar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 8, fvg_stat, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 9, ob_ptr, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 10, str.tostring(S.ob_total_emitted), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 11, na(ob_cbar) ? "N/A" : str.tostring(ob_cbar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 12, ob_stat, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 13, brk_ptr, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 14, str.tostring(S.brk_total_emitted), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 15, na(brk_cbar) ? "N/A" : str.tostring(brk_cbar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 16, brk_stat, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 17, mss_ptr, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 18, str.tostring(S.mss_total_emitted), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 19, na(mss_cbar) ? "N/A" : str.tostring(mss_cbar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 20, mss_stat, text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 23, str.tostring(bar_index), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 24, na(S.mss_last_eval_bar) ? "N/A" : str.tostring(S.mss_last_eval_bar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 25, na(S.mss_diag_bar) ? "N/A" : str.tostring(S.mss_diag_bar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 26, S.mss_diag_reason, text_color=str.contains(S.mss_diag_reason, "Failed") ? color.red : str.contains(S.mss_diag_reason, "SUCCESS") ? color.green : color.gray, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 29, str.tostring(bar_index), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 30, na(S.brk_last_eval_bar) ? "N/A" : str.tostring(S.brk_last_eval_bar), text_color=color.white, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 31, S.brk_diag_ob_inv ? "Yes" : "No", text_color=S.brk_diag_ob_inv ? color.green : color.gray, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 32, S.brk_diag_mss_found ? "Yes" : "No", text_color=S.brk_diag_mss_found ? color.green : color.gray, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 33, S.brk_diag_reason, text_color=str.contains(S.brk_diag_reason, "Created") ? color.green : str.contains(S.brk_diag_reason, "Rejected") ? color.red : color.gray, text_size=size.tiny)
+            table.cell(p9_inspector_table, 1, 34, "Eval: " + str.tostring(S.brk_stat_evals) + " | Created: " + str.tostring(S.brk_stat_created) + "\nRej (No MSS): " + str.tostring(S.brk_stat_rej_no_mss) + " | Rej (Dir): " + str.tostring(S.brk_stat_rej_direction) + "\nRej (Integ): " + str.tostring(S.brk_stat_rej_integrity) + " | Waiting: " + str.tostring(S.brk_stat_waiting), text_color=color.white, text_size=size.tiny)
+
+        table.cell(p9_engine_summary_table, 1, 1, str.tostring(array.size(g_pd_registry)), text_color=color.white, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 1, 2, str.tostring(S.liq_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 1, 3, str.tostring(S.fvg_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 1, 4, str.tostring(S.ob_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 1, 5, str.tostring(S.mss_total_emitted), text_color=color.white, text_size=size.tiny)
+        table.cell(p9_engine_summary_table, 1, 6, str.tostring(S.brk_total_emitted), text_color=color.white, text_size=size.tiny)
+        int grand_total = array.size(g_pd_registry) + S.liq_total_emitted + S.fvg_total_emitted + S.ob_total_emitted + S.mss_total_emitted + S.brk_total_emitted
+        table.cell(p9_engine_summary_table, 1, 7, str.tostring(grand_total), text_color=color.yellow, text_size=size.tiny)
+
+        table.cell(profile_table, 0, 2, "FVG", text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 1, 2, str.tostring(array.size(g_fvg_registry)), text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 2, 2, str.tostring(S.drawn_fvg), text_color=color.green, text_size=size.tiny)
+        table.cell(profile_table, 0, 3, "OB", text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 1, 3, str.tostring(array.size(g_ob_registry)), text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 2, 3, str.tostring(S.drawn_ob), text_color=color.green, text_size=size.tiny)
+        table.cell(profile_table, 0, 4, "BRK", text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 1, 4, str.tostring(array.size(g_brk_registry)), text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 2, 4, str.tostring(S.drawn_brk), text_color=color.green, text_size=size.tiny)
+        table.cell(profile_table, 0, 5, "POI", text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 1, 5, str.tostring(array.size(g_poi_registry)), text_color=color.white, text_size=size.tiny)
+        table.cell(profile_table, 2, 5, str.tostring(S.drawn_poi), text_color=color.green, text_size=size.tiny)
+
+// =========================================================================
+// MAIN EXECUTION LOOP
+// =========================================================================
+S := f_compute_phase8(S)
+S := f_compute_p9(S)
+S := f_compute_m10(S)
+S := f_compute_m12(S)
+S := f_render_engine(S)
+f_update_dashboards(S)
