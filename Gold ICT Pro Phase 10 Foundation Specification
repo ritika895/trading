@@ -1,0 +1,743 @@
+
+
+# Gold ICT Pro
+
+# Phase 10 Foundation Specification
+
+## Architecture Freeze v1.0
+
+### Status: 🔒 FROZEN
+
+**Purpose**
+
+This document defines the permanent architectural foundation of the Gold ICT Pro Engine. Every implementation must conform to this specification. Any future enhancement must extend the architecture without violating these contracts unless a critical design flaw is discovered.
+
+---
+
+# 1. Core Philosophy
+
+The engine is designed around the following principles:
+
+* Deterministic execution
+* Replay-safe computation
+* Non-repainting logic
+* Immutable registries
+* Single writer ownership
+* Fail-closed integrity
+* Event-driven communication
+* Broker independence
+* Platform independence
+* Test-first validation
+
+---
+
+# 2. Overall Architecture
+
+```text
+Market Data
+      │
+      ▼
+Selection Layer
+      │
+      ▼
+Analysis Layer
+      │
+      ▼
+Decision Layer
+      │
+      ▼
+Strategy Layer
+      │
+      ▼
+Arbitration Layer
+      │
+      ▼
+Recommendation Boundary
+      │
+      ▼
+Risk Layer
+      │
+      ▼
+Authorization Layer
+      │
+      ▼
+Execution Layer
+      │
+      ▼
+Broker Adapter
+      │
+      ▼
+Execution Monitor
+```
+
+Everything above the Broker Adapter is broker-independent.
+
+---
+
+# 3. Layer Responsibilities
+
+## Layer 1 — Selection
+
+Responsible for selecting valid liquidity pools.
+
+Never:
+
+* Creates recommendations
+* Calculates entries
+* Executes trades
+
+---
+
+## Layer 2 — Analysis
+
+Responsible for:
+
+* Structure
+* Liquidity
+* FVG
+* OB
+* MSS
+* Breakers
+* POI
+
+Produces analysis only.
+
+---
+
+## Layer 3 — Decision
+
+Determines:
+
+* Is the setup valid?
+* Is confirmation complete?
+* Is trading permitted?
+
+---
+
+## Layer 4 — Strategy
+
+Creates:
+
+* Entry
+* Stop Loss
+* Take Profit
+* Risk Reward
+
+No broker interaction.
+
+---
+
+## Layer 5 — Arbitration
+
+Selects the best recommendation.
+
+One recommendation leaves Arbitration.
+
+---
+
+## Layer 6 — Recommendation Boundary
+
+This is the permanent boundary.
+
+Everything above creates recommendations.
+
+Everything below executes recommendations.
+
+---
+
+## Layer 7 — Risk
+
+Calculates
+
+* Position size
+* Exposure
+* Daily risk
+* Portfolio limits
+
+---
+
+## Layer 8 — Authorization
+
+Final safety checkpoint.
+
+If any Integrity flag fails:
+
+No execution.
+
+---
+
+## Layer 9 — Execution
+
+Responsible only for execution.
+
+No trading decisions.
+
+---
+
+# 4. Modules
+
+## Core
+
+* Types
+* Logger
+* Registry Manager
+* Event Bus
+* Snapshot Manager
+* Persistence Queue
+* Engine Lifecycle
+* Interfaces
+
+---
+
+## Engine Modules
+
+M1 Structure
+
+M2 Liquidity
+
+M3 Premium/Discount
+
+M4 Fair Value Gap
+
+M5 Order Block
+
+M6 Market Structure Shift
+
+M7 Breaker Block
+
+M8 POI Aggregator
+
+M9 Strategy
+
+M10 Recommendation
+
+M11 Event Audit
+
+M12 Audit
+
+M13 Analytics
+
+M14 Broker Adapter
+
+M15 Trade Manager
+
+M16 Execution Monitor
+
+---
+
+# 5. Engine Lifecycle
+
+```text
+BOOT
+
+↓
+
+INITIALIZE
+
+↓
+
+READY
+
+↓
+
+RUNNING
+
+↓
+
+DEGRADED
+
+↓
+
+PAUSED
+
+↓
+
+RECOVERY
+
+↓
+
+SHUTDOWN
+```
+
+Definitions:
+
+BOOT
+
+Program starting.
+
+INITIALIZE
+
+Create services.
+
+READY
+
+Waiting for market.
+
+RUNNING
+
+Normal execution.
+
+DEGRADED
+
+Integrity violation.
+
+No execution.
+
+Still auditing.
+
+PAUSED
+
+Intentional pause.
+
+RECOVERY
+
+Restarting after interruption.
+
+SHUTDOWN
+
+Clean exit.
+
+---
+
+# 6. Dependency Rule
+
+Dependency Injection only.
+
+Forbidden:
+
+```cpp
+Singleton::Instance()
+Global Objects
+Hidden Dependencies
+```
+
+Allowed:
+
+```cpp
+Process(
+EngineContext&
+)
+```
+
+Every dependency must appear in the function signature.
+
+---
+
+# 7. Engine Context
+
+Reserved objects:
+
+```text
+PortfolioContext
+        │
+        ▼
+CSymbolContext
+        │
+        ▼
+Engine Modules
+```
+
+One SymbolContext per instrument.
+
+No shared symbol state.
+
+---
+
+# 8. Event System
+
+Event Bus responsibilities:
+
+* Route events
+* Queue events
+* Publish events
+* Maintain short RAM history
+* Send persistence queue
+
+Never:
+
+* Make trading decisions
+* Run audits
+
+---
+
+# 9. Event Audit
+
+Module 11
+
+Responsible for:
+
+* Event inspection
+* Event enrichment
+* Trigger audit requests
+
+No infrastructure.
+
+---
+
+# 10. Audit Engine
+
+Responsible for:
+
+* Contract validation
+* Registry integrity
+* Ownership verification
+* Dependency verification
+
+Produces
+
+PASS
+
+WARNING
+
+FAIL
+
+---
+
+# 11. Analytics
+
+Read-only.
+
+Reads SQLite.
+
+Never changes engine state.
+
+Produces:
+
+* Win rate
+* RR
+* Session reports
+* POI reports
+* Liquidity reports
+
+---
+
+# 12. Registry Rules
+
+Every registry:
+
+* Immutable
+* Versioned
+* Single writer
+* Append only
+
+Every entry has:
+
+* Base ID
+* Instance ID
+* Version
+* Timestamp
+* Integrity
+* Status
+
+---
+
+# 13. Registry Manager
+
+Responsible only for:
+
+* Retention
+* Snapshot
+* Versioning
+* Archival
+
+Never writes business data.
+
+Modules own their registries.
+
+---
+
+# 14. Persistence
+
+RAM
+
+↓
+
+Persistence Queue
+
+↓
+
+SQLite
+
+SQLite failure
+
+↓
+
+Persistence Error
+
+↓
+
+Engine continues
+
+Persistence is never a dependency.
+
+---
+
+# 15. Snapshot Strategy
+
+Snapshot:
+
+* Counters
+* Registry metadata
+* Active recommendations
+* Correlation IDs
+
+Market-derived state
+
+↓
+
+Rebuild from replay
+
+Broker state
+
+↓
+
+Restore from snapshot
+
+---
+
+# 16. Recovery Strategy
+
+On startup:
+
+If snapshot exists
+
+↓
+
+Load
+
+↓
+
+Replay missing bars
+
+↓
+
+Continue
+
+If snapshot missing
+
+↓
+
+Replay historical bars
+
+↓
+
+Rebuild engine
+
+↓
+
+Continue
+
+---
+
+# 17. Integrity Rules
+
+Fail closed.
+
+Integrity is scoped.
+
+Scope contains:
+
+* Symbol
+* Broker
+* Module
+
+Integrity failure affects only its scope.
+
+---
+
+# 18. Versioning
+
+Every contract includes:
+
+```text
+SchemaVersion
+
+EngineVersion
+```
+
+Every registry entry stores:
+
+* Schema Version
+* Engine Version
+
+This guarantees future compatibility.
+
+---
+
+# 19. Testing
+
+Every module requires:
+
+Unit Test
+
+↓
+
+Replay Test
+
+↓
+
+Regression Test
+
+↓
+
+Integration Test
+
+↓
+
+Freeze
+
+No module proceeds until all tests pass.
+
+---
+
+# 20. Build Order (Frozen)
+
+```
+Phase 0
+Foundation Freeze
+
+↓
+
+Sprint 1
+Core Infrastructure
+
+↓
+
+Sprint 2
+M1 Structure
+
+↓
+
+Sprint 3
+M2 Liquidity
+
+↓
+
+Sprint 4
+M3 PD
+
+↓
+
+Sprint 5
+M4 FVG
+
+↓
+
+Sprint 6
+M5 OB
+
+↓
+
+Sprint 7
+M6 MSS
+
+↓
+
+Sprint 8
+M7 Breaker
+
+↓
+
+Sprint 9
+M8 POI
+
+↓
+
+Sprint 10
+M9 Strategy
+
+↓
+
+Sprint 11
+M10 Recommendation
+
+↓
+
+Sprint 12
+M11 Event Audit
+
+↓
+
+Sprint 13
+M12 Audit
+
+↓
+
+Sprint 14
+M13 Analytics
+
+↓
+
+Sprint 15
+M14 Broker Adapter
+
+↓
+
+Sprint 16
+M15 Trade Manager
+
+↓
+
+Sprint 17
+M16 Execution Monitor
+
+↓
+
+Sprint 18
+Signal Tester
+
+↓
+
+Sprint 19
+Recovery
+
+↓
+
+Sprint 20
+Production
+```
+
+---
+
+# 21. Architecture Freeze Rules
+
+The following are **FROZEN** and cannot be changed without a formal architecture review:
+
+* Core philosophy
+* Layer boundaries
+* Recommendation Boundary
+* Module responsibilities
+* Ownership matrix
+* Event contracts
+* Registry contracts
+* Engine lifecycle
+* Dependency Injection policy
+* Symbol Context architecture
+* Registry immutability
+* Fail-closed integrity model
+* Build order
+
+---
+
+# 22. Future Extensions (Reserved, Not Part of v1.0)
+
+These are intentionally deferred until after the production engine is stable:
+
+* Multi-symbol portfolio trading
+* Portfolio-level arbitration
+* Multi-broker execution
+* FIX protocol support
+* AI-assisted optimization
+* Distributed backtesting
+* Cloud analytics
+* Event sourcing (full implementation, if ever needed)
+
+---
+
+## 🔒 Final Status
+
+**Document:** Gold ICT Pro – Phase 10 Foundation Specification
+**Version:** 1.0
+**Status:** **ARCHITECTURE FROZEN**
+
+From this point forward, the architecture should be treated as stable. New work should focus on **implementation, testing, and validation**, with changes to this document reserved only for critical architectural defects rather than incremental improvements.
