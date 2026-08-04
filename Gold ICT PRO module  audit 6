@@ -1,0 +1,1872 @@
+//@version=6
+indicator("Gold ICT Pro", overlay=true)
+
+// ============================================================================
+// MODULE 0 — INPUTS & SETTINGS
+// ============================================================================
+GRP_GENERAL = "General Settings"
+int SWING_LOOKBACK   = input.int(5, "Swing Lookback", group=GRP_GENERAL, minval=2)
+int ATR_LENGTH       = input.int(14, "ATR Length", group=GRP_GENERAL, minval=1)
+float SWEEP_THRESHOLD= input.float(0.2, "Sweep Threshold", group=GRP_GENERAL, step=0.1)
+
+GRP_SESSION = "Session Settings"
+int ASIAN_START_HR   = input.int(19, "Asian Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_START_MIN  = input.int(0, "Asian Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int ASIAN_END_HR     = input.int(4, "Asian End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int ASIAN_END_MIN    = input.int(0, "Asian End Minute", group=GRP_SESSION, minval=0, maxval=59)
+int LONDON_START_HR  = input.int(3, "London Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_START_MIN = input.int(0, "London Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int LONDON_END_HR    = input.int(12, "London End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int LONDON_END_MIN   = input.int(0, "London End Minute", group=GRP_SESSION, minval=0, maxval=59)
+int NY_START_HR      = input.int(8, "New York Start Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_START_MIN     = input.int(0, "New York Start Minute", group=GRP_SESSION, minval=0, maxval=59)
+int NY_END_HR        = input.int(17, "New York End Hour", group=GRP_SESSION, minval=0, maxval=23)
+int NY_END_MIN       = input.int(0, "New York End Minute", group=GRP_SESSION, minval=0, maxval=59)
+
+GRP_LIMITS = "Engine Limits"
+int MAX_POOLS           = input.int(50, "Max Registry Pools", group=GRP_LIMITS, minval=10)
+
+GRP_P9_VIS = "Phase 9 Visualizations"
+bool show_p9_debug = input.bool(false, "Show P9 Debug Panel", group=GRP_P9_VIS)
+bool show_p9_inspector = input.bool(false, "Show P9 Registry Inspector", group=GRP_P9_VIS)
+bool show_fvg_vis  = input.bool(true, "Show FVG Boxes", group=GRP_P9_VIS)
+bool show_ob_vis   = input.bool(true, "Show OB Boxes", group=GRP_P9_VIS)
+bool show_brk_vis  = input.bool(true, "Show Breaker Boxes", group=GRP_P9_VIS)
+bool show_mss_vis  = input.bool(true, "Show MSS Labels", group=GRP_P9_VIS)
+bool show_poi_vis  = input.bool(true, "Show POI Boxes (M8)", group=GRP_P9_VIS)
+bool show_m10_vis  = input.bool(true, "Show Trade Levels (M10)", group=GRP_P9_VIS)
+bool enable_validation = input.bool(true, "Enable Phase 9 Historical Validation", group=GRP_P9_VIS)
+bool dev_mode      = input.bool(false, "Enable Developer Mode (M13 Analytics)", group=GRP_P9_VIS)
+
+int MAX_VISUALS = input.int(3, "Max Visuals Per Type", minval=1, maxval=10, group="Render Engine")
+float MAX_RENDER_DIST_MULT = input.float(10.0, "Max Render Distance (ATR Mult)", minval=1.0, group="Render Engine")
+
+GRP_M8 = "Module 8 & 9 Weights"
+int W_HTF = input.int(20, "HTF Bias Weight", group=GRP_M8)
+int W_LIQ = input.int(20, "Liquidity Tier Weight", group=GRP_M8)
+int W_PD  = input.int(15, "PD Zone Weight", group=GRP_M8)
+int W_FVG = input.int(15, "FVG Weight", group=GRP_M8)
+int W_OB  = input.int(15, "OB Weight", group=GRP_M8)
+int W_MSS = input.int(10, "MSS Weight", group=GRP_M8)
+int W_BRK = input.int(5,  "Breaker Weight", group=GRP_M8)
+
+GRP_M9 = "Module 9 Penalties"
+int P_HTF_CONF = input.int(-20, "HTF Conflict Penalty", group=GRP_M9)
+int P_PD_CONF  = input.int(-15, "PD Conflict Penalty", group=GRP_M9)
+int P_SESS     = input.int(-10, "Against Session Penalty", group=GRP_M9)
+int P_WEAK_DSP = input.int(-8,  "Weak Displacement Penalty", group=GRP_M9)
+int P_LOW_LIQ  = input.int(-5,  "Low Liquidity Penalty", group=GRP_M9)
+
+color C_BULL_OB  = color.new(color.blue, 70)
+color C_BEAR_OB  = color.new(color.orange, 70)
+color C_BULL_FVG = color.new(color.green, 80)
+color C_BEAR_FVG = color.new(color.red, 80)
+color C_BRK      = color.new(color.purple, 60)
+color C_MIT      = color.new(color.gray, 70)
+color C_INV      = color.new(color.black, 50)
+color C_MSS_BULL = color.new(color.green, 0)
+color C_MSS_BEAR = color.new(color.red, 0)
+color C_POI      = color.new(color.teal, 50)
+
+string P9_HTF_1 = input.timeframe("60",  "HTF 1", group="Phase 9 — MTF Structure")
+string P9_HTF_2 = input.timeframe("240", "HTF 2", group="Phase 9 — MTF Structure")
+string P9_HTF_3 = input.timeframe("D",   "HTF 3", group="Phase 9 — MTF Structure")
+
+// ============================================================================
+// MODULE 1 — CONSTANTS & ENUMS
+// ============================================================================
+int LS_ACTIVE = 1
+int LS_SWEPT = 3
+int LS_INVALIDATED = 4
+int LS_EXPIRED = 5
+int LT_BUY_SIDE = 0
+int LT_SELL_SIDE = 1
+int ST_OFF_SESSION = 0
+int ST_ASIAN = 1
+int ST_LONDON = 2
+int ST_NEW_YORK = 3
+int TD_NEUTRAL = 0
+int TD_LONG = 1
+int TD_SHORT = 2
+int RS_ACTIVE = 1
+
+string EXIT_NONE = "NONE"
+string EXIT_MARKET_CLOSED = "MARKET_CLOSED"
+string EXIT_NO_POOL = "NO_POOL_SELECTED"
+string EXIT_NO_SWEEP = "NO_SWEEP_DETECTED"
+string EXIT_VAL_FAIL = "VALIDATION_FAILED"
+string EXIT_STRAT_REJ = "STRATEGY_REJECTED"
+string EXIT_ARB_REJ = "ARBITRATION_REJECTED"
+string EXIT_LOW_SCORE = "LOW_SCORE"
+
+int POOL_EXPIRY_BARS = 200
+int REC_EXPIRY_BARS = 100
+int OB_LOOKBACK = 20
+int LABEL_MAX_AGE = 4900
+float STRATEGY_TP_MULT = 2.0
+float STRATEGY_SL_BUFFER_ATR = 0.2
+float SWEEP_CONF_WEIGHT_1 = 0.6
+float SWEEP_CONF_WEIGHT_2 = 0.4
+float DISP_CLOSE_PCT = 0.25
+float MIN_SWING_ATR = 0.5
+float PD_PREMIUM_PCT = 0.7
+float PD_DISCOUNT_PCT = 0.3
+
+int MAX_MTF_REGISTRY = 100
+int MAX_LIQ_REGISTRY = 100
+int MAX_PD_REGISTRY = 100
+int MAX_FVG_REGISTRY = 200
+int MAX_OB_REGISTRY = 200
+int MAX_MSS_REGISTRY = 200
+int MAX_BRK_REGISTRY = 200
+int MAX_POI_REGISTRY = 50
+int MAX_TRADE_REC_REGISTRY = 500
+int MAX_EVENT_REGISTRY = 250
+int MAX_AUDIT_REGISTRY = 250
+int MAX_AUDIT_SUMMARY_REG = 100
+int MAX_ANALYTICS_REGISTRY = 100
+int MAX_LIFECYCLE_LOG = 10
+int MAX_EVENT_LOG_DISPLAY = 15
+int MAX_BASELINE_RECORDS = 500
+
+string ENGINE_VERSION = "2.0.0"
+int SEV_INFO = 0
+int SEV_WARNING = 1
+int SEV_ERROR = 2
+int SEV_CRITICAL = 3
+int MOD_MTF = 1
+int MOD_LIQ = 2
+int MOD_PD = 3
+int MOD_FVG = 4
+int MOD_OB = 5
+int MOD_MSS = 6
+int MOD_BRK = 7
+int MOD_POI = 8
+int MOD_TR = 9
+int MOD_BUS = 10
+int MOD_AUDIT = 11
+string EVENT_EMIT = "EMIT"
+string EVENT_CREATE = "CREATE"
+string EVENT_INVALID = "INVALIDATE"
+string EVENT_WARNING = "WARNING"
+string EVENT_ERROR = "ERROR"
+string EVENT_ASSERT = "ASSERT_FAIL"
+string AUDIT_SCHEMA_VERSION = "1.0"
+int AUDIT_INTERVAL = 50
+int ANALYTICS_INTERVAL = 100
+string AUDIT_STRUCTURE = "STRUCTURE"
+string AUDIT_DEPENDENCY = "DEPENDENCY"
+string AUDIT_REGISTRY = "REGISTRY"
+string AUDIT_REPLAY = "REPLAY"
+string AUDIT_ENGINE = "ENGINE"
+string AUDIT_PASS = "PASS"
+string AUDIT_WARNING = "WARNING"
+string AUDIT_FAIL = "FAIL"
+string AUDIT_SKIPPED = "SKIPPED"
+string EVENT_SCHEMA_VERSION = "1.0"
+
+string MSG_NO_POOL = "No Pool Selected"
+string MSG_VAL_FAIL = "Validation Failed"
+string MSG_STRAT_REJ = "Strategy Rejected"
+string MSG_WAIT_SWEEP = "Waiting for Sweep"
+string MSG_NO_ACTIVE_REC = "No Active Recommendation"
+string MSG_NOT_EVAL = "NOT_EVALUATED"
+string MSG_NO_ELIG = "No eligible pools found."
+string MSG_BULL_HIGHEST = "Bullish selected (Highest Score)."
+string MSG_BEAR_HIGHEST = "Bearish selected (Highest Score)."
+string MSG_BULL_NO_COMP = "Bullish selected (No Bearish competition)."
+string MSG_BEAR_NO_COMP = "Bearish selected (No Bullish competition)."
+string LBL_ENGINE_STAT = "ENGINE STATUS"
+string LBL_MKT_STRUCT = "MARKET STRUCTURE"
+string LBL_LIQ_STAT = "LIQUIDITY STATUS"
+string LBL_STRAT_ARB = "STRATEGY & ARBITRATION"
+string LBL_REC = "RECOMMENDATION"
+string LBL_PIPE_STAT = "PIPELINE STATUS"
+string LBL_M8_POI = "MODULE 8 - POI"
+string LBL_M9_HIST = "MODULE 9 - HISTORY"
+string LBL_M10_RATING = "MODULE 10 - RATING"
+string LBL_M11_EVENTS = "MODULE 11 - EVENTS"
+string LBL_M12_AUDIT = "MODULE 12 - AUDIT"
+string LBL_M13_ANALYTICS = "MODULE 13 - ANALYTICS"
+
+// ============================================================================
+// MODULE 2 — USER DEFINED TYPES (UDTs)
+// ============================================================================
+type SwingPoint
+    float price
+    int   barIndex
+    int   timeMs
+    bool  isHigh
+
+type LiquidityPool
+    int id
+    int poolType
+    int state
+    float priceLevel
+    int touchCount
+    float confidence
+    bool isSwept
+    int createdAtBar
+    int sweptAtBar
+    int invalidatedAtBar
+    string sweepReasonCode
+    array<SwingPoint> mitigations
+
+type ContextSnapshot
+    int barIndex
+    int timeMs
+    float currentPrice
+    float atr
+    int currentSession
+    int marketBias
+    float premiumZone
+    float discountZone
+    string time_str
+    string market_status
+
+type PipelineTrace
+    int eval_id
+    string pool_str
+    string sweep_str
+    string trend_str
+    string strategy_str
+    string arb_str
+    string final_str
+    string reason_str
+
+type StrategyCandidate
+    int id
+    LiquidityPool sourcePool
+    ContextSnapshot context
+    int direction
+    float entryPrice
+    float stopLoss
+    float takeProfit
+    string strategyName
+
+type Recommendation
+    int id
+    StrategyCandidate candidate
+    int status
+    int createdBarIndex
+    float actualEntry
+    float actualStop
+
+type PoolTracker
+    int poolId
+    int lastState
+    int activeStartBar
+    int reinforcedStartBar
+    int sweptStartBar
+
+type LifecycleAuditEntry
+    int poolId
+    int prevState
+    int newState
+    string transitionStr
+    string reason
+    int barIndex
+    int activeDuration
+    int reinforcedDuration
+    int sweptDuration
+
+type SelectionResult
+    LiquidityPool bestBullPool
+    LiquidityPool bestBearPool
+    LiquidityPool bestOverallPool
+    string selectionReason
+    float selectionConfidence
+
+type SelectionAuditData
+    int totalBull
+    int totalBear
+    int eligibleBull
+    int eligibleBear
+    string stateFilterBull
+    string stateFilterBear
+    int selectedBullId
+    int selectedBearId
+    int selectedOverallId
+    string finalRejectionReason
+
+type SweepValidationResult
+    bool isSwept
+    int sweepDirection
+    float sweepConfidence
+    string sweepReason
+    LiquidityPool sweptPool
+
+type ValidationSummary
+    bool isReady
+    string validationResult
+    string failureReason
+    string validationStatus
+    ContextSnapshot context
+    SelectionResult selection
+    SweepValidationResult sweep
+    int trend
+
+type StrategyResult
+    bool strategyApproved
+    int direction
+    float entryPrice
+    float stopLoss
+    float takeProfit
+    float riskReward
+    float strategyConfidence
+    string rejectionReason
+
+type ArbitrationResult
+    bool isApproved
+    int direction
+    float entryPrice
+    float stopLoss
+    float takeProfit
+    string reason
+
+type MTFStructureInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    string timeframe
+    int structuralBias
+    int lastBOS
+    int lastCHoCH
+    int timestamp
+
+type LiquidityHierarchyInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    int poolId
+    string tier
+    string originTimeframe
+    float price
+    bool swept
+    float institutionalScore
+
+type PDArrayInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    float rangeHigh
+    float rangeLow
+    float rangeSize
+    float equilibriumPrice
+    float currentPrice
+    float positionPercent
+    string currentZone
+    int timestamp
+
+type FVGInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    int direction
+    float gapTop
+    float gapBottom
+    float mitigationPercent
+    int originMTFBias
+    string originPDZone
+    string originLiquidityTier
+    int timestamp
+
+type OBInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    int direction
+    float obHigh
+    float obLow
+    float mitigationPercent
+
+type MSSInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    int direction
+    int triggerBarIndex
+    float triggerPrice
+    float triggerRange
+    float displacementStrength
+    string invalidatedStructureId
+    bool createsBreakerCandidate
+
+type BreakerBlockInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    int direction
+    float brkHigh
+    float brkLow
+    float mitigationPercent
+    string originOrderBlockId
+    string originOrderBlockInstance
+    string originMSSId
+    string originMSSInstance
+    int originBarTime
+    int originMTFBias
+    string originPDZone
+    string originLiquidityTier
+    string confidenceReason
+    float orig_mss_px
+    int orig_mss_bar
+
+type POIInstance
+    string baseId
+    string instanceId
+    string supersedes
+    string ctype
+    string sourceModule
+    int createdAt
+    string status
+    bool integrity
+    string contractVersion
+    string poiType
+    int direction
+    float poiHigh
+    float poiLow
+    float centerPrice
+    int session
+    int htfBias
+    string pdZone
+    string liqTier
+    string fvgLink
+    string obLink
+    string mssLink
+    string brkLink
+    int confluenceScore
+    string grade
+    string confidenceReason
+    string correlationId
+
+type TradeRecommendationInstance
+    string baseId
+    string instanceId
+    int version
+    string action
+    int direction
+    string rating
+    int confidence
+    int previousScore
+    int scoreDelta
+    int riskScore
+    float expectedRR
+    float entryPrice
+    float stopLoss
+    float takeProfit
+    string poiLink
+    string brkLink
+    string mssLink
+    string obLink
+    string fvgLink
+    string liqLink
+    string htfLink
+    string confidenceFactors
+    string reasons
+    string penalties
+    bool integrity
+    int createdAt
+    string correlationId
+    string exitReason
+    int pipelineBars
+
+type EventRegistryInstance
+    int eventId
+    int parentEventId
+    string correlationId
+    int module
+    string eventType
+    int severity
+    string outcome
+    string objectId
+    int timestamp
+    int barIndex
+    string timeStr
+    string engineVersion
+    string schemaVersion
+    string metadata
+    string description
+    bool integrity
+    int createdAt
+
+type AuditResultInstance
+    int auditId
+    string auditType
+    int severity
+    string status
+    string objectId
+    string module
+    string correlationId
+    string message
+    string recommendation
+    bool integrity
+    string auditVersion
+    int timestamp
+    int createdAt
+
+type AuditSummaryInstance
+    int cycleId
+    int timestamp
+    int barIndex
+    int trustScore
+    int totalAudits
+    int passed
+    int warnings
+    int failures
+    int skipped
+    string summary
+
+type AnalyticsSummaryInstance
+    int snapshotId
+    int timestamp
+    int barIndex
+    int totalRecommendations
+    float avgConfidence
+    int confBucket_60_69
+    int confBucket_70_79
+    int confBucket_80_89
+    int confBucket_90_100
+    int poiGrade_A_plus
+    int poiGrade_A
+    int poiGrade_B
+    int poiGrade_C
+    int factor_HTF
+    int factor_OB
+    int factor_FVG
+    int factor_Breaker
+    int factor_Sweep
+    int factor_PD
+    string mostCommonAuditFail
+    int wins
+    int losses
+    float profitFactor
+    float expectancy
+    float drawdown
+    int rej_pool
+    int rej_sweep
+    int rej_val
+    int rej_strat
+    int rej_arb
+    int rej_low_score
+    int fvg_used
+    int ob_used
+    int brk_used
+    float avgPipelineBars
+    int maxPipelineBars
+
+type StructureState
+    int current_trend
+    int last_bos_dir
+    int last_choch_dir
+    float last_swing_high_price
+    int   last_swing_high_bar
+    float last_swing_low_price
+    int   last_swing_low_bar
+
+type MTFState
+    int ver_1
+    int ver_2
+    int ver_3
+    int bias_1
+    int bias_2
+    int bias_3
+    int bos_1
+    int bos_2
+    int bos_3
+    int choch_1
+    int choch_2
+    int choch_3
+    float hi_1
+    float hi_2
+    float hi_3
+    float lo_1
+    float lo_2
+    float lo_3
+    int t_1
+    int t_2
+    int t_3
+    bool integ_1
+    bool integ_2
+    bool integ_3
+    int l_bias_1
+    int l_bias_2
+    int l_bias_3
+    int l_bos_1
+    int l_bos_2
+    int l_bos_3
+    int l_choch_1
+    int l_choch_2
+    int l_choch_3
+    bool l_integ_1
+    bool l_integ_2
+    bool l_integ_3
+
+type RegistryCounters
+    int next_pool_id
+    int next_rec_id
+    int next_fvg_id
+    int next_ob_id
+    int next_mss_id
+    int next_brk_id
+    int next_poi_id
+    int next_trade_rec_id
+    int liq_total_emitted
+    int fvg_total_emitted
+    int ob_total_emitted
+    int mss_total_emitted
+    int brk_total_emitted
+    int poi_total_emitted
+    int trade_rec_total_emitted
+    int pd_ver
+    float pd_high
+    float pd_low
+    string pd_zone
+    bool pd_integ
+
+type DiagnosticsState
+    string mss_diag_reason
+    int mss_diag_bar
+    int mss_last_eval_bar
+    string brk_diag_reason
+    int brk_diag_bar
+    int brk_last_eval_bar
+    bool brk_diag_ob_inv
+    bool brk_diag_mss_found
+    int brk_stat_evals
+    int brk_stat_created
+    int brk_stat_rej_no_mss
+    int brk_stat_rej_integrity
+    int brk_stat_rej_direction
+    int brk_stat_waiting
+    int drawn_fvg
+    int drawn_ob
+    int drawn_brk
+    int drawn_poi
+    string poi_latest_grade
+    int poi_latest_score
+    string poi_latest_type
+    int poi_latest_dir
+    int poi_highest_score
+    string poi_latest_rationale
+    string m10_latest_action
+    string m10_latest_rating
+    int m10_latest_score
+    string m10_latest_risk
+    int m10_latest_risk_score
+    float m10_latest_rr
+    float m10_latest_entry
+    float m10_latest_sl
+    float m10_latest_tp
+    string m10_latest_reasons
+    string m10_latest_penalties
+    string m10_reject_reason
+    string struct_logs
+
+type EventBusState
+    int next_event_id
+    int event_total_emitted
+    int next_flow_id
+    string current_correlation_id
+    int last_event_id
+
+type AuditState
+    int next_audit_id
+    int audit_total_emitted
+    int next_audit_cycle_id
+    int lifetime_audit_failures
+    int lifetime_audit_warnings
+    int lifetime_audit_passed
+    int m12_cycle_trust_score
+    int m12_cycle_failures
+    int m12_cycle_warnings
+    int m12_cycle_passed
+    int m12_cycle_skipped
+    string m12_last_summary
+    string audit_last_failure_msg
+
+type AnalyticsState
+    int next_analytics_id
+    int m13_last_snapshot_id
+    int m13_last_total_recs
+    float m13_last_avg_conf
+    string m13_last_common_audit
+    string m13_last_summary
+    string m13_last_rej_dist
+    string m13_last_poi_util
+    float m13_last_avg_pipe
+    int m13_last_max_pipe
+    int val_evals
+    int val_pools_created
+    int val_sweeps
+    int val_bull_choch
+    int val_bear_choch
+    int val_buys
+    int val_sells
+    int val_rej_pool
+    int val_rej_val
+    int val_rej_strat
+    int val_rej_arb
+    float val_sum_conf
+    float val_sum_rr
+    float val_sum_pipe_bars
+    int val_sum_audit_trust
+    int val_strat_approved
+
+type EngineState
+    ContextSnapshot current_context
+    SelectionResult current_selection
+    SweepValidationResult current_sweep_validation
+    ValidationSummary current_validation
+    StrategyResult current_strategy
+    ArbitrationResult current_arbitration
+    Recommendation active_rec
+    SelectionAuditData current_audit
+    PipelineTrace current_trace
+    StructureState structure
+    MTFState mtf
+    RegistryCounters counters
+    DiagnosticsState diag
+    EventBusState bus
+    AuditState audit
+    AnalyticsState analytics
+
+type SelectionBaselineRecord
+    int timestamp
+    int barIndex
+    int poolId
+    float confidence
+    int touchCount
+    bool isSwept
+    int htfBias
+    float distanceFromPrice
+    string selectionReason
+
+// ============================================================================
+// MODULE 3 — GLOBAL STATE & REGISTRIES
+// ============================================================================
+var EngineState S = EngineState.new(na, na, na, na, na, na, na, na, na, na, na, na, na, na, na, na)
+
+if barstate.isfirst
+    S.current_context := ContextSnapshot.new(na, na, na, na, na, na, na, na, "00:00", "CLOSED")
+    S.structure := StructureState.new(0, 0, 0, na, na, na, na)
+    S.mtf := MTFState.new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, na, na, na, na, na, na, 0, 0, 0, false, false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false, false)
+    S.counters := RegistryCounters.new(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, na, na, "N/A", false)
+    S.diag := DiagnosticsState.new("No CHoCH detected", na, na, "Waiting for OB Invalidation", na, na, false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "N/A", 0, "N/A", 0, 0, "N/A", "WAIT", "Reject", 0, "Medium", 50, 0.0, na, na, na, "N/A", "N/A", "None", "")
+    S.bus := EventBusState.new(1, 0, 1, "INIT", 0)
+    S.audit := AuditState.new(1, 0, 1, 0, 0, 0, 100, 0, 0, 0, 0, "No audits run yet", "None")
+    S.analytics := AnalyticsState.new(1, 0, 0, 0.0, "None", "No analytics run yet", "N/A", "N/A", 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0)
+    
+    S.current_validation := ValidationSummary.new(false, "N/A", "N/A", "PENDING", S.current_context, SelectionResult.new(na, na, na, "N/A", 0.0), SweepValidationResult.new(false, 0, 0.0, "N/A", na), 0)
+    S.current_strategy := StrategyResult.new(false, 0, na, na, na, 0.0, 0.0, "Not evaluated")
+    S.current_arbitration := ArbitrationResult.new(false, 0, na, na, na, "Not evaluated")
+    S.current_trace := PipelineTrace.new(0, "WAIT", "WAIT", "WAIT", "WAIT", "WAIT", "FAIL", "No data")
+    S.current_audit := SelectionAuditData.new(0, 0, 0, 0, "N/A", "N/A", -1, -1, -1, "No data")
+    S.active_rec := Recommendation.new(0, StrategyCandidate.new(0, LiquidityPool.new(0, 0, 0, na, 0, 0.0, false, 0, 0, 0, "N/A", array.new<SwingPoint>()), S.current_context, 0, na, na, na, "N/A"), 0, 0, na, na)
+    S.current_selection := SelectionResult.new(na, na, na, "N/A", 0.0)
+    S.current_sweep_validation := SweepValidationResult.new(false, 0, 0.0, "N/A", na)
+
+var array<LiquidityPool> g_registry = array.new<LiquidityPool>()
+var array<string> g_event_log = array.new<string>()
+var array<PoolTracker> g_pool_trackers = array.new<PoolTracker>()
+var array<LifecycleAuditEntry> g_lifecycle_audit_log = array.new<LifecycleAuditEntry>()
+var array<string> _lc_logs = array.new<string>()
+var array<MTFStructureInstance> g_mtf_registry = array.new<MTFStructureInstance>()
+var array<LiquidityHierarchyInstance> g_liq_registry = array.new<LiquidityHierarchyInstance>()
+var array<int> g_liq_pool_ids = array.new<int>()
+var array<string> g_liq_tier_map = array.new<string>()
+var array<bool> g_liq_swept_map = array.new<bool>()
+var array<int> g_liq_ver_map = array.new<int>()
+var array<float> g_liq_score_map = array.new<float>()
+var array<PDArrayInstance> g_pd_registry = array.new<PDArrayInstance>()
+var array<FVGInstance> g_fvg_registry = array.new<FVGInstance>()
+var array<string> g_fvg_base_id = array.new<string>()
+var array<int> g_fvg_ver = array.new<int>()
+var array<float> g_fvg_top = array.new<float>()
+var array<float> g_fvg_bot = array.new<float>()
+var array<int> g_fvg_dir = array.new<int>()
+var array<string> g_fvg_state = array.new<string>()
+var array<float> g_fvg_mit_pct = array.new<float>()
+var array<OBInstance> g_ob_registry = array.new<OBInstance>()
+var array<string> g_ob_base_id = array.new<string>()
+var array<int> g_ob_ver = array.new<int>()
+var array<int> g_ob_dir = array.new<int>()
+var array<float> g_ob_high = array.new<float>()
+var array<float> g_ob_low = array.new<float>()
+var array<string> g_ob_state = array.new<string>()
+var array<float> g_ob_mit_pct = array.new<float>()
+var array<MSSInstance> g_mss_registry = array.new<MSSInstance>()
+var array<string> g_mss_base_id = array.new<string>()
+var array<int> g_mss_ver = array.new<int>()
+var array<int> g_mss_dir = array.new<int>()
+var array<string> g_mss_state = array.new<string>()
+var array<float> g_mss_trigger_px = array.new<float>()
+var array<int> g_mss_trigger_bar = array.new<int>()
+var array<float> g_mss_trigger_rg = array.new<float>()
+var array<float> g_mss_disp_str = array.new<float>()
+var array<bool> g_mss_breaker = array.new<bool>()
+var array<BreakerBlockInstance> g_brk_registry = array.new<BreakerBlockInstance>()
+var array<string> g_brk_base_id = array.new<string>()
+var array<int> g_brk_ver = array.new<int>()
+var array<int> g_brk_dir = array.new<int>()
+var array<float> g_brk_high = array.new<float>()
+var array<float> g_brk_low = array.new<float>()
+var array<string> g_brk_state = array.new<string>()
+var array<float> g_brk_mit_pct = array.new<float>()
+var array<string> g_brk_src_ob_base = array.new<string>()
+var array<string> g_brk_src_ob_inst = array.new<string>()
+var array<string> g_brk_src_mss_base = array.new<string>()
+var array<string> g_brk_src_mss_inst = array.new<string>()
+var array<int> g_brk_orig_time = array.new<int>()
+var array<int> g_brk_orig_bias = array.new<int>()
+var array<string> g_brk_orig_pd = array.new<string>()
+var array<string> g_brk_orig_liq = array.new<string>()
+var array<string> g_brk_conf_reason = array.new<string>()
+var array<float> g_brk_orig_mss_px = array.new<float>()
+var array<int> g_brk_orig_mss_bar = array.new<int>()
+var array<POIInstance> g_poi_registry = array.new<POIInstance>()
+var array<string> g_poi_base_id = array.new<string>()
+var array<int> g_poi_ver = array.new<int>()
+var array<string> g_poi_state = array.new<string>()
+var array<float> g_poi_high = array.new<float>()
+var array<float> g_poi_low = array.new<float>()
+var array<int> g_poi_dir = array.new<int>()
+var array<int> g_poi_score = array.new<int>()
+var array<string> g_poi_grade = array.new<string>()
+var array<string> g_poi_type = array.new<string>()
+var array<string> g_poi_links = array.new<string>()
+var array<string> g_poi_rationale = array.new<string>()
+var array<TradeRecommendationInstance> g_trade_rec_registry = array.new<TradeRecommendationInstance>()
+var array<string> g_trade_rec_base_id = array.new<string>()
+var array<string> g_trade_rec_action = array.new<string>()
+var array<string> g_trade_rec_rating = array.new<string>()
+var array<int> g_trade_rec_score = array.new<int>()
+var array<EventRegistryInstance> g_event_registry = array.new<EventRegistryInstance>()
+var array<AuditResultInstance> g_audit_registry = array.new<AuditResultInstance>()
+var array<AuditSummaryInstance> g_audit_summary_registry = array.new<AuditSummaryInstance>()
+var array<AnalyticsSummaryInstance> g_analytics_registry = array.new<AnalyticsSummaryInstance>()
+var array<Recommendation> g_recommendations = array.new<Recommendation>()
+var array<box> fvg_boxes = array.new<box>()
+var array<box> ob_boxes = array.new<box>()
+var array<box> brk_boxes = array.new<box>()
+var array<box> poi_boxes = array.new<box>()
+var array<label> mss_labels = array.new<label>()
+var array<line> debug_lines = array.new<line>()
+var array<SelectionBaselineRecord> g_selection_baseline = array.new<SelectionBaselineRecord>()
+
+var table dash_table = table.new(position.top_right, 2, 100, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table event_log_table = table.new(position.top_left, 1, 16, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table audit_table = table.new(position.bottom_right, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table lifecycle_audit_table = table.new(position.middle_left, 2, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table p9_debug_table = table.new(position.bottom_right, 2, 20, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table p9_inspector_table = table.new(position.middle_right, 2, 36, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table p9_engine_summary_table = table.new(position.bottom_right, 2, 9, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table profile_table = table.new(position.bottom_left, 3, 10, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+var table validation_table = table.new(position.bottom_right, 2, 20, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+int asian_start = ASIAN_START_HR * 60 + ASIAN_START_MIN
+int asian_end = ASIAN_END_HR * 60 + ASIAN_END_MIN
+int london_start = LONDON_START_HR * 60 + LONDON_START_MIN
+int london_end = LONDON_END_HR * 60 + LONDON_END_MIN
+int ny_start = NY_START_HR * 60 + NY_START_MIN
+int ny_end = NY_END_HR * 60 + NY_END_MIN
+
+// ============================================================================
+// MODULE 4 — HELPER FUNCTIONS
+// ============================================================================
+f_format_id(string prefix, int seq, int ver) =>
+    string seq_str = str.tostring(seq)
+    while str.length(seq_str) < 6
+        seq_str := "0" + seq_str
+    if ver > 0
+        string ver_str = str.tostring(ver)
+        while str.length(ver_str) < 2
+            ver_str := "0" + ver_str
+        prefix + "-" + seq_str + "-v" + ver_str
+    else
+        prefix + "-" + seq_str
+
+f_create_liquidity_pool(int _id, int _poolType, int _state, float _priceLevel, int _touchCount, float _confidence, bool _isSwept, int _createdAtBar, int _sweptAtBar, int _invalidatedAtBar, string _sweepReasonCode, array<SwingPoint> _mitigations) =>
+    LiquidityPool.new(_id, _poolType, _state, _priceLevel, _touchCount, _confidence, _isSwept, _createdAtBar, _sweptAtBar, _invalidatedAtBar, _sweepReasonCode, _mitigations)
+
+f_state_to_string(int state_val) =>
+    string res = "UNKNOWN"
+    if state_val == LS_ACTIVE
+        res := "ACTIVE"
+    else if state_val == LS_SWEPT
+        res := "SWEPT"
+    else if state_val == LS_INVALIDATED
+        res := "INVALIDATED"
+    else if state_val == LS_EXPIRED
+        res := "EXPIRED"
+    res
+
+f_score_pool(LiquidityPool pool) =>
+    float score = pool.confidence
+    if pool.state == 2
+        score += 0.5
+        score += pool.touchCount * 0.1
+    score
+
+f_is_in_range(int cur_mins, int start_mins, int end_mins) =>
+    if start_mins <= end_mins
+        cur_mins >= start_mins and cur_mins < end_mins
+    else
+        cur_mins >= start_mins or cur_mins < end_mins
+
+f_push_int(array<int> registry, int value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_float(array<float> registry, float value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_string(array<string> registry, string value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_mtf(array<MTFStructureInstance> registry, MTFStructureInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_liq(array<LiquidityHierarchyInstance> registry, LiquidityHierarchyInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_pd(array<PDArrayInstance> registry, PDArrayInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_fvg(array<FVGInstance> registry, FVGInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_ob(array<OBInstance> registry, OBInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_mss(array<MSSInstance> registry, MSSInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_brk(array<BreakerBlockInstance> registry, BreakerBlockInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_audit(array<AuditResultInstance> registry, AuditResultInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_audit_summary(array<AuditSummaryInstance> registry, AuditSummaryInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_analytics(array<AnalyticsSummaryInstance> registry, AnalyticsSummaryInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_event(array<EventRegistryInstance> registry, EventRegistryInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_poi(array<POIInstance> registry, POIInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_trade_rec(array<TradeRecommendationInstance> registry, TradeRecommendationInstance value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_baseline(array<SelectionBaselineRecord> registry, SelectionBaselineRecord value, int max_size) =>
+    array.push(registry, value)
+    if array.size(registry) > max_size
+        array.shift(registry)
+
+f_push_poi_registry(POIInstance inst, string baseId, int ver, string state, float poiHigh, float poiLow, int dir, int score, string grade, string poiTypeArg, string links, string rationale) =>
+    f_push_poi(g_poi_registry, inst, MAX_POI_REGISTRY)
+    f_push_string(g_poi_base_id, baseId, MAX_POI_REGISTRY)
+    f_push_int(g_poi_ver, ver, MAX_POI_REGISTRY)
+    f_push_string(g_poi_state, state, MAX_POI_REGISTRY)
+    f_push_float(g_poi_high, poiHigh, MAX_POI_REGISTRY)
+    f_push_float(g_poi_low, poiLow, MAX_POI_REGISTRY)
+    f_push_int(g_poi_dir, dir, MAX_POI_REGISTRY)
+    f_push_int(g_poi_score, score, MAX_POI_REGISTRY)
+    f_push_string(g_poi_grade, grade, MAX_POI_REGISTRY)
+    f_push_string(g_poi_type, poiTypeArg, MAX_POI_REGISTRY)
+    f_push_string(g_poi_links, links, MAX_POI_REGISTRY)
+    f_push_string(g_poi_rationale, rationale, MAX_POI_REGISTRY)
+
+f_push_trade_rec_registry(TradeRecommendationInstance inst, string baseId, string action, string rating, int score) =>
+    f_push_trade_rec(g_trade_rec_registry, inst, MAX_TRADE_REC_REGISTRY)
+    f_push_string(g_trade_rec_base_id, baseId, MAX_TRADE_REC_REGISTRY)
+    f_push_string(g_trade_rec_action, action, MAX_TRADE_REC_REGISTRY)
+    f_push_string(g_trade_rec_rating, rating, MAX_TRADE_REC_REGISTRY)
+    f_push_int(g_trade_rec_score, score, MAX_TRADE_REC_REGISTRY)
+
+f_bus_emit(int evtId, int pEvtId, string corrId, int modId, string eType, int sev, string outc, string objId, string desc, string meta, bool integ) =>
+    EventRegistryInstance bus_evt = EventRegistryInstance.new(evtId, pEvtId, corrId, modId, eType, sev, outc, objId, time, bar_index, str.format_time(time, "HH:mm", syminfo.timezone), ENGINE_VERSION, EVENT_SCHEMA_VERSION, meta, desc, integ, bar_index)
+    f_push_event(g_event_registry, bus_evt, MAX_EVENT_REGISTRY)
+    string sev_str = sev == SEV_INFO ? "INFO" : sev == SEV_WARNING ? "WARN" : sev == SEV_ERROR ? "ERROR" : "SUCCESS"
+    array.push(g_event_log, str.format_time(time, "HH:mm", syminfo.timezone) + " [" + sev_str + "/" + outc + "] " + desc)
+    bus_evt
+
+f_emit_engine_event(EngineState st, int pEvtId, string corrId, int modId, string eType, int sev, string outc, string objId, string desc, string meta, bool integ) =>
+    int evtId = st.bus.next_event_id
+    st.bus.next_event_id += 1
+    st.bus.event_total_emitted += 1
+    _ = f_bus_emit(evtId, pEvtId, corrId, modId, eType, sev, outc, objId, desc, meta, integ)
+    st.bus.last_event_id := evtId
+    evtId
+
+// ── Dashboard Rendering Helpers ──
+f_table_cell(table t, int c, int r, string s) =>
+    table.cell(t, c, r, s, text_color=color.white, text_size=size.tiny)
+
+f_table_cell_color(table t, int c, int r, string s, color tc) =>
+    table.cell(t, c, r, s, text_color=tc, text_size=size.tiny)
+
+f_table_header(table t, int c, int r, string s) =>
+    table.cell(t, c, r, s, text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+
+f_get_latest_mtf_bias(string tf) =>
+    TD_NEUTRAL
+
+// ============================================================================
+// MODULE 5 — MARKET STRUCTURE ENGINE
+// ============================================================================
+f_m5_record_structure_audit(EngineState st, string corr_id, string object_id, string message) =>
+    int audit_id = st.audit.next_audit_id
+    st.audit.next_audit_id += 1
+    st.audit.audit_total_emitted += 1
+    st.audit.lifetime_audit_passed += 1
+    st.audit.m12_cycle_passed += 1
+    st.audit.m12_last_summary := message
+
+    AuditResultInstance audit_result = AuditResultInstance.new(
+         audit_id,
+         AUDIT_STRUCTURE,
+         SEV_INFO,
+         AUDIT_PASS,
+         object_id,
+         "Module 5",
+         corr_id,
+         message,
+         "No action required",
+         true,
+         AUDIT_SCHEMA_VERSION,
+         time,
+         bar_index)
+
+    f_push_audit(g_audit_registry, audit_result, MAX_AUDIT_REGISTRY)
+
+f_m5_update_structure(EngineState st) =>
+    if barstate.isnew
+        st.analytics.val_evals += 1
+
+    st.current_context.barIndex := bar_index
+    st.current_context.timeMs := time
+    st.current_context.currentPrice := close
+    st.current_context.atr := ta.atr(ATR_LENGTH)
+
+    float prior_swing_high = st.structure.last_swing_high_price
+    float prior_swing_low = st.structure.last_swing_low_price
+    int prior_trend = st.structure.current_trend
+
+    bool bull_break = not na(prior_swing_high) and close > prior_swing_high and close[1] <= prior_swing_high
+    bool bear_break = not na(prior_swing_low) and close < prior_swing_low and close[1] >= prior_swing_low
+
+    float confirmed_swing_high = ta.pivothigh(high, SWING_LOOKBACK, SWING_LOOKBACK)
+    float confirmed_swing_low = ta.pivotlow(low, SWING_LOOKBACK, SWING_LOOKBACK)
+
+    if not na(confirmed_swing_high)
+        st.structure.last_swing_high_price := confirmed_swing_high
+        st.structure.last_swing_high_bar := bar_index - SWING_LOOKBACK
+
+    if not na(confirmed_swing_low)
+        st.structure.last_swing_low_price := confirmed_swing_low
+        st.structure.last_swing_low_bar := bar_index - SWING_LOOKBACK
+
+    if bull_break or bear_break
+        int break_direction = bull_break ? TD_LONG : TD_SHORT
+        bool is_choch = (break_direction == TD_LONG and prior_trend == TD_SHORT) or (break_direction == TD_SHORT and prior_trend == TD_LONG)
+        string structure_type = is_choch ? "CHoCH" : "BOS"
+        string object_id = f_format_id("M5-" + structure_type, bar_index, 0)
+        string correlation_id = "M5-" + str.tostring(bar_index)
+        string message = structure_type + " " + (break_direction == TD_LONG ? "BULLISH" : "BEARISH")
+
+        st.structure.current_trend := break_direction
+        st.current_context.marketBias := break_direction
+        
+        st.current_validation.trend := break_direction
+        st.current_trace.trend_str := "PASS"
+        
+        st.diag.struct_logs := message
+
+        if is_choch
+            st.structure.last_choch_dir := break_direction
+            if break_direction == TD_LONG
+                st.analytics.val_bull_choch += 1
+            else if break_direction == TD_SHORT
+                st.analytics.val_bear_choch += 1
+        else
+            st.structure.last_bos_dir := break_direction
+
+        _ = f_emit_engine_event(
+             st,
+             0,
+             correlation_id,
+             MOD_MSS,
+             EVENT_CREATE,
+             SEV_INFO,
+             "SUCCESS",
+             object_id,
+             message,
+             "{}",
+             true)
+
+        f_m5_record_structure_audit(st, correlation_id, object_id, message)
+
+// ============================================================================
+// MODULE 6 — LIQUIDITY POOL LIFECYCLE ENGINE (INSTRUMENTED)
+// ============================================================================
+f_m6_record_pool_audit(EngineState st, string corr_id, string object_id, string message) =>
+    int audit_id = st.audit.next_audit_id
+    st.audit.next_audit_id += 1
+    st.audit.audit_total_emitted += 1
+    st.audit.lifetime_audit_passed += 1
+    st.audit.m12_cycle_passed += 1
+    st.audit.m12_last_summary := message
+
+    AuditResultInstance audit_result = AuditResultInstance.new(
+         audit_id,
+         AUDIT_REGISTRY,
+         SEV_INFO,
+         AUDIT_PASS,
+         object_id,
+         "Module 6",
+         corr_id,
+         message,
+         "No action required",
+         true,
+         AUDIT_SCHEMA_VERSION,
+         time,
+         bar_index)
+
+    f_push_audit(g_audit_registry, audit_result, MAX_AUDIT_REGISTRY)
+
+f_m6_update_liquidity(EngineState st) =>
+    // INSTRUMENTATION: ENTRY & VARIABLE DUMP
+    st.current_trace.pool_str += "\nENTERED M6"
+    _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "ENTERED M6", "{}", true)
+    
+    st.current_trace.pool_str += "\nCurrBar=" + str.tostring(bar_index) + " SWING_LB=" + str.tostring(SWING_LOOKBACK)
+    st.current_trace.pool_str += "\nM5_HighBar=" + str.tostring(st.structure.last_swing_high_bar) + " M5_LowBar=" + str.tostring(st.structure.last_swing_low_bar)
+    st.current_trace.pool_str += "\nTarget_HB=" + str.tostring(bar_index - SWING_LOOKBACK) + " Target_LB=" + str.tostring(bar_index - SWING_LOOKBACK)
+
+    bool new_swing_high = not na(st.structure.last_swing_high_price) and st.structure.last_swing_high_bar == bar_index - SWING_LOOKBACK
+    bool new_swing_low  = not na(st.structure.last_swing_low_price) and st.structure.last_swing_low_bar == bar_index - SWING_LOOKBACK
+
+    // Log prices to ensure they are not na
+    st.current_trace.pool_str += "\nHighPrice=" + str.tostring(st.structure.last_swing_high_price, "#.##")
+    st.current_trace.pool_str += "\nLowPrice=" + str.tostring(st.structure.last_swing_low_price, "#.##")
+
+    st.current_trace.pool_str += "\nnew_swing_high=" + (new_swing_high ? "TRUE" : "FALSE") + " new_swing_low=" + (new_swing_low ? "TRUE" : "FALSE")
+
+    if new_swing_high
+        st.current_trace.pool_str += "\nPASSED SWING CHECK (HIGH)"
+        _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "PASSED SWING CHECK (HIGH)", "{}", true)
+        
+        int pool_id = st.counters.next_pool_id
+        st.counters.next_pool_id += 1
+        st.counters.liq_total_emitted += 1
+        st.analytics.val_pools_created += 1
+        
+        LiquidityPool new_pool = f_create_liquidity_pool(pool_id, LT_BUY_SIDE, LS_ACTIVE, st.structure.last_swing_high_price, 0, 0.5, false, bar_index - SWING_LOOKBACK, na, na, "NONE", array.new<SwingPoint>())
+        st.current_trace.pool_str += "\nPOOL CREATED (HIGH) ID:" + str.tostring(pool_id)
+        _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "POOL CREATED (HIGH) ID:" + str.tostring(pool_id), "{}", true)
+             
+        array.push(g_registry, new_pool)
+        
+        // Log registry growth immediately after push
+        st.current_trace.pool_str += "\nRegistrySize=" + str.tostring(array.size(g_registry))
+        st.current_trace.pool_str += "\nPoolsCreated=" + str.tostring(st.analytics.val_pools_created)
+        
+        // Verify the pushed pool
+        LiquidityPool verify_pool = array.get(g_registry, array.size(g_registry) - 1)
+        st.current_trace.pool_str += "\nLastPoolID=" + str.tostring(verify_pool.id)
+        st.current_trace.pool_str += "\nLastPoolState=" + str.tostring(verify_pool.state)
+        
+        _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "PUSHED TO REGISTRY | Size=" + str.tostring(array.size(g_registry)), "{}", true)
+        
+        string obj_id = f_format_id("M6-BSL", pool_id, 0)
+        string corr_id = "M6-" + str.tostring(bar_index)
+        string msg = "Buy-Side Liquidity Created @ " + str.tostring(new_pool.priceLevel, "#.##")
+        _ = f_emit_engine_event(st, 0, corr_id, MOD_LIQ, EVENT_CREATE, SEV_INFO, "SUCCESS", obj_id, msg, "{}", true)
+        f_m6_record_pool_audit(st, corr_id, obj_id, msg)
+
+    if new_swing_low
+        st.current_trace.pool_str += "\nPASSED SWING CHECK (LOW)"
+        _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "PASSED SWING CHECK (LOW)", "{}", true)
+        
+        int pool_id = st.counters.next_pool_id
+        st.counters.next_pool_id += 1
+        st.counters.liq_total_emitted += 1
+        st.analytics.val_pools_created += 1
+        
+        LiquidityPool new_pool = f_create_liquidity_pool(pool_id, LT_SELL_SIDE, LS_ACTIVE, st.structure.last_swing_low_price, 0, 0.5, false, bar_index - SWING_LOOKBACK, na, na, "NONE", array.new<SwingPoint>())
+        st.current_trace.pool_str += "\nPOOL CREATED (LOW) ID:" + str.tostring(pool_id)
+        _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "POOL CREATED (LOW) ID:" + str.tostring(pool_id), "{}", true)
+             
+        array.push(g_registry, new_pool)
+        
+        // Log registry growth immediately after push
+        st.current_trace.pool_str += "\nRegistrySize=" + str.tostring(array.size(g_registry))
+        st.current_trace.pool_str += "\nPoolsCreated=" + str.tostring(st.analytics.val_pools_created)
+        
+        // Verify the pushed pool
+        LiquidityPool verify_pool = array.get(g_registry, array.size(g_registry) - 1)
+        st.current_trace.pool_str += "\nLastPoolID=" + str.tostring(verify_pool.id)
+        st.current_trace.pool_str += "\nLastPoolState=" + str.tostring(verify_pool.state)
+        
+        _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "PUSHED TO REGISTRY | Size=" + str.tostring(array.size(g_registry)), "{}", true)
+        
+        string obj_id = f_format_id("M6-SSL", pool_id, 0)
+        string corr_id = "M6-" + str.tostring(bar_index)
+        string msg = "Sell-Side Liquidity Created @ " + str.tostring(new_pool.priceLevel, "#.##")
+        _ = f_emit_engine_event(st, 0, corr_id, MOD_LIQ, EVENT_CREATE, SEV_INFO, "SUCCESS", obj_id, msg, "{}", true)
+        f_m6_record_pool_audit(st, corr_id, obj_id, msg)
+
+    while array.size(g_registry) > MAX_POOLS
+        array.shift(g_registry)
+
+    // Phase B — Pool Lifecycle
+    if array.size(g_registry) > 0
+        for i = 0 to array.size(g_registry) - 1
+            LiquidityPool pool = array.get(g_registry, i)
+            
+            if pool.state == LS_EXPIRED or pool.state == LS_INVALIDATED
+                continue
+                
+            float lvl = pool.priceLevel
+            bool is_buy = pool.poolType == LT_BUY_SIDE
+
+            if bar_index - pool.createdAtBar > POOL_EXPIRY_BARS
+                pool.state := LS_EXPIRED
+                pool.invalidatedAtBar := bar_index
+                string obj_id = f_format_id("M6-POOL", pool.id, 0)
+                string corr_id = "M6-" + str.tostring(bar_index)
+                string msg = "Pool #" + str.tostring(pool.id) + " Expired"
+                _ = f_emit_engine_event(st, 0, corr_id, MOD_LIQ, EVENT_INVALID, SEV_INFO, "EXPIRED", obj_id, msg, "{}", true)
+                f_m6_record_pool_audit(st, corr_id, obj_id, msg)
+                continue
+
+            if pool.state == LS_ACTIVE or pool.state == 2 // 2 = TOUCHED
+                bool sweep_cond = is_buy ? (high > lvl and close < lvl) : (low < lvl and close > lvl)
+                if sweep_cond
+                    pool.state := LS_SWEPT
+                    pool.isSwept := true
+                    pool.sweptAtBar := bar_index
+                    pool.sweepReasonCode := is_buy ? "BSL_SWEEP" : "SSL_SWEEP"
+                    st.analytics.val_sweeps += 1
+                    string obj_id = f_format_id("M6-POOL", pool.id, 0)
+                    string corr_id = "M6-" + str.tostring(bar_index)
+                    string msg = "Pool #" + str.tostring(pool.id) + " Swept"
+                    _ = f_emit_engine_event(st, 0, corr_id, MOD_LIQ, EVENT_INVALID, SEV_WARNING, "SWEPT", obj_id, msg, "{}", true)
+                    f_m6_record_pool_audit(st, corr_id, obj_id, msg)
+                    continue
+
+                bool inv_cond = is_buy ? (close > lvl) : (close < lvl)
+                if inv_cond
+                    pool.state := LS_INVALIDATED
+                    pool.invalidatedAtBar := bar_index
+                    pool.sweepReasonCode := "BOS_BREAK"
+                    string obj_id = f_format_id("M6-POOL", pool.id, 0)
+                    string corr_id = "M6-" + str.tostring(bar_index)
+                    string msg = "Pool #" + str.tostring(pool.id) + " Invalidated by BOS"
+                    _ = f_emit_engine_event(st, 0, corr_id, MOD_LIQ, EVENT_INVALID, SEV_ERROR, "INVALIDATED", obj_id, msg, "{}", true)
+                    f_m6_record_pool_audit(st, corr_id, obj_id, msg)
+                    continue
+
+                bool touch_cond = is_buy ? (high >= lvl) : (low <= lvl)
+                if touch_cond and pool.state == LS_ACTIVE
+                    pool.state := 2 // TOUCHED
+                    pool.touchCount += 1
+                    array.push(pool.mitigations, SwingPoint.new(lvl, bar_index, time, is_buy))
+
+            else if pool.state == LS_SWEPT
+                bool inv_cond = is_buy ? (close > lvl) : (close < lvl)
+                if inv_cond
+                    pool.state := LS_INVALIDATED
+                    pool.invalidatedAtBar := bar_index
+                    pool.sweepReasonCode := "POST_SWEEP_INVALIDATION"
+                    string obj_id = f_format_id("M6-POOL", pool.id, 0)
+                    string corr_id = "M6-" + str.tostring(bar_index)
+                    string msg = "Swept Pool #" + str.tostring(pool.id) + " Invalidated"
+                    _ = f_emit_engine_event(st, 0, corr_id, MOD_LIQ, EVENT_INVALID, SEV_ERROR, "INVALIDATED", obj_id, msg, "{}", true)
+                    f_m6_record_pool_audit(st, corr_id, obj_id, msg)
+
+    st.current_trace.pool_str += "\nEXIT M6 | Pools:" + str.tostring(st.analytics.val_pools_created) + " RegSize:" + str.tostring(array.size(g_registry))
+    _ = f_emit_engine_event(st, 0, "DBG-M6", MOD_LIQ, EVENT_EMIT, SEV_INFO, "DEBUG", "M6", "EXIT M6 | Pools:" + str.tostring(st.analytics.val_pools_created) + " RegSize:" + str.tostring(array.size(g_registry)), "{}", true)
+
+// ============================================================================
+// MODULE 11 — DASHBOARD ENGINE
+// ============================================================================
+f_bool_icon(bool cond) =>
+    cond ? "✅" : "❌"
+
+f_bool_color(bool cond) =>
+    cond ? color.green : color.red
+
+f_trace_icon_3way(string traceStr) =>
+    str.contains(traceStr, "PASS") ? "✅" : str.contains(traceStr, "WAIT") ? "⏸" : "❌"
+
+f_trace_color_3way(string traceStr) =>
+    str.contains(traceStr, "PASS") ? color.green : str.contains(traceStr, "WAIT") ? color.gray : color.red
+
+f_grade_color(string grade) =>
+    grade == "A+" ? color.green : grade == "A" ? color.lime : grade == "B" ? color.yellow : color.orange
+
+f_bias_color(int biasVal) =>
+    biasVal == TD_LONG ? color.green : biasVal == TD_SHORT ? color.red : color.gray
+
+f_bias_label(int biasVal) =>
+    biasVal == TD_LONG ? "Bull" : biasVal == TD_SHORT ? "Bear" : "Neutral"
+
+f_count_not_equal(array<string> arr, string excludeVal) =>
+    int cnt = 0
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            if array.get(arr, i) != excludeVal
+                cnt += 1
+    cnt
+
+f_count_equal(array<string> arr, string matchVal) =>
+    int cnt = 0
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            if array.get(arr, i) == matchVal
+                cnt += 1
+    cnt
+
+f_last_or_na(array<string> arr) =>
+    array.size(arr) > 0 ? array.get(arr, array.size(arr) - 1) : "N/A"
+
+// ── Dashboard Update — Main Entry Point ──
+f_update_dashboards(EngineState state) =>
+    EngineState st = state
+
+    if barstate.isfirst
+        table.cell(dash_table, 0, 0, "GOLD ICT PRO - PHASE 9", text_color=color.yellow, text_size=size.small, text_halign=text.align_center)
+        table.merge_cells(dash_table, 0, 0, 1, 0)
+        string[] headers = array.from(LBL_ENGINE_STAT, LBL_MKT_STRUCT, LBL_LIQ_STAT, LBL_STRAT_ARB, LBL_REC, LBL_PIPE_STAT, LBL_M8_POI, LBL_M9_HIST, LBL_M10_RATING, LBL_M11_EVENTS, LBL_M12_AUDIT, LBL_M13_ANALYTICS)
+        int[] start_rows = array.from(1, 6, 14, 22, 31, 37, 44, 57, 63, 73, 83, 92)
+        for i = 0 to array.size(headers) - 1
+            f_table_header(dash_table, 0, array.get(start_rows, i), array.get(headers, i))
+            table.merge_cells(dash_table, 0, array.get(start_rows, i), 1, array.get(start_rows, i))
+        table.cell(event_log_table, 0, 0, "EVENT TIMELINE", text_color=color.yellow, text_size=size.tiny, text_halign=text.align_center, bgcolor=color.new(color.navy, 60))
+        for i = 1 to 15
+            f_table_cell_color(event_log_table, 0, i, "", color.gray)
+        f_table_header(audit_table, 0, 0, "SELECTION AUDIT")
+        table.merge_cells(audit_table, 0, 0, 1, 0)
+        f_table_header(lifecycle_audit_table, 0, 0, "LIFECYCLE AUDIT")
+        table.merge_cells(lifecycle_audit_table, 0, 0, 1, 0)
+        table.cell(p9_debug_table, 0, 0, "PHASE 9 DEBUG", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_debug_table, 0, 0, 1, 0)
+        table.cell(p9_inspector_table, 0, 0, "P9 REGISTRY INSPECTOR", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_inspector_table, 0, 0, 1, 0)
+        table.cell(p9_engine_summary_table, 0, 0, "PHASE 9 ENGINE", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(p9_engine_summary_table, 0, 0, 1, 0)
+        table.cell(profile_table, 0, 0, "P9 PROFILE", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(profile_table, 0, 0, 2, 0)
+        table.cell(validation_table, 0, 0, "PHASE 9 VALIDATION", text_color=color.yellow, text_size=size.small, text_halign=text.align_center, bgcolor=color.new(color.navy, 60))
+        table.merge_cells(validation_table, 0, 0, 1, 0)
+
+    if barstate.islast
+        // ── Session / Market Status ──
+        int now_hour = hour(timenow, syminfo.timezone)
+        int now_min = minute(timenow, syminfo.timezone)
+        int now_mins = now_hour * 60 + now_min
+        int now_day = dayofweek(timenow, syminfo.timezone)
+        bool is_weekend_now = false
+        if now_day == 1
+            if now_mins < (17 * 60)
+                is_weekend_now := true
+        else if now_day == 6
+            if now_mins >= (17 * 60)
+                is_weekend_now := true
+        string display_session_name = "Off Session"
+        string display_status = "CLOSED"
+        string display_time_str = st.current_context.time_str
+        if is_weekend_now
+            string h_str2 = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+            string m_str2 = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+            display_time_str := h_str2 + ":" + m_str2 + " (Wknd)"
+        else
+            if f_is_in_range(now_mins, ny_start, ny_end) and f_is_in_range(now_mins, london_start, london_end)
+                display_session_name := "London/NY Overlap"
+                display_status := "OPEN"
+            else if f_is_in_range(now_mins, ny_start, ny_end)
+                display_session_name := "New York"
+                display_status := "OPEN"
+            else if f_is_in_range(now_mins, london_start, london_end)
+                display_session_name := "London"
+                display_status := "OPEN"
+            else if f_is_in_range(now_mins, asian_start, asian_end)
+                display_session_name := "Asian"
+                display_status := "OPEN"
+            string h_str2 = now_hour < 10 ? "0" + str.tostring(now_hour) : str.tostring(now_hour)
+            string m_str2 = now_min < 10 ? "0" + str.tostring(now_min) : str.tostring(now_min)
+            display_time_str := h_str2 + ":" + m_str2
+        f_table_cell(dash_table, 1, 7, display_session_name)
+        f_table_cell_color(dash_table, 1, 8, display_status, display_status == "OPEN" ? color.green : color.red)
+        f_table_cell(dash_table, 1, 9, display_time_str)
+
+        // ── Liquidity Pool Registry Counts ──
+        int bull_count = 0
+        int bear_count = 0
+        int active_count = 0
+        int swept_count = 0
+        int rein_count = 0
+        int invalid_count = 0
+        int expired_count = 0
+        if array.size(g_registry) > 0
+            for i = 0 to array.size(g_registry) - 1
+                LiquidityPool pool = array.get(g_registry, i)
+                if pool.poolType == LT_BUY_SIDE
+                    bull_count += 1
+                else
+                    bear_count += 1
+                if pool.state == LS_ACTIVE
+                    active_count += 1
+                else if pool.state == 2
+                    rein_count += 1
+                else if pool.state == LS_SWEPT
+                    swept_count += 1
+                else if pool.state == LS_INVALIDATED
+                    invalid_count += 1
+                else if pool.state == LS_EXPIRED
+                    expired_count += 1
+        f_table_cell(dash_table, 1, 15, str.tostring(bull_count))
+        f_table_cell(dash_table, 1, 16, str.tostring(bear_count))
+        f_table_cell(dash_table, 1, 17, str.tostring(active_count))
+        f_table_cell(dash_table, 1, 18, str.tostring(swept_count))
+        f_table_cell(dash_table, 1, 19, str.tostring(rein_count))
+        f_table_cell(dash_table, 1, 20, str.tostring(invalid_count))
+        f_table_cell(dash_table, 1, 21, str.tostring(expired_count))
+
+        // ── Market Structure ──
+        if not na(st.current_validation)
+            f_table_cell_color(dash_table, 1, 10, st.current_validation.trend == TD_LONG ? "Bullish" : st.current_validation.trend == TD_SHORT ? "Bearish" : "Neutral", f_bias_color(st.current_validation.trend))
+        else
+            f_table_cell_color(dash_table, 1, 10, "N/A", color.gray)
+
+        f_table_cell_color(dash_table, 1, 11, st.structure.last_bos_dir == TD_LONG ? "Bullish BOS" : st.structure.last_bos_dir == TD_SHORT ? "Bearish BOS" : "None", st.structure.last_bos_dir != 0 ? color.yellow : color.gray)
+        f_table_cell_color(dash_table, 1, 12, st.structure.last_choch_dir == TD_LONG ? "Bullish CHoCH" : st.structure.last_choch_dir == TD_SHORT ? "Bearish CHoCH" : "None", st.structure.last_choch_dir != 0 ? color.orange : color.gray)
+        string pd_str = "N/A"
+        if not na(st.current_context.currentPrice)
+            if st.current_context.currentPrice >= st.current_context.premiumZone
+                pd_str := "Premium"
+            else if st.current_context.currentPrice <= st.current_context.discountZone
+                pd_str := "Discount"
+            else
+                pd_str := "Equilibrium"
+        f_table_cell_color(dash_table, 1, 13, pd_str, pd_str == "Premium" ? color.red : pd_str == "Discount" ? color.green : color.gray)
+
+        // ── Strategy & Arbitration ──
+        f_table_cell_color(dash_table, 1, 23, st.current_strategy.strategyApproved ? "Approved" : "Rejected", f_bool_color(st.current_strategy.strategyApproved))
+        f_table_cell(dash_table, 1, 24, st.current_strategy.direction == TD_LONG ? "LONG" : st.current_strategy.direction == TD_SHORT ? "SHORT" : "N/A")
+        f_table_cell(dash_table, 1, 25, str.tostring(st.current_strategy.entryPrice, "#.##"))
+        f_table_cell(dash_table, 1, 26, str.tostring(st.current_strategy.stopLoss, "#.##") + " / " + str.tostring(st.current_strategy.takeProfit, "#.##"))
+        f_table_cell(dash_table, 1, 27, str.tostring(st.current_strategy.riskReward, "#.##"))
+        f_table_cell(dash_table, 1, 28, str.tostring(st.current_strategy.strategyConfidence, "#.##"))
+
+        if not na(st.current_arbitration)
+            f_table_cell_color(dash_table, 1, 29, st.current_arbitration.isApproved ? "Approved" : "Rejected", f_bool_color(st.current_arbitration.isApproved))
+            f_table_cell(dash_table, 1, 30, st.current_arbitration.reason)
+        else
+            f_table_cell_color(dash_table, 1, 29, "N/A", color.gray)
+            f_table_cell_color(dash_table, 1, 30, "Not evaluated", color.gray)
+
+        // ── Recommendation ──
+        string rec_status_str = "No Active Rec"
+        string rec_dir_str = "N/A"
+        string rec_entry_str = "N/A"
+        string rec_sltp_str = "N/A"
+        string rec_rr_str = "N/A"
+        if not na(st.active_rec)
+            string status_name = "Active"
+            if st.active_rec.status == 2
+                status_name := "Invalidated"
+            else if st.active_rec.status == 3
+                status_name := "Fulfilled"
+            else if st.active_rec.status == 4
+                status_name := "Expired"
+            rec_status_str := "Rec #" + str.tostring(st.active_rec.id) + " (" + status_name + ")"
+            rec_dir_str := st.active_rec.candidate.direction == TD_LONG ? "LONG" : "SHORT"
+            rec_entry_str := str.tostring(st.active_rec.actualEntry, "#.##")
+            rec_sltp_str := str.tostring(st.active_rec.actualStop, "#.##") + " / " + str.tostring(st.active_rec.candidate.takeProfit, "#.##")
+            if st.active_rec.actualEntry != st.active_rec.actualStop
+                if st.active_rec.candidate.direction == TD_LONG
+                    rec_rr_str := str.tostring((st.active_rec.candidate.takeProfit - st.active_rec.actualEntry) / (st.active_rec.actualEntry - st.active_rec.actualStop), "#.##")
+                else
+                    rec_rr_str := str.tostring((st.active_rec.actualEntry - st.active_rec.candidate.takeProfit) / (st.active_rec.actualStop - st.active_rec.actualEntry), "#.##")
+        else
+            rec_status_str := "No Active Rec (" + st.diag.m10_reject_reason + ")"
+        f_table_cell_color(dash_table, 1, 32, rec_status_str, not na(st.active_rec) and st.active_rec.status == RS_ACTIVE ? color.green : color.gray)
+        f_table_cell(dash_table, 1, 33, rec_dir_str)
+        f_table_cell(dash_table, 1, 34, rec_entry_str)
+        f_table_cell(dash_table, 1, 35, rec_sltp_str)
+        f_table_cell(dash_table, 1, 36, rec_rr_str)
+
+        // ── Pipeline Status ──
+        string pool_icon  = f_bool_icon(str.contains(st.current_trace.pool_str, "PASS"))
+        string sweep_icon = f_trace_icon_3way(st.current_trace.sweep_str)
+        string trend_icon = f_trace_icon_3way(st.current_trace.trend_str)
+        string strat_icon = f_trace_icon_3way(st.current_trace.strategy_str)
+        string arb_icon   = f_trace_icon_3way(st.current_trace.arb_str)
+        string final_icon = f_bool_icon(st.current_trace.final_str == "PASS")
+
+        color pool_color  = f_bool_color(str.contains(st.current_trace.pool_str, "PASS"))
+        color sweep_color = f_trace_color_3way(st.current_trace.sweep_str)
+        color trend_color = f_trace_color_3way(st.current_trace.trend_str)
+        color strat_color = f_trace_color_3way(st.current_trace.strategy_str)
+        color arb_color   = f_trace_color_3way(st.current_trace.arb_str)
+        color final_color = f_bool_color(st.current_trace.final_str == "PASS")
+
+        f_table_cell_color(dash_table, 0, 38, pool_icon + " Selection", pool_color)
+        f_table_cell_color(dash_table, 1, 38, st.current_trace.pool_str, pool_color)
+        f_table_cell_color(dash_table, 0, 39, sweep_icon + " Sweep", sweep_color)
+        f_table_cell_color(dash_table, 1, 39, st.current_trace.sweep_str, sweep_color)
+        f_table_cell_color(dash_table, 0, 40, trend_icon + " Trend", trend_color)
+        f_table_cell_color(dash_table, 1, 40, st.current_trace.trend_str, trend_color)
+        f_table_cell_color(dash_table, 0, 41, strat_icon + " Strategy", strat_color)
+        f_table_cell_color(dash_table, 1, 41, st.current_trace.strategy_str, strat_color)
+        f_table_cell_color(dash_table, 0, 42, arb_icon + " Arbitration", arb_color)
+        f_table_cell_color(dash_table, 1, 42, st.current_trace.arb_str, arb_color)
+        f_table_cell_color(dash_table, 0, 43, final_icon + " Final Result", final_color)
+        f_table_cell_color(dash_table, 1, 43, st.current_trace.reason_str, final_color)
+
+        // ── Module 8 — POI ──
+        f_table_cell_color(dash_table, 1, 44, str.tostring(st.diag.poi_highest_score) + "pts", color.yellow)
+        f_table_cell(dash_table, 1, 45, f_last_or_na(g_poi_base_id))
+        f_table_cell_color(dash_table, 1, 46, st.diag.poi_latest_grade, f_grade_color(st.diag.poi_latest_grade))
+        f_table_cell(dash_table, 1, 47, st.diag.poi_latest_dir == TD_LONG ? "LONG" : st.diag.poi_latest_dir == TD_SHORT ? "SHORT" : "N/A")
+        int m3_bias_val = f_get_latest_mtf_bias(P9_HTF_3)
+        f_table_cell(dash_table, 1, 48, f_bias_label(m3_bias_val))
+        f_table_cell(dash_table, 1, 49, st.counters.pd_zone)
+        f_table_cell(dash_table, 1, 50, f_last_or_na(g_fvg_base_id))
+        f_table_cell(dash_table, 1, 51, f_last_or_na(g_ob_base_id))
+        f_table_cell(dash_table, 1, 52, f_last_or_na(g_mss_base_id))
+        f_table_cell(dash_table, 1, 53, f_last_or_na(g_brk_base_id))
+
+        // ── Module 10 — Rating ──
+        f_table_cell_color(dash_table, 1, 61, st.diag.m10_latest_action, st.diag.m10_latest_action == "BUY" ? color.green : st.diag.m10_latest_action == "SELL" ? color.red : color.gray)
+        f_table_cell_color(dash_table, 1, 62, st.diag.m10_latest_rating, f_grade_color(st.diag.m10_latest_rating))
+        f_table_cell(dash_table, 1, 63, str.tostring(st.diag.m10_latest_score) + "pts")
+        f_table_cell_color(dash_table, 1, 64, st.diag.m10_latest_risk + " (" + str.tostring(st.diag.m10_latest_risk_score) + "/100)", st.diag.m10_latest_risk == "Low" ? color.green : st.diag.m10_latest_risk == "Medium" ? color.yellow : color.red)
+        f_table_cell(dash_table, 1, 65, "1:" + str.tostring(st.diag.m10_latest_rr, "#.#"))
+        f_table_cell_color(dash_table, 1, 66, str.tostring(st.diag.m10_latest_entry, "#.##"), color.blue)
+        f_table_cell(dash_table, 1, 67, str.tostring(st.diag.m10_latest_sl, "#.##") + " / " + str.tostring(st.diag.m10_latest_tp, "#.##"))
+        f_table_cell_color(dash_table, 1, 68, st.diag.m10_latest_reasons, color.green)
+        f_table_cell_color(dash_table, 1, 69, st.diag.m10_latest_penalties, color.red)
+
+        // ── Module 11 — Events ──
+        f_table_cell(dash_table, 1, 71, str.tostring(st.bus.event_total_emitted))
+        f_table_cell(dash_table, 1, 72, str.tostring(array.size(g_event_registry)))
+        EventRegistryInstance latest_evt = array.size(g_event_registry) > 0 ? array.get(g_event_registry, array.size(g_event_registry)-1) : na
+        if not na(latest_evt)
+            string mod_name = latest_evt.module == MOD_MTF ? "MTF" : latest_evt.module == MOD_LIQ ? "Liquidity" : latest_evt.module == MOD_FVG ? "FVG" : latest_evt.module == MOD_OB ? "OB" : latest_evt.module == MOD_MSS ? "MSS" : latest_evt.module == MOD_BRK ? "Breaker" : latest_evt.module == MOD_POI ? "POI" : latest_evt.module == MOD_TR ? "Trade" : latest_evt.module == MOD_AUDIT ? "Audit" : "System"
+            string sev_name = latest_evt.severity == SEV_INFO ? "INFO" : latest_evt.severity == SEV_WARNING ? "WARN" : latest_evt.severity == SEV_ERROR ? "ERROR" : "SUCCESS"
+            f_table_cell_color(dash_table, 1, 73, str.tostring(latest_evt.eventId), color.yellow)
+            f_table_cell_color(dash_table, 1, 74, str.tostring(latest_evt.parentEventId), color.gray)
+            f_table_cell(dash_table, 1, 75, mod_name)
+            f_table_cell_color(dash_table, 1, 76, sev_name + " / " + latest_evt.outcome, latest_evt.outcome == "SUCCESS" ? color.green : latest_evt.outcome == "REJECTED" ? color.red : color.yellow)
+            f_table_cell(dash_table, 1, 77, latest_evt.objectId)
+            f_table_cell(dash_table, 1, 78, latest_evt.description)
+            f_table_cell_color(dash_table, 1, 79, latest_evt.correlationId, color.aqua)
+
+        // ── Module 12 — Audit ──
+        f_table_cell_color(dash_table, 1, 81, str.tostring(st.audit.m12_cycle_trust_score) + "/100", st.audit.m12_cycle_trust_score > 90 ? color.green : st.audit.m12_cycle_trust_score > 70 ? color.yellow : color.red)
+        f_table_cell(dash_table, 1, 82, str.tostring(st.audit.audit_total_emitted))
+        f_table_cell_color(dash_table, 1, 83, str.tostring(st.audit.lifetime_audit_failures), st.audit.lifetime_audit_failures == 0 ? color.green : color.red)
+        f_table_cell_color(dash_table, 1, 84, str.tostring(st.audit.lifetime_audit_warnings), st.audit.lifetime_audit_warnings == 0 ? color.green : color.yellow)
+        f_table_cell_color(dash_table, 1, 85, str.tostring(st.audit.lifetime_audit_passed), st.audit.lifetime_audit_passed > 0 ? color.green : color.gray)
+        f_table_cell(dash_table, 1, 86, str.tostring(array.size(g_audit_registry)))
+        f_table_cell_color(dash_table, 1, 87, st.audit.audit_last_failure_msg, st.audit.lifetime_audit_failures > 0 ? color.red : color.gray)
+        f_table_cell_color(dash_table, 1, 88, st.audit.m12_last_summary, color.aqua)
+
+        // ── Module 13 — Analytics ──
+        f_table_cell_color(dash_table, 1, 90, "Snap #" + str.tostring(st.analytics.m13_last_snapshot_id) + " | Recs=" + str.tostring(st.analytics.m13_last_total_recs), color.yellow)
+        f_table_cell(dash_table, 1, 91, "AvgConf=" + str.tostring(st.analytics.m13_last_avg_conf, "#.#") + " | AvgPipe=" + str.tostring(st.analytics.m13_last_avg_pipe, "#.#"))
+        f_table_cell_color(dash_table, 1, 92, "Rej Dist: " + st.analytics.m13_last_rej_dist, color.aqua)
+        f_table_cell(dash_table, 1, 93, "POI Util: " + st.analytics.m13_last_poi_util)
+        f_table_cell_color(dash_table, 1, 94, "Common Audit: " + st.analytics.m13_last_common_audit, st.analytics.m13_last_common_audit == "None" ? color.green : color.yellow)
+        f_table_cell_color(dash_table, 1, 95, st.analytics.m13_last_summary, color.aqua)
+
+        // ── Event Timeline Table ──
+        int event_log_size = array.size(g_event_log)
+        int event_start_idx = math.max(0, event_log_size - MAX_EVENT_LOG_DISPLAY)
+        int event_display_idx = 1
+        if event_log_size > 0
+            for i = event_start_idx to event_log_size - 1
+                f_table_cell(event_log_table, 0, event_display_idx, array.get(g_event_log, i))
+                event_display_idx += 1
+        if event_display_idx <= MAX_EVENT_LOG_DISPLAY
+            for i = event_display_idx to MAX_EVENT_LOG_DISPLAY
+                f_table_cell_color(event_log_table, 0, i, "", color.gray)
+
+        // ── Selection Audit Table ──
+        f_table_cell(audit_table, 1, 1, str.tostring(st.current_audit.totalBull) + " / " + str.tostring(st.current_audit.totalBear))
+        f_table_cell_color(audit_table, 1, 2, str.tostring(st.current_audit.eligibleBull) + " / " + str.tostring(st.current_audit.eligibleBear), st.current_audit.eligibleBull > 0 or st.current_audit.eligibleBear > 0 ? color.green : color.red)
+        f_table_cell_color(audit_table, 1, 3, st.current_audit.stateFilterBull, str.contains(st.current_audit.stateFilterBull, "FAIL") ? color.red : color.green)
+        f_table_cell_color(audit_table, 1, 4, st.current_audit.stateFilterBear, str.contains(st.current_audit.stateFilterBear, "FAIL") ? color.red : color.green)
+        f_table_cell(audit_table, 1, 5, st.current_audit.selectedBullId == -1 ? "N/A" : str.tostring(st.current_audit.selectedBullId))
+        f_table_cell(audit_table, 1, 6, st.current_audit.selectedBearId == -1 ? "N/A" : str.tostring(st.current_audit.selectedBearId))
+        f_table_cell_color(audit_table, 1, 7, st.current_audit.selectedOverallId == -1 ? "N/A" : str.tostring(st.current_audit.selectedOverallId), st.current_audit.selectedOverallId == -1 ? color.red : color.green)
+        f_table_cell_color(audit_table, 1, 8, st.current_audit.finalRejectionReason, color.yellow)
+
+        // ── Lifecycle Audit Table ──
+        LifecycleAuditEntry lastEntry = array.size(g_lifecycle_audit_log) > 0 ? array.get(g_lifecycle_audit_log, array.size(g_lifecycle_audit_log) - 1) : na
+        if not na(lastEntry)
+            f_table_cell(lifecycle_audit_table, 1, 1, str.tostring(lastEntry.poolId))
+            f_table_cell_color(lifecycle_audit_table, 1, 2, lastEntry.transitionStr, color.yellow)
+            f_table_cell(lifecycle_audit_table, 1, 3, lastEntry.reason)
+            f_table_cell(lifecycle_audit_table, 1, 4, str.tostring(lastEntry.barIndex))
+            f_table_cell(lifecycle_audit_table, 1, 5, str.tostring(lastEntry.activeDuration))
+            f_table_cell(lifecycle_audit_table, 1, 6, str.tostring(lastEntry.reinforcedDuration))
+            f_table_cell(lifecycle_audit_table, 1, 7, str.tostring(lastEntry.sweptDuration))
+            string diagnosis = "Normal Transition"
+            if lastEntry.newState == LS_INVALIDATED
+                if lastEntry.reason == "TIME_EXPIRY"
+                    diagnosis := "Invalidated by Age"
+                else if lastEntry.reason == "POST_SWEEP_INVALIDATION"
+                    diagnosis := "Invalidated Post-Sweep"
+                else
+                    diagnosis := "Invalidated (Price)"
+            if lastEntry.activeDuration <= 1 and lastEntry.newState == LS_INVALIDATED
+                diagnosis := "Invalidated IMMEDIATELY"
+            f_table_cell_color(lifecycle_audit_table, 1, 8, diagnosis, diagnosis == "Normal Transition" ? color.green : color.red)
+
+        // ── Phase 9 Debug Panel ──
+        if show_p9_debug
+            int m1_b = f_get_latest_mtf_bias(P9_HTF_1)
+            int m2_b = f_get_latest_mtf_bias(P9_HTF_2)
+            int m3_b = m3_bias_val
+            string m1_bias = f_bias_label(m1_b)
+            string m2_bias = f_bias_label(m2_b)
+            string m3_bias = f_bias_label(m3_b)
+            int active_fvg = f_count_not_equal(g_fvg_state, "Full")
+            int active_ob  = f_count_not_equal(g_ob_state, "Invalidated")
+            int active_brk = f_count_not_equal(g_brk_state, "Invalidated")
+            int active_mss = f_count_equal(g_mss_state, "Active")
+            f_table_cell(p9_debug_table, 1, 1, str.tostring(array.size(g_mtf_registry)))
+            f_table_cell_color(p9_debug_table, 1, 2, m1_bias, f_bias_color(m1_b))
+            f_table_cell_color(p9_debug_table, 1, 3, m2_bias, f_bias_color(m2_b))
+            f_table_cell_color(p9_debug_table, 1, 4, m3_bias, f_bias_color(m3_b))
+            f_table_cell(p9_debug_table, 1, 5, str.tostring(array.size(g_liq_registry)))
+            f_table_cell(p9_debug_table, 1, 6, "PD-v" + str.tostring(st.counters.pd_ver))
+            f_table_cell_color(p9_debug_table, 1, 7, st.counters.pd_zone, st.counters.pd_zone == "Premium" ? color.red : st.counters.pd_zone == "Discount" ? color.green : color.gray)
+            f_table_cell(p9_debug_table, 1, 8, str.tostring(array.size(g_fvg_registry)) + " (" + str.tostring(active_fvg) + " act)")
+            f_table_cell(p9_debug_table, 1, 9, str.tostring(array.size(g_ob_registry)) + " (" + str.tostring(active_ob) + " act)")
+            f_table_cell(p9_debug_table, 1, 10, str.tostring(array.size(g_brk_registry)) + " (" + str.tostring(active_brk) + " act)")
+            f_table_cell(p9_debug_table, 1, 11, str.tostring(array.size(g_mss_registry)) + " (" + str.tostring(active_mss) + " act)")
+            f_table_cell_color(p9_debug_table, 1, 12, str.tostring(array.size(g_poi_registry)) + " (" + str.tostring(st.diag.drawn_poi) + " drawn)", color.teal)
+            f_table_cell_color(p9_debug_table, 1, 13, (st.mtf.integ_1 and st.mtf.integ_2 and st.mtf.integ_3) ? "TRUE" : "FALSE", (st.mtf.integ_1 and st.mtf.integ_2 and st.mtf.integ_3) ? color.green : color.red)
+
+        // ── Registry Inspector ──
+        if show_p9_inspector
+            f_table_cell(p9_inspector_table, 1, 1, st.counters.pd_ver > 0 ? "PD-ARRAY-v" + str.tostring(st.counters.pd_ver) : "None")
+            f_table_cell(p9_inspector_table, 1, 2, str.tostring(array.size(g_pd_registry)))
+            f_table_cell(p9_inspector_table, 1, 3, array.size(g_pd_registry) > 0 ? str.tostring(array.get(g_pd_registry, array.size(g_pd_registry) - 1).createdAt) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 4, array.size(g_pd_registry) > 0 ? array.get(g_pd_registry, array.size(g_pd_registry) - 1).status : "N/A")
+            f_table_cell(p9_inspector_table, 1, 5, array.size(g_fvg_base_id) > 0 ? array.get(g_fvg_base_id, array.size(g_fvg_base_id) - 1) + "-v" + str.tostring(array.get(g_fvg_ver, array.size(g_fvg_ver) - 1)) : "None")
+            f_table_cell(p9_inspector_table, 1, 6, str.tostring(st.counters.fvg_total_emitted))
+            f_table_cell(p9_inspector_table, 1, 7, array.size(g_fvg_registry) > 0 ? str.tostring(array.get(g_fvg_registry, array.size(g_fvg_registry) - 1).createdAt) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 8, array.size(g_fvg_state) > 0 ? array.get(g_fvg_state, array.size(g_fvg_state) - 1) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 9, array.size(g_ob_base_id) > 0 ? array.get(g_ob_base_id, array.size(g_ob_base_id) - 1) + "-v" + str.tostring(array.get(g_ob_ver, array.size(g_ob_ver) - 1)) : "None")
+            f_table_cell(p9_inspector_table, 1, 10, str.tostring(st.counters.ob_total_emitted))
+            f_table_cell(p9_inspector_table, 1, 11, array.size(g_ob_registry) > 0 ? str.tostring(array.get(g_ob_registry, array.size(g_ob_registry) - 1).createdAt) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 12, array.size(g_ob_state) > 0 ? array.get(g_ob_state, array.size(g_ob_state) - 1) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 13, array.size(g_brk_base_id) > 0 ? array.get(g_brk_base_id, array.size(g_brk_base_id) - 1) + "-v" + str.tostring(array.get(g_brk_ver, array.size(g_brk_ver) - 1)) : "None")
+            f_table_cell(p9_inspector_table, 1, 14, str.tostring(st.counters.brk_total_emitted))
+            f_table_cell(p9_inspector_table, 1, 15, array.size(g_brk_registry) > 0 ? str.tostring(array.get(g_brk_registry, array.size(g_brk_registry) - 1).createdAt) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 16, array.size(g_brk_state) > 0 ? array.get(g_brk_state, array.size(g_brk_state) - 1) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 17, array.size(g_mss_base_id) > 0 ? array.get(g_mss_base_id, array.size(g_mss_base_id) - 1) + "-v" + str.tostring(array.get(g_mss_ver, array.size(g_mss_ver) - 1)) : "None")
+            f_table_cell(p9_inspector_table, 1, 18, str.tostring(st.counters.mss_total_emitted))
+            f_table_cell(p9_inspector_table, 1, 19, array.size(g_mss_registry) > 0 ? str.tostring(array.get(g_mss_registry, array.size(g_mss_registry) - 1).createdAt) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 20, array.size(g_mss_state) > 0 ? array.get(g_mss_state, array.size(g_mss_state) - 1) : "N/A")
+            f_table_cell(p9_inspector_table, 1, 23, str.tostring(bar_index))
+            f_table_cell(p9_inspector_table, 1, 24, na(st.diag.mss_last_eval_bar) ? "N/A" : str.tostring(st.diag.mss_last_eval_bar))
+            f_table_cell(p9_inspector_table, 1, 25, na(st.diag.mss_diag_bar) ? "N/A" : str.tostring(st.diag.mss_diag_bar))
+            f_table_cell_color(p9_inspector_table, 1, 26, st.diag.mss_diag_reason, str.contains(st.diag.mss_diag_reason, "Failed") ? color.red : str.contains(st.diag.mss_diag_reason, "SUCCESS") ? color.green : color.gray)
+            f_table_cell(p9_inspector_table, 1, 29, str.tostring(bar_index))
+            f_table_cell(p9_inspector_table, 1, 30, na(st.diag.brk_last_eval_bar) ? "N/A" : str.tostring(st.diag.brk_last_eval_bar))
+            f_table_cell_color(p9_inspector_table, 1, 31, st.diag.brk_diag_ob_inv ? "Yes" : "No", st.diag.brk_diag_ob_inv ? color.green : color.gray)
+            f_table_cell_color(p9_inspector_table, 1, 32, st.diag.brk_diag_mss_found ? "Yes" : "No", st.diag.brk_diag_mss_found ? color.green : color.gray)
+            f_table_cell_color(p9_inspector_table, 1, 33, st.diag.brk_diag_reason, str.contains(st.diag.brk_diag_reason, "Created") ? color.green : str.contains(st.diag.brk_diag_reason, "Rejected") ? color.red : color.gray)
+            f_table_cell(p9_inspector_table, 1, 34, "Eval: " + str.tostring(st.diag.brk_stat_evals) + " | Created: " + str.tostring(st.diag.brk_stat_created) + "\nRej (No MSS): " + str.tostring(st.diag.brk_stat_rej_no_mss) + " | Rej (Dir): " + str.tostring(st.diag.brk_stat_rej_direction) + "\nRej (Integ): " + str.tostring(st.diag.brk_stat_rej_integrity) + " | Waiting: " + str.tostring(st.diag.brk_stat_waiting))
+
+        // ── Phase 9 Engine Summary ──
+        f_table_cell(p9_engine_summary_table, 1, 1, str.tostring(array.size(g_pd_registry)))
+        f_table_cell(p9_engine_summary_table, 1, 2, str.tostring(st.counters.liq_total_emitted))
+        f_table_cell(p9_engine_summary_table, 1, 3, str.tostring(st.counters.fvg_total_emitted))
+        f_table_cell(p9_engine_summary_table, 1, 4, str.tostring(st.counters.ob_total_emitted))
+        f_table_cell(p9_engine_summary_table, 1, 5, str.tostring(st.counters.mss_total_emitted))
+        f_table_cell(p9_engine_summary_table, 1, 6, str.tostring(st.counters.brk_total_emitted))
+        f_table_cell_color(p9_engine_summary_table, 1, 7, str.tostring(array.size(g_pd_registry) + st.counters.liq_total_emitted + st.counters.fvg_total_emitted + st.counters.ob_total_emitted + st.counters.mss_total_emitted + st.counters.brk_total_emitted), color.yellow)
+
+        // ── P9 Profile ──
+        f_table_cell(profile_table, 0, 2, "FVG")
+        f_table_cell(profile_table, 1, 2, str.tostring(array.size(g_fvg_registry)))
+        f_table_cell_color(profile_table, 2, 2, str.tostring(st.diag.drawn_fvg), color.green)
+        f_table_cell(profile_table, 0, 3, "OB")
+        f_table_cell(profile_table, 1, 3, str.tostring(array.size(g_ob_registry)))
+        f_table_cell_color(profile_table, 2, 3, str.tostring(st.diag.drawn_ob), color.green)
+        f_table_cell(profile_table, 0, 4, "BRK")
+        f_table_cell(profile_table, 1, 4, str.tostring(array.size(g_brk_registry)))
+        f_table_cell_color(profile_table, 2, 4, str.tostring(st.diag.drawn_brk), color.green)
+        f_table_cell(profile_table, 0, 5, "POI")
+        f_table_cell(profile_table, 1, 5, str.tostring(array.size(g_poi_registry)))
+        f_table_cell_color(profile_table, 2, 5, str.tostring(st.diag.drawn_poi), color.green)
+
+        // ── Validation Dashboard ──
+        if enable_validation
+            int total_evals = st.analytics.val_evals
+            int total_pools = st.analytics.val_pools_created
+            int total_sweeps = st.analytics.val_sweeps
+            int total_strat_app = st.analytics.val_strat_approved
+            int total_recs = st.analytics.val_buys + st.analytics.val_sells
+            float sel_rej_pct = total_evals > 0 ? (st.analytics.val_rej_pool / total_evals) * 100 : 0
+            float val_rej_pct = total_evals > 0 ? (st.analytics.val_rej_val / total_evals) * 100 : 0
+            float strat_rej_pct = total_evals > 0 ? (st.analytics.val_rej_strat / total_evals) * 100 : 0
+            float arb_rej_pct = total_evals > 0 ? (st.analytics.val_rej_arb / total_evals) * 100 : 0
+            float avg_conf = total_recs > 0 ? st.analytics.val_sum_conf / total_recs : 0
+            float avg_rr = total_recs > 0 ? st.analytics.val_sum_rr / total_recs : 0
+            float avg_pipe = total_recs > 0 ? st.analytics.val_sum_pipe_bars / total_recs : 0
+            float avg_trust = total_evals > 0 ? st.analytics.val_sum_audit_trust / total_evals : 0
+            string val_status = total_recs > 0 ? "PASS" : "WARNING: No BUY/SELL generated"
+            color status_color = f_bool_color(total_recs > 0)
+            f_table_cell_color(validation_table, 0, 1, "Bars Analyzed", color.gray)
+            f_table_cell(validation_table, 1, 1, str.tostring(total_evals))
+            f_table_cell_color(validation_table, 0, 2, "Pools Created", color.gray)
+            f_table_cell(validation_table, 1, 2, str.tostring(total_pools))
+            f_table_cell_color(validation_table, 0, 3, "Pipeline Conversion", color.yellow)
+            table.merge_cells(validation_table, 0, 3, 1, 3)
+            f_table_cell_color(validation_table, 0, 4, "Pools Swept", color.gray)
+            f_table_cell(validation_table, 1, 4, str.tostring(total_sweeps) + " (" + str.tostring(total_pools > 0 ? math.round(total_sweeps / total_pools * 100) : 0) + "%)")
+            f_table_cell_color(validation_table, 0, 5, "Strategy Approved", color.gray)
+            f_table_cell(validation_table, 1, 5, str.tostring(total_strat_app) + " (" + str.tostring(total_sweeps > 0 ? math.round(total_strat_app / total_sweeps * 100) : 0) + "%)")
+            f_table_cell_color(validation_table, 0, 6, "BUY / SELL", color.gray)
+            f_table_cell_color(validation_table, 1, 6, str.tostring(total_recs) + " (" + str.tostring(total_strat_app > 0 ? math.round(total_recs / total_strat_app * 100) : 0) + "%)", color.green)
+            f_table_cell_color(validation_table, 0, 7, "Bull / Bear CHoCH", color.gray)
+            f_table_cell_color(validation_table, 1, 7, str.tostring(st.analytics.val_bull_choch) + " / " + str.tostring(st.analytics.val_bear_choch), color.gray)
+            f_table_cell_color(validation_table, 0, 8, "Rejection Distribution", color.yellow)
+            table.merge_cells(validation_table, 0, 8, 1, 8)
+            f_table_cell_color(validation_table, 0, 9, "Selection Reject %", color.gray)
+            f_table_cell_color(validation_table, 1, 9, str.tostring(math.round(sel_rej_pct)) + "%", color.red)
+            f_table_cell_color(validation_table, 0, 10, "Validation Reject %", color.gray)
+            f_table_cell_color(validation_table, 1, 10, str.tostring(math.round(val_rej_pct)) + "%", color.red)
+            f_table_cell_color(validation_table, 0, 11, "Strategy Reject %", color.gray)
+            f_table_cell_color(validation_table, 1, 11, str.tostring(math.round(strat_rej_pct)) + "%", color.red)
+            f_table_cell_color(validation_table, 0, 12, "Arbitration Reject %", color.gray)
+            f_table_cell_color(validation_table, 1, 12, str.tostring(math.round(arb_rej_pct)) + "%", color.red)
+            f_table_cell_color(validation_table, 0, 13, "Performance Metrics", color.yellow)
+            table.merge_cells(validation_table, 0, 13, 1, 13)
+            f_table_cell_color(validation_table, 0, 14, "Average Confidence", color.gray)
+            f_table_cell_color(validation_table, 1, 14, str.tostring(avg_conf, "#.#"), color.aqua)
+            f_table_cell_color(validation_table, 0, 15, "Average RR", color.gray)
+            f_table_cell_color(validation_table, 1, 15, str.tostring(avg_rr, "#.##"), color.aqua)
+            f_table_cell_color(validation_table, 0, 16, "Average Pipeline Bars", color.gray)
+            f_table_cell_color(validation_table, 1, 16, str.tostring(avg_pipe, "#.#"), color.aqua)
+            f_table_cell_color(validation_table, 0, 17, "Average Audit Trust", color.gray)
+            f_table_cell_color(validation_table, 1, 17, str.tostring(avg_trust, "#.#"), color.aqua)
+            f_table_cell_color(validation_table, 0, 18, "Validation Status", color.yellow)
+            f_table_cell_color(validation_table, 1, 18, val_status, status_color)
+
+            log.info("================ PHASE 9 VALIDATION REPORT ================")
+            log.info("Bars Analyzed: " + str.tostring(total_evals))
+            log.info("Pools Created: " + str.tostring(total_pools))
+            log.info("Pools Swept: " + str.tostring(total_sweeps) + " (" + str.tostring(total_pools > 0 ? math.round(total_sweeps / total_pools * 100) : 0) + "%)")
+            log.info("Strategy Approved: " + str.tostring(total_strat_app) + " (" + str.tostring(total_sweeps > 0 ? math.round(total_strat_app / total_sweeps * 100) : 0) + "%)")
+            log.info("BUY / SELL: " + str.tostring(total_recs) + " (" + str.tostring(total_strat_app > 0 ? math.round(total_recs / total_strat_app * 100) : 0) + "%)")
+            log.info("Selection Reject %: " + str.tostring(math.round(sel_rej_pct)) + "%")
+            log.info("Validation Reject %: " + str.tostring(math.round(val_rej_pct)) + "%")
+            log.info("Strategy Reject %: " + str.tostring(math.round(strat_rej_pct)) + "%")
+            log.info("Arbitration Reject %: " + str.tostring(math.round(arb_rej_pct)) + "%")
+            log.info("Average Confidence: " + str.tostring(avg_conf, "#.#"))
+            log.info("Average RR: " + str.tostring(avg_rr, "#.##"))
+            log.info("Average Pipeline Bars: " + str.tostring(avg_pipe, "#.#"))
+            log.info("Average Audit Trust: " + str.tostring(avg_trust, "#.#"))
+            log.info("Validation Status: " + val_status)
+            log.info("==========================================================")
+
+// ============================================================================
+// EXECUTION PIPELINE (INSTRUMENTED)
+// ============================================================================
+S.current_trace.pool_str := "RUN M5"
+f_m5_update_structure(S)
+
+S.current_trace.pool_str += "\nRUN M6"
+f_m6_update_liquidity(S)
+
+S.current_trace.pool_str += "\nRUN DASHBOARD"
+f_update_dashboards(S)
