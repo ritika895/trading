@@ -1,0 +1,539 @@
+# Module 10 Architecture — v1.1 (FROZEN)
+
+Status: **FROZEN — architecture only, no Pine Script.** This document supersedes v1.0 (Draft for Review). It is derived exclusively from: the frozen Module 9 Architecture (v1.4), the complete, verified Pine Script source for Modules 1–9 and the Module 11 dashboard renderer as provided, and the independent audit of v1.0. Every UDT field, registry, counter, and diagnostic slot referenced below already exists in that frozen source — none is invented. Decisions are marked **[DECISION]** with rationale, exactly as Module 9's own document does.
+
+---
+
+## Changelog — v1.0 → v1.1
+
+Exactly seven changes were made, per the independent audit and its acceptance. No other content was altered.
+
+| # | Item | Resolution |
+|---|---|---|
+| 1 | **C1** (Critical) | Module 10 does **not** exclusively use `f_push_trade_rec_registry`. It manually manages push/shift of `g_trade_rec_registry` and its four parallel arrays, mirroring `f_m9_push_candidate`, specifically to retain access to the evicted instance's `exitReason`. §3, §8, §9 updated. |
+| 2 | **H1** (High) | The dashboard's "latest recommendation" block is explicitly creation-time-only by design. Stage 5 never writes to `m10_latest_*`. §3, §4.2 updated; combined with the H4 statement in §3. |
+| 3 | **H2** (High) | Row 63 header/data collision is formally attributed to Module 11 as an inherited, unresolved rendering defect, not guessed at or left open. §11.3 reaffirmed as final (no change in substance from v1.0, now stated as the closed resolution rather than a pending item). |
+| 4 | **M4** (Medium) | `f_push_trade_rec_registry`'s `score` argument is explicitly `confidence`. §7, §8 updated. |
+| 5 | **M5** (Medium) | `m10_reject_reason` is explicitly reset to `"None"` on successful Stage 4 creation, matching its `barstate.isfirst` default. §3, §4.2 updated. |
+| 6 | **M3** (Medium) | `rating` is reclassified as fully **Immutable** in §7. `"Reject"` is stated as exclusively a property of `m10_latest_rating`, never of the UDT. |
+| 7 | **H4** (High, new in audit) | Singleton diagnostic semantics for `m10_latest_*` under same-bar multiplicity are explicitly documented. §3 updated. |
+
+M1, M2, and all Low Priority items (L1–L3) from the audit remain carried forward as documented, acknowledged limitations — unchanged from v1.0.
+
+---
+
+## §0. Ground Truth Established From the Frozen Source
+
+Before any design decision, these facts were extracted directly from the provided Modules 1–9 source and are treated as immovable constraints:
+
+1. **`TradeRecommendationInstance` (Module 2 UDT) is already fully defined** with 29 fields, and it has **no `status` field** — unlike `TradeCandidate` and `POIInstance`. Lifecycle state must therefore be *derived*, not stored redundantly (see §4).
+2. **`g_trade_rec_registry`, its four parallel arrays (`g_trade_rec_base_id`, `g_trade_rec_action`, `g_trade_rec_rating`, `g_trade_rec_score`), and the push helper `f_push_trade_rec_registry`** already exist (Module 3/4). The parallel-array helper only supports *creation* (a single push of all four); there is no update variant. **As of v1.1 (see C1 resolution, §8), Module 10 does not call this helper — it manages these five structures manually.**
+3. **`RegistryCounters` already reserves `next_trade_rec_id` and `trade_rec_total_emitted`** for Module 10's exclusive use.
+4. **`DiagnosticsState` already reserves twelve fields** for Module 10: `m10_latest_action`, `m10_latest_rating`, `m10_latest_score`, `m10_latest_risk`, `m10_latest_risk_score`, `m10_latest_rr`, `m10_latest_entry`, `m10_latest_sl`, `m10_latest_tp`, `m10_latest_reasons`, `m10_latest_penalties`, `m10_reject_reason`. Their `barstate.isfirst` defaults are `"WAIT"`, `"Reject"`, `0`, `"Medium"`, `50`, `0.0`, `na`, `na`, `na`, `"N/A"`, `"N/A"`, `"None"` respectively — confirming `"Reject"` is a legitimate rating value distinct from a letter grade, and confirming a dedicated reject-reason channel exists separate from the rating string.
+5. **The Module 11 dashboard already contains a fully-written Module 10 rendering block** (rows described in §11) that reads exactly these twelve diag fields and nothing else from Module 10 — it does not read `g_trade_rec_registry` or its parallel arrays at all.
+6. **No module ID constant exists for "Module 10."** `MOD_TR = 9` is already claimed and used exclusively by Module 9, and is mapped to display label `"Trade"` in the dashboard's event-log renderer. No `MOD_M10`/`MOD_REC` constant was pre-reserved (see §9).
+7. **`POIInstance.confluenceScore` and `.grade` are permanently `0` / `"UNSCORED"`** in the frozen implementation — Module 8 sets them once at creation with rationale text `"Awaiting Module 10 scoring"` and never updates them again anywhere in the given source. `mssLink` and `brkLink` on every `POIInstance` are always the empty string `""` (Module 8 never populates them); `liqTier` is always `"N/A"`.
+8. **`POIExtension.liqPoolLink`** (Module 8's own extension UDT, index-synchronized 1:1 with `g_poi_registry` via the shared push/shift helper) *does* carry a real value (`"POOL#<id>"` or `"N/A"`), computed at POI creation by `f_m8_find_liq_link`.
+9. **No account-equity, risk-percent, or instrument-size input exists anywhere in Modules 1–9**, and `TradeRecommendationInstance` has no position-size field. Position sizing is architecturally impossible under the frozen contract (see §1, §5).
+10. **Global constants `STRATEGY_SL_BUFFER_ATR`, `STRATEGY_TP_MULT`, and `REC_EXPIRY_BARS`** exist in Module 1 but are referenced nowhere in Modules 5–9 — they belong to a separate, legacy `Recommendation`/`StrategyCandidate` pipeline (dashboard sections `LBL_STRAT_ARB`/`LBL_REC`) that coexists with but is architecturally distinct from the Module 5–9 ICT pipeline Module 10 extends.
+11. **UDT instances in this codebase are mutated by reference**, not via `array.set` round-trips (confirmed by `f_m8_evaluate_lifecycle`, which mutates `poi.status` directly with no `array.set` call, and by `f_m9_evaluate_lifecycle`, which does use `array.set` after mutation — both patterns coexist and both work because `array.get` returns a reference; `array.set` is used by M9 defensively but is not load-bearing). **Module 10's manual registry management (§8) uses the `array.set`-after-mutation pattern for `g_trade_rec_registry`, consistent with M9's own defensive convention, precisely because Module 10 needs guaranteed access to the pre-shift evicted element on overflow — the one case where relying purely on reference mutation is insufficient.**
+
+---
+
+## §1. Responsibility
+
+**Module 10 owns:**
+
+- Converting a `TradeCandidate` that has reached `M9_TRIGGERED` in `g_m9_registry` into exactly one `TradeRecommendationInstance`, or explicitly declining to, with a recorded reason.
+- The Risk Engine: entry price selection, stop loss, take profit, expected RR, and a qualitative `riskScore` — **not** position sizing (impossible, see below).
+- Consuming (never recomputing) Module 9's `qualificationScore` as the sole confidence input; producing Module 10's own `confidence`, `rating`, and `riskScore` from it plus Module 10-local risk factors.
+- The `TradeRecommendationInstance` lifecycle: `ACTIVE → FULFILLED / STOPPED / EXPIRED`, driven purely by price and bar-count, evaluated every confirmed bar.
+- **Manually managing `g_trade_rec_registry` and its four parallel arrays** (§8), and maintaining a new, Module 10-local dedup registry.
+- Incrementing `S.counters.next_trade_rec_id` / `S.counters.trade_rec_total_emitted`.
+- Writing all twelve `m10_latest_*` / `m10_reject_reason` diagnostic fields.
+- Emitting its own Event Bus records (under the shared `MOD_TR` identity — see §9) and Audit Bus records (`"Module 10"` string tag).
+- Dashboard rows 61–69 of `dash_table` (see §11).
+
+**Module 10 must never own:**
+
+- **Position sizing.** No account equity, risk-per-trade percentage, contract/lot size, or instrument tick-value input exists in Modules 1–9's input groups, and `TradeRecommendationInstance` has no field to hold a computed size. This is not a gap Module 10 can architect around without inventing an input group and a UDT field that do not exist in the frozen contract — per the task's own rule, this is stated as impossible rather than solved. A future module (or a revision to the frozen UDT, outside this document's authority) would be required.
+- **POI scoring.** `POIInstance.confluenceScore`/`.grade` remain `"UNSCORED"` forever under this architecture. Module 10 has no write access to `g_poi_registry` (only Module 8's coordinator pushes/mutates it), so Module 10 cannot resolve the "Awaiting Module 10 scoring" text left in Module 8's POI creation rationale. `TradeRecommendationInstance.confidence` is the sole authoritative score Module 10 produces; it is entirely independent of, and does not attempt to repair, the POI's own dead scoring fields.
+- **`TradeCandidate` lifecycle.** Module 10 never writes to `g_m9_registry`, `g_m9_dedup_keys`, or `g_m9_rt`. It reads `g_m9_registry` read-only, exactly as Module 9 reads `g_poi_registry` read-only from Module 8.
+- **HTF/MTF/PD/session computation.** These are already fully folded into `candidate.qualificationScore` by Module 9. Module 10 does not re-read `S.mtf.bias_1` or `S.counters.pd_zone` for scoring purposes — doing so would duplicate Module 9's responsibility, which the task explicitly forbids.
+- **Order execution / broker interaction.** No such capability exists anywhere in the frozen codebase (this is a signaling/dashboard engine, not a strategy with `strategy.entry` calls). Module 10 produces recommendation records only.
+- **Any new global module-ID or Module 1 constant** beyond what is documented in §9 as a deliberate reuse decision.
+
+**Module boundary, precisely:** Module 9's output boundary is `TradeCandidate.status == M9_TRIGGERED` inside `g_m9_registry`. Module 10's input boundary is exactly that signal, plus read-only access to `g_poi_registry` / `g_poi_ext_registry` for correlation-link enrichment only (never for gating). Module 10's output boundary is a `TradeRecommendationInstance` reaching a terminal `exitReason` inside `g_trade_rec_registry`. No downstream module is specified in the material provided, so Module 10's downstream contract is not architected here beyond what the frozen `AnalyticsSummaryInstance` fields (`avgPipelineBars`, `maxPipelineBars`, `wins`, `losses`, `profitFactor`, etc.) imply a future Module 13 will consume from `g_trade_rec_registry`.
+
+---
+
+## §2. Inputs
+
+Unchanged from v1.0. Module 10 reads the following, and only the following, from the frozen state. Nothing here is mutated by Module 10 unless explicitly marked "write."
+
+**From `g_m9_registry` (`array<TradeCandidate>`), read-only:**
+| Field | Use |
+|---|---|
+| `baseId` | Source-of-truth linkage key back to the originating POI; becomes the dedup key and the basis for `poiLink` |
+| `direction` | `TD_LONG`/`TD_SHORT` → maps to `action` ("BUY"/"SELL") and entry/SL/TP sign logic |
+| `entryZoneHigh` / `entryZoneLow` | Immutable zone snapshot; source geometry for entry/SL/TP computation |
+| `createdAt` | Not used directly by Module 10 (Module 9's own creation bar is irrelevant to Module 10's timing) |
+| `status` | Filtered for `== M9_TRIGGERED` only; all other statuses are ignored |
+| `qualificationScore` | Sole confidence input — consumed, never recomputed (§6) |
+
+Constant read: `M9_TRIGGERED` (string, Module 9-local but script-global in scope).
+
+**From `g_poi_registry` (`array<POIInstance>`) and `g_poi_ext_registry` (`array<POIExtension>`), read-only, index-synchronized pair:**
+Looked up by matching `poi.baseId == candidate.baseId` (identical lookup pattern to Module 9's own `poiIdx` map in `f_m9_evaluate_lifecycle`).
+| Field | Use |
+|---|---|
+| `poi.fvgLink` | Passed through to `TradeRecommendationInstance.fvgLink` |
+| `poi.obLink` | Passed through to `.obLink` |
+| `poi.mssLink` | Passed through to `.mssLink` (always `""` under the frozen Module 8 implementation — see §14 Edge Case 13) |
+| `poi.brkLink` | Passed through to `.brkLink` (always `""` — same caveat) |
+| `poi.integrity` | Informational only — feeds `riskScore`, never gates creation |
+| `poi.status` | Informational only (may be appended to `confidenceFactors`), never gates creation |
+| `ext.liqPoolLink` | Passed through to `TradeRecommendationInstance.liqLink` |
+
+If no POI resolves at this baseId (evicted or never found), all six fields above degrade to `"N/A"` / empty and this is logged (§14 Edge Case 1) — it is **not** a hard gate.
+
+**From `EngineState.current_context`, read-only:**
+- `atr` (float) — sole volatility input for SL buffer and a hard validation gate.
+
+**From `EngineState.counters`, read-write:**
+- `next_trade_rec_id` (read then incremented) — ID assignment.
+- `trade_rec_total_emitted` (incremented) — lifetime counter.
+
+**From `EngineState.diag`, write-only (Module 10's exclusive twelve fields, listed in §0.4).**
+
+**From `EngineState.audit` / `EngineState.bus`,** via the shared helpers `f_push_audit` and `f_emit_engine_event` exactly as Modules 5–9 use them — no direct field mutation outside those helpers.
+
+**Bar-native series:** `bar_index`, `time`, `low`, `high`, `close` — read-only, replay-safe.
+
+**Explicitly not read:** `S.mtf.bias_1`, `S.counters.pd_zone`, `S.structure.*`, `g_fvg_registry`, `g_ob_registry`, `g_mss_registry`, `g_brk_registry` directly. All HTF/structural context Module 10 needs is already pre-digested into `candidate.qualificationScore`; reading these registries again would duplicate Module 9's work.
+
+---
+
+## §3. Outputs
+
+| Object / Registry | Lifecycle Ownership |
+|---|---|
+| `TradeRecommendationInstance` objects | Created once per accepted candidate (Stage 4, §4). Mutated in place thereafter (by reference — see §0.11) only by Module 10's own Stage 5 lifecycle evaluator. No other module ever writes to an instance's fields. |
+| `g_trade_rec_registry` | **[v1.1 — C1 resolved]** Appended to via manual `array.push`, with manual `array.shift` on overflow, mirroring `f_m9_push_candidate`'s pattern exactly. The frozen `f_push_trade_rec_registry` helper is **not called** by Module 10 — see §8 for the full rationale and mechanism. FIFO-capped at `MAX_TRADE_REC_REGISTRY = 500` (frozen constant, unchanged). |
+| `g_trade_rec_base_id` / `_action` / `_rating` / `_score` (parallel arrays) | **[v1.1 — C1 resolved]** Written manually, in lockstep with `g_trade_rec_registry`, exactly once per accepted candidate (§8). Semantics unchanged from v1.0: **not** kept in sync with later mutations — this mirrors the accepted, pre-existing staleness pattern in `g_poi_state` under Module 8. |
+| `S.counters.next_trade_rec_id`, `.trade_rec_total_emitted` | Incremented exactly once per accepted candidate, same call site pattern as every other `next_*_id`/`*_total_emitted` pair in Modules 6–9. |
+| `S.diag.m10_latest_*` (nine fields) | Overwritten every bar an accepted candidate is created; **left untouched** on a rejection (§4 Stage 1/3) so the dashboard does not flicker to blank on a rejected attempt. **[v1.1 — H1 resolved]** These nine fields are written **only** at Stage 4 (creation). Stage 5 lifecycle transitions (SL_HIT/TP_HIT/EXPIRED_NO_RESOLUTION) never write to any `m10_latest_*` field. The dashboard's "latest recommendation" block is therefore **creation-time-only by design**: it always shows the entry/SL/TP/rating/score as they were at the moment of creation, never reflecting whether that recommendation has since resolved. A recommendation's live/terminal status is authoritatively available only via `g_trade_rec_registry` (by reference, per §0.11) — not via the diagnostics block. This is a deliberate scope boundary, not an oversight: the diagnostics block answers "what was the most recent recommendation this engine produced," not "what is the status of the most recent recommendation." A future consumer needing live status must read the registry object directly. |
+| `S.diag.m10_latest_action`, `.m10_latest_rating`, `.m10_reject_reason` | Overwritten on both acceptance and rejection (these three specifically describe "what just happened," including rejections). |
+| **[v1.1 — H4 resolved]** Singleton diagnostic semantics under same-bar multiplicity | `m10_latest_*` always represents the last candidate processed during the current confirmed bar (Stage 0's `g_m9_registry` index-ascending scan order, §9). When more than one `TRIGGERED` candidate is discovered on the same bar — whether resulting in acceptance, rejection, or a mix — only the outcome of the last one processed is reflected in the singleton diagnostics; earlier same-bar outcomes are fully recorded and remain retrievable through the Event Bus, the Audit Bus, and (for accepted candidates) `g_trade_rec_registry`, but are not preserved in `m10_latest_*`. This is stated explicitly so "last processed wins" is understood as intended singleton-snapshot behavior, not an implementation defect. |
+| `g_event_registry` entries | One `EVENT_CREATE`/`SUCCESS` per accepted instance, one `EVENT_WARNING`/`REJECTED` per Stage-1/3 rejection, one per Stage-5 transition, one per overflow eviction (§9). |
+| `g_audit_registry` entries | One per Stage 0–5 outcome, mirroring the `f_m9_record_audit` pattern exactly (§10). |
+| `g_m10_dedup_keys` (new, Module 10-local) | See §8. |
+
+---
+
+## §4. Trade Recommendation State Machine
+
+### §4.1 Why there is no `status` field, and what replaces it
+
+`TradeRecommendationInstance` has no `status` string, unlike `TradeCandidate` (`status`) or `POIInstance` (`status`). This is a deliberate constraint of the frozen UDT that Module 10 must not work around by inventing a field. Instead, lifecycle state is **fully derived from `exitReason`**:
+
+- `exitReason == ""` → **ACTIVE** (non-terminal).
+- `exitReason == "SL_HIT"` → **STOPPED** (terminal, non-success).
+- `exitReason == "TP_HIT"` → **FULFILLED** (terminal, success).
+- `exitReason == "EXPIRED_NO_RESOLUTION"` → **EXPIRED** (terminal, timeout).
+
+No other `exitReason` values exist. Once set, `exitReason` is never cleared or reassigned — every terminal state is genuinely terminal, matching the one-way lifecycle convention already used everywhere else in the frozen codebase (pool states, POI states, candidate states).
+
+### §4.2 Full Pipeline (Stages 0–5)
+
+**Stage 0 — Discovery & Dedup.** Gated on `barstate.isconfirmed`, scan `g_m9_registry` for `candidate.status == M9_TRIGGERED`. For each match, check `candidate.baseId` against `g_m10_dedup_keys` (§8). If already present, skip entirely (no audit — this is a normal steady-state no-op, not a rejection). If absent, proceed to Stage 1 **and immediately mark the dedup key as attempted, regardless of the eventual outcome** (see §4.3 for why this must differ from the M8/M9 dedup pattern).
+
+**Stage 1 — Hard Validation Gates** (evaluated in order; first failure stops the pipeline for this candidate, this bar):
+1. **Zone geometry:** `entryZoneHigh > entryZoneLow`. Defensive — should always hold given Module 8/9's own invariants, but checked explicitly, mirroring `f_m8_push_poi`'s own `zoneHigh > zoneLow` defensive check. On failure: `AUDIT_FAIL`, `EVENT_WARNING`/`REJECTED`, `m10_reject_reason := "DEGENERATE_ZONE"`. No instance created.
+2. **ATR validity:** `not na(S.current_context.atr) AND S.current_context.atr > 0`. On failure: `AUDIT_WARNING`, `m10_reject_reason := "ATR_INVALID"`. No instance created. (In practice this can only fire inside the `ATR_LENGTH`-bar warm-up window at the very start of history — see §14 Edge Case 3.)
+
+**Stage 2 — Risk Engine Computation** (§5). Produces `entryPrice`, `stopLoss`, `takeProfit`, `expectedRR`, `riskScore` as local values (not yet written to the UDT).
+
+**Stage 3 — Soft Quality Gates** (evaluated in order):
+1. **Minimum RR:** `expectedRR >= M10_MIN_RR`. On failure: `AUDIT_WARNING`, `m10_reject_reason := "RR_BELOW_MINIMUM"`, `m10_latest_rating := "Reject"`. No instance created.
+2. **Minimum confidence:** `round(candidate.qualificationScore) >= M10_MIN_CONFIDENCE`. On failure: `AUDIT_WARNING`, `m10_reject_reason := "CONFIDENCE_BELOW_MINIMUM"`, `m10_latest_rating := "Reject"`. No instance created.
+
+On any Stage 1 or Stage 3 rejection: `m10_latest_action := "WAIT"`; `m10_latest_score`, `_risk`, `_risk_score`, `_rr`, `_entry`, `_sl`, `_tp`, `_reasons`, `_penalties` are **left at their previous values** (§3). The dedup key was already marked in Stage 0, so this candidate is never re-attempted.
+
+**Stage 4 — Instance Creation.** All gates passed. Build the complete `TradeRecommendationInstance` (§7), push via manual `array.push` into `g_trade_rec_registry` and its four parallel arrays (§8), increment `S.counters.next_trade_rec_id`/`trade_rec_total_emitted`, set all twelve diag fields to the new instance's values — **including `m10_reject_reason := "None"`** (§4.2 note below; v1.1 — M5 resolved) — emit `EVENT_CREATE`/`SEV_INFO`/`"SUCCESS"`, record `AUDIT_PASS`.
+
+> **[v1.1 — M5 resolved]** On every successful Stage 4 creation, `m10_reject_reason` is explicitly reset to `"None"` — matching its `barstate.isfirst` default value exactly (§0.4). This prevents a stale rejection-reason string from a prior bar's rejected attempt persisting on the dashboard after a subsequent successful creation. `m10_reject_reason` therefore always reflects the outcome of the *most recently processed* Stage 0 attempt this bar (consistent with the H4 singleton-diagnostic semantics in §3): `"None"` after a creation, or the specific rejection code after a Stage 1/3 rejection.
+
+**Stage 5 — Lifecycle Evaluation.** Runs every confirmed bar, independently of Stage 0–4, over every `TradeRecommendationInstance` in `g_trade_rec_registry` with `exitReason == ""`, **excluding instances where `bar_index == createdAt`** (one-bar creation-delay guard — see §4.4). Evaluated in fixed priority order, first match wins, at most one transition per instance per bar:
+
+1. **Stop-loss check (priority 1 — conservative-first):**
+   ```
+   LONG:  low  <= stopLoss   → STOPPED, exitReason = "SL_HIT"
+   SHORT: high >= stopLoss   → STOPPED, exitReason = "SL_HIT"
+   ```
+2. **Take-profit check (priority 2):**
+   ```
+   LONG:  high >= takeProfit → FULFILLED, exitReason = "TP_HIT"
+   SHORT: low  <= takeProfit → FULFILLED, exitReason = "TP_HIT"
+   ```
+3. **Expiry check (priority 3, lowest):**
+   ```
+   bar_index - createdAt > M10_REC_EXPIRY_BARS → EXPIRED, exitReason = "EXPIRED_NO_RESOLUTION"
+   ```
+
+On any Stage 5 transition: emit `EVENT_INVALID` (STOPPED/EXPIRED) or `EVENT_CREATE`-class `SUCCESS` outcome (FULFILLED) via `MOD_TR`; record matching audit; update `pipelineBars := bar_index - createdAt` (frozen at the transition bar, since the instance is now terminal and no further Stage 5 evaluation will touch it). **No `m10_latest_*` field is written on any Stage 5 transition** (§3, H1 resolution) — the object's own fields (mutated by reference, §0.11) and the Event/Audit Bus records are the sole authoritative record of the transition.
+
+### §4.3 [DECISION] Why the dedup marker is set on *attempt*, not on *success*
+
+Unchanged from v1.0. Module 8's POI dedup and Module 9's candidate dedup both add their dedup key only inside the success branch, yet neither ever re-attempts a rejected source repeatedly — because their scan trigger conditions (`poi.createdAt == bar_index`, `fvg.createdAt == bar_index`) are naturally one-shot: they only match on the source object's own creation bar. **Module 10's scan trigger (`candidate.status == M9_TRIGGERED`) is not naturally one-shot** — `M9_TRIGGERED` is a persistent status that remains true for the candidate on every subsequent confirmed bar until it is FIFO-evicted from `g_m9_registry`. If Module 10 copied the M8/M9 pattern verbatim (dedup key added only on success), a Stage 1/3 rejection would be silently re-attempted every single confirmed bar thereafter, producing unbounded duplicate `AUDIT_WARNING` records for the same candidate. Marking the dedup key at the moment of *first observation*, independent of outcome, is therefore a deliberate, necessary deviation from the M8/M9 precedent — not an inconsistency. The tradeoff (a transient ATR-invalid rejection is never retried even if ATR later becomes valid) is accepted for determinism and audit-log cleanliness; see §14 Edge Case 3 for why this tradeoff is low-impact in practice.
+
+### §4.4 [DECISION] One-bar creation delay for Stage 5
+
+Unchanged from v1.0. Module 8's touch detection (`bar_index != poi.createdAt`) and Module 9's Stage 2 confirmation (`bar_index != cand.createdAt`) both exclude the object's own creation bar from that stage's evaluation, specifically to avoid same-bar look-ahead ambiguity about ordering of events within one bar. Module 10 adopts the identical guard for Stage 5: an instance created this bar is never evaluated for SL/TP/expiry on the same bar. This avoids the ambiguous question of whether the entry (computed from this bar's zone/ATR) can be considered "filled" before this same bar's high/low is checked against SL/TP — an ordering Pine cannot resolve from OHLC data alone. This is the same class of justification Module 9 itself gave for its SL-first-vs-TP-first-style priority decisions.
+
+### §4.5 [DECISION] Stop-loss-before-take-profit priority
+
+Unchanged from v1.0. When a single bar's range touches both `stopLoss` and `takeProfit` (only possible starting the bar *after* creation, per §4.4), Pine's bar-level OHLC cannot determine which was actually touched first intrabar. Module 10 resolves this deterministically by checking stop-loss first — the standard, conservative convention (assume the worse outcome when order is unknowable) used by backtesting engines generally, to avoid overstating performance. This is stated as an explicit, auditable convention, not an attempt to infer true intrabar sequence.
+
+---
+
+## §5. Risk Engine
+
+Unchanged from v1.0.
+
+**Entry selection.** `entryPrice := (candidate.entryZoneHigh + candidate.entryZoneLow) / 2.0` — the zone midpoint, deterministic and non-repainting (computable entirely from the immutable zone snapshot already on the `TradeCandidate`). This mirrors Module 8's own established convention of using `(zoneHigh + zoneLow) / 2.0` for `POIInstance.centerPrice`. No live-fill or slippage model exists in the frozen codebase (no `strategy.*` calls anywhere) — this is a computed reference price for the recommendation record, not an executed fill.
+
+**Stop loss.**
+```
+LONG:  stopLoss := candidate.entryZoneLow  - (S.current_context.atr * M10_SL_BUFFER_ATR_MULT)
+SHORT: stopLoss := candidate.entryZoneHigh + (S.current_context.atr * M10_SL_BUFFER_ATR_MULT)
+```
+
+**Take profit.**
+```
+LONG:  takeProfit := entryPrice + (entryPrice - stopLoss) * M10_TP_RR_MULT
+SHORT: takeProfit := entryPrice - (stopLoss - entryPrice) * M10_TP_RR_MULT
+```
+
+**RR calculation.**
+```
+expectedRR := abs(takeProfit - entryPrice) / abs(entryPrice - stopLoss)
+```
+Computed from the constructed prices rather than hardcoded to `M10_TP_RR_MULT`, so the value stays correct if the formulas above are ever revised, and so the Stage 1 ATR-validity gate (which prevents a zero/na denominator) is the only thing standing between this division and a runtime error — confirmed safe given Stage 1 runs first.
+
+**Position sizing: architecturally impossible.** No equity, risk-percent, or instrument-value input exists in Modules 1–9, and `TradeRecommendationInstance` has no field to store a size. Stated per the task's own instruction rather than invented around.
+
+**Risk filters (soft, §4 Stage 3):** minimum RR (`M10_MIN_RR`), minimum confidence (`M10_MIN_CONFIDENCE`). Both reject-only; neither mutates price levels.
+
+**`riskScore` formula [DECISION]** — a 0–100 qualitative risk metric, higher = riskier, independent of `confidence`:
+```
+poi_unresolved := (no POI found at candidate.baseId) OR (poi.integrity == false)
+weak_qual      := candidate.qualificationScore < 70
+
+riskScore := clamp(
+    50
+    + (poi_unresolved ? 25 : 0)
+    + (expectedRR < M10_MIN_RR * 1.25 ? 15 : -15)
+    + (weak_qual ? 10 : -10),
+    0, 100)
+```
+Display tier (written to `m10_latest_risk`, not stored on the UDT — no field exists for it): `riskScore < 34 → "Low"`, `34–66 → "Medium"`, `> 66 → "High"`.
+
+**M10-local constants (new, Module 10-scoped — following the exact precedent of `M9_CANDIDATE_EXPIRY_BARS`/`M9_READY_ATR_MULT` being declared locally rather than in Module 1):**
+```
+float M10_SL_BUFFER_ATR_MULT   = 0.5   [DECISION]
+float M10_TP_RR_MULT           = 2.0   [DECISION]
+float M10_MIN_RR               = 1.5   [DECISION]
+int   M10_MIN_CONFIDENCE       = 50    [DECISION]
+int   M10_REC_EXPIRY_BARS      = 100   [DECISION]
+int   MAX_M10_DEDUP_REGISTRY   = 500   [DECISION]
+```
+**[DECISION] Why not reuse `STRATEGY_SL_BUFFER_ATR`/`STRATEGY_TP_MULT`/`REC_EXPIRY_BARS`:** these already exist in Module 1 with fitting names, but are referenced nowhere in Modules 5–9 (§0.10) — they belong to the separate legacy `Recommendation`/`StrategyCandidate` pipeline. Reusing them would create hidden coupling: if that legacy pipeline's own (unbuilt-in-this-scope) logic ever tunes those values for its own purposes, Module 10 would be silently affected. Declaring fresh M10-local constants preserves a clean module boundary, at the cost of two conceptually-overlapping constants existing in the script. This tradeoff is flagged again in §15.
+
+---
+
+## §6. Confidence Engine
+
+Unchanged from v1.0. Module 9 already produces the single blended confidence signal for a candidate: `qualificationScore` (0–100 float, HTF/PD/session penalties already applied — see M9 §4). Module 9's own document is explicit that the *decomposition* of this score lives only in the audit trail, not the UDT, specifically so downstream consumers don't need to reverse-engineer it. Module 10 respects this exactly:
+
+- **`confidence := round(clamp(candidate.qualificationScore, 0, 100))`** — a direct, undecorated cast. Module 10 performs no independent HTF/PD/session evaluation. This is the entirety of how Module 10 consumes Module 9's confidence output.
+- **`rating`** is derived from `confidence` alone (not from `riskScore`, which is a separate, independent axis):
+  ```
+  confidence >= 90        → "A+"
+  confidence in [80, 90)  → "A"
+  confidence in [70, 80)  → "B"
+  confidence in [50, 70)  → "C"
+  confidence < 50         → "Reject" (Stage 3 gate — no instance created)
+  ```
+  This exactly matches `f_grade_color`'s existing four-case-plus-default branching (`"A+"`/`"A"`/`"B"`/else-orange) and the diag field's own `"Reject"` default value (§0.4), giving every branch of that existing color function a real, reachable meaning.
+- **`confidenceFactors`** does *not* attempt to reconstruct Module 9's HTF/PD/session breakdown (impossible in general — with user-configurable penalty magnitudes, distinct combinations of M9's three penalties can sum to the same final score, so the blended value cannot always be reverse-decomposed). Instead it records Module 10's *own* inputs as opaque tokens: `"M9_QUAL:<score>,POI_INTEGRITY:<true|false>,RR:<value>"`. This is the field's entire content — no invented decomposition.
+- **`previousScore` / `scoreDelta` / `version`** exist on the frozen UDT anticipating a rescoring capability. This architecture, as designed, exercises **no post-creation rescoring** — Stage 5 is purely price/time-driven for determinism (§4). Consequently, for every instance produced under this architecture: `version = 1` (fixed for its lifetime), `previousScore = confidence` (set once, equal to itself), `scoreDelta = 0` (fixed). This is stated plainly as a deliberate design choice, not a placeholder or oversight — a future revision could exercise these fields if a rescoring trigger were added, but none is architected here.
+
+---
+
+## §7. Trade Recommendation UDT — Complete Field Population
+
+`TradeRecommendationInstance` is frozen (Module 2); no field is added, removed, or renamed. Every field below has a defined, non-placeholder value.
+
+| Field | Category | Value at creation | Behavior post-creation |
+|---|---|---|---|
+| `baseId` | Immutable, identity | `f_format_id("M10-TR", S.counters.next_trade_rec_id, 0)` | Never changes |
+| `instanceId` | Immutable, identity | `baseId + "_v1"` | Never changes (no re-versioning exercised — §6) |
+| `version` | Audit | `1` | Fixed at `1` for this architecture (§6) |
+| `action` | Immutable | `"BUY"` (LONG) / `"SELL"` (SHORT) | Never changes |
+| `direction` | Immutable | `candidate.direction` | Never changes |
+| `rating` | **Immutable [v1.1 — M3 resolved]** | `"A+"`/`"A"`/`"B"`/`"C"` (§6) | Never changes post-creation (Stage 5 does not re-rate). **`"Reject"` is never a value this field can take — a candidate that would receive `"Reject"` is rejected at the Stage 3 gate before any `TradeRecommendationInstance` is created, so no instance with `rating = "Reject"` can ever exist. `"Reject"` is exclusively a value of the separate `m10_latest_rating` diagnostic field (§3), describing the outcome of a rejected attempt, not a property of any UDT instance.** |
+| `confidence` | Immutable | `round(candidate.qualificationScore)` | Never changes |
+| `previousScore` | Audit, inert | `= confidence` | Never changes (§6) |
+| `scoreDelta` | Audit, inert | `0` | Never changes (§6) |
+| `riskScore` | Immutable | Per §5 formula | Never changes |
+| `expectedRR` | Immutable | Per §5 formula | Never changes |
+| `entryPrice` | Immutable | Zone midpoint (§5) | Never changes |
+| `stopLoss` | Immutable | Per §5 formula | Never changes |
+| `takeProfit` | Immutable | Per §5 formula | Never changes |
+| `poiLink` | Immutable | `candidate.baseId` | Never changes |
+| `brkLink` | Immutable | `poi.brkLink` or `""` if unresolved | Never changes |
+| `mssLink` | Immutable | `poi.mssLink` or `""` if unresolved | Never changes |
+| `obLink` | Immutable | `poi.obLink` or `""` if unresolved | Never changes |
+| `fvgLink` | Immutable | `poi.fvgLink` or `""` if unresolved | Never changes |
+| `liqLink` | Immutable | `ext.liqPoolLink` or `"N/A"` if unresolved | Never changes |
+| `htfLink` | Immutable | `"N/A"` — no HTF instance registry exists to link to (Module 7's MTF state is scalar, not an instance-keyed registry); stated explicitly rather than fabricated | Never changes |
+| `confidenceFactors` | Audit | Per §6 | Never changes |
+| `reasons` | Audit | Comma-separated positive tokens from `{STRUCTURE_CONFIRMED, RR_ABOVE_MIN, HIGH_QUAL_SCORE, POI_INTEGRITY_OK}` — whichever apply | Never changes |
+| `penalties` | Audit | Comma-separated negative tokens from `{TIGHT_ATR_STOP, POI_UNRESOLVED, MARGINAL_RR, MODERATE_QUAL_SCORE}` — whichever apply, or `"NONE"` | Never changes |
+| `integrity` | Immutable | `true` (Stage 1 already guaranteed geometric validity; only genuine creation-time validation failures would set `false`, but such candidates never reach Stage 4) | Never changes |
+| `createdAt` | Immutable | `bar_index` | Never changes |
+| `correlationId` | Immutable | `"M10-" + str.tostring(bar_index)` | Never changes |
+| `exitReason` | Lifecycle | `""` | Set exactly once, at the Stage 5 terminal transition (§4) |
+| `pipelineBars` | Lifecycle | `0` | Updated to `bar_index - createdAt` at the terminal transition only (frozen thereafter) |
+
+**[v1.1 — M4 resolved]** The `int score` argument passed at Stage 4 to the manual registry-append operation (§8) — i.e. the value written into the `g_trade_rec_score` parallel array — is explicitly **`confidence`** (the field immediately above `previousScore` in this table). No other candidate field is used for this purpose.
+
+---
+
+## §8. Registry Design
+
+**[v1.1 — C1 resolved]** **`g_trade_rec_registry` is managed manually by Module 10, not via the frozen `f_push_trade_rec_registry` helper.**
+
+### §8.1 Rationale (C1 resolution)
+
+§3 of v1.0 stated `g_trade_rec_registry` is "appended to exclusively via the frozen `f_push_trade_rec_registry` helper," while §8/§9 of v1.0 required Module 10 to inspect an *evicted* instance's `exitReason` on FIFO overflow to decide whether to emit `EVICTED_OVERFLOW`. These two requirements were mutually incompatible: `f_push_trade_rec_registry`'s final statement calls `f_push_int(g_trade_rec_score, ...)`, so its return type and value are the shifted `int` score (or `na`), not the shifted `TradeRecommendationInstance` — the shifted instance computed internally by the nested `f_push_trade_rec` call is discarded before the wrapper returns.
+
+Per the audit's Option (a), Module 10 resolves this by adopting Module 9's own pattern: `f_m9_push_candidate` does not call an equivalent single-line wrapper for `g_m9_registry` — it manually performs `array.push`/`array.shift` directly, specifically to retain access to the evicted element. Module 10 does the same for `g_trade_rec_registry` and its four parallel arrays.
+
+### §8.2 Mechanism
+
+```
+f_m10_push_recommendation(EngineState st, TradeRecommendationInstance inst, string baseId, string action, string rating, int score) =>
+    array.push(g_trade_rec_registry, inst)
+    array.push(g_trade_rec_base_id, baseId)
+    array.push(g_trade_rec_action, action)
+    array.push(g_trade_rec_rating, rating)
+    array.push(g_trade_rec_score, score)
+    TradeRecommendationInstance evicted = na
+    if array.size(g_trade_rec_registry) > MAX_TRADE_REC_REGISTRY
+        evicted := array.shift(g_trade_rec_registry)
+        _ = array.shift(g_trade_rec_base_id)
+        _ = array.shift(g_trade_rec_action)
+        _ = array.shift(g_trade_rec_rating)
+        _ = array.shift(g_trade_rec_score)
+    evicted
+```
+
+This is called exactly once per accepted candidate (Stage 4), with `score := confidence` (§7, M4 resolution). No second call is ever made for the same instance; all subsequent Stage 5 mutations happen by reference on the object already in the array (§0.11), never via a second push. The five arrays (`g_trade_rec_registry` plus its four parallel arrays) are pushed to and shifted from in lockstep, in the same order, every time — guaranteeing they never drift out of index-sync with one another, the same guarantee `f_m8_push_poi_registry` provides for the three-way POI/extension/dedup set.
+
+### §8.3 Parallel arrays — staleness is accepted, not fixed
+
+Unchanged in substance from v1.0. Per §0.11, this codebase's precedent (`g_poi_state` under Module 8) already establishes that a parallel array snapshotted at creation and never resynced on later mutation is an accepted pattern. Since the manual push in §8.2 is the only write path into these four arrays and it happens only at Stage 4, they will forever reflect creation-time `action`/`rating`/`score` even after Stage 5 sets `exitReason`. This is stated explicitly: **the authoritative live state of any recommendation is always `g_trade_rec_registry` (the object, read by reference), never the parallel arrays, past the instant of creation.** This matches the fact (§0.5) that the given Module 11 dashboard code never reads these parallel arrays at all — they exist for a future consumer (plausibly Module 13's analytics) that is expected to read them as a creation-time snapshot log, not a live-state index.
+
+### §8.4 FIFO overflow
+
+On overflow shift-out of `g_trade_rec_registry` (via `f_m10_push_recommendation`, §8.2), if the evicted instance's `exitReason == ""` (still ACTIVE), emit `EVENT_WARNING`/`"EVICTED_OVERFLOW"` and `AUDIT_WARNING` noting the last known state — identical pattern to Module 9's `f_m9_push_candidate` eviction handling, and now mechanically identical as well (§8.1–§8.2), not just analogous. If the evicted instance is already terminal, no warning is needed (its outcome is already permanently recorded in the event/audit trail from its terminal transition).
+
+### §8.5 Deduplication — new registry, Module 10-local
+
+Unchanged from v1.0:
+```
+var array<string> g_m10_dedup_keys = array.new<string>()
+int MAX_M10_DEDUP_REGISTRY = 500   [DECISION]
+```
+Tracks `candidate.baseId` values that have been *attempted* (Stage 0, §4.3), independent of Stage 4 success. FIFO-capped at 500. **[DECISION] Why not size this to `MAX_M9_REGISTRY = 100`:** `g_m9_registry` itself cycles at 100, but a `TRIGGERED` candidate can persist there for many bars before eviction; sizing the dedup set any smaller than the realistic attempt-volume over that residency window risks re-processing. 500 is chosen to match `MAX_TRADE_REC_REGISTRY`'s order of magnitude as a reasonable upper bound on lifetime processed-candidate volume, not derived from a hard invariant (this is a discretionary capacity choice, not a correctness requirement below which the system breaks — the same class of choice `MAX_POI_REGISTRY = 50` represents for Module 8).
+
+### §8.6 Replay safety
+
+Unchanged from v1.0. Registry writes happen only inside `barstate.isconfirmed`-gated Stage 0 and Stage 5 blocks (§4), so replaying history from bar 0 reproduces byte-identical registry contents to a live run that reached the same bar — identical to the replay-safety argument Module 9's own document makes for its registry. The manual push/shift mechanism (§8.2) is deterministic index-order `array.push`/`array.shift`, the same primitives `f_m9_push_candidate` already uses under the identical replay-safety argument.
+
+---
+
+## §9. Event Bus
+
+**[DECISION] Module 10 events are emitted under `MOD_TR` — the same module ID already used by Module 9 — because no dedicated module ID was reserved for Module 10 anywhere in the frozen Module 1 constants**, unlike every other resource Module 10 needs (UDT, registry, counters, diag fields), all of which *were* pre-reserved. `MOD_TR`'s dashboard display label, `"Trade"`, is the only existing label that semantically fits Trade Recommendation events, and the reasoning Module 9's own document used to justify claiming `MOD_TR` in the first place ("no other module claiming it," §11 of the M9 doc) no longer applies verbatim since Module 9 now claims it — but the evidence instead supports Module 9 and Module 10 *sharing* a single "Trade" domain in the event log, distinguished by `correlationId` prefix (`"M9-"` vs `"M10-"`) and `objectId`, rather than by module ID. This preserves a strictly zero-modification integration with the frozen Module 1 constants file (adding a new module-ID constant was considered and rejected — see §15).
+
+**Events emitted, in the order they can occur within one bar:**
+
+| Stage | Event Type | Severity | Outcome | Trigger |
+|---|---|---|---|---|
+| Stage 1/3 rejection | `EVENT_WARNING` | `SEV_WARNING` | `"REJECTED"` | Any hard/soft gate failure |
+| Stage 4 creation | `EVENT_CREATE` | `SEV_INFO` | `"SUCCESS"` | Instance created (via `f_m10_push_recommendation`, §8.2) |
+| Stage 5 stop | `EVENT_INVALID` | `SEV_WARNING` | `"SL_HIT"` | Priority-1 transition |
+| Stage 5 fulfill | `EVENT_CREATE` | `SEV_INFO` | `"TP_HIT"` | Priority-2 transition |
+| Stage 5 expiry | `EVENT_INVALID` | `SEV_WARNING` | `"EXPIRED"` | Priority-3 transition |
+| Registry overflow | `EVENT_WARNING` | `SEV_WARNING` | `"EVICTED_OVERFLOW"` | Non-terminal instance FIFO-evicted (§8.4), evaluated using the `evicted` value directly returned by `f_m10_push_recommendation` |
+
+**Ordering within `f_m10_coordinator`:** Stage 0–4 (new-candidate discovery/creation) runs to completion for every newly-observed `TRIGGERED` candidate first, in `g_m9_registry` index order (ascending — deterministic, identical on replay; this is also the order that determines "last processed" for the H4 singleton-diagnostic semantics, §3). Stage 5 (lifecycle evaluation of already-existing instances) runs second, over `g_trade_rec_registry` in index order. A candidate accepted in Stage 4 this bar is excluded from this same bar's Stage 5 pass by the creation-delay guard (§4.4) regardless of which stage would otherwise run first — so there is no ordering ambiguity between a same-bar creation and a same-bar exit for that specific instance.
+
+**Replay-safe ordering:** identical to Module 9's argument — both scans are gated on `barstate.isconfirmed`, iterate arrays in stable index order, and depend on no wall-clock (`timenow`) value.
+
+---
+
+## §10. Audit Bus
+
+Unchanged from v1.0. `f_m10_record_audit(st, corr_id, object_id, status, message, recommendation)` — a direct structural mirror of `f_m9_record_audit`/`f_m8_record_audit`: same `AuditResultInstance` shape, same `st.audit.*` counter increments per status branch, `module := "Module 10"` (free-text string field, no collision risk unlike the event-bus module-ID enum), same `AUDIT_SCHEMA_VERSION`.
+
+| Outcome | Audit Status | Example message |
+|---|---|---|
+| Stage 1 geometry failure | `AUDIT_FAIL` | `"TradeRecommendation rejected: DEGENERATE_ZONE"` |
+| Stage 1 ATR failure | `AUDIT_WARNING` | `"TradeRecommendation rejected: ATR_INVALID"` |
+| Stage 3 RR failure | `AUDIT_WARNING` | `"TradeRecommendation rejected: RR_BELOW_MINIMUM"` |
+| Stage 3 confidence failure | `AUDIT_WARNING` | `"TradeRecommendation rejected: CONFIDENCE_BELOW_MINIMUM"` |
+| Stage 4 creation | `AUDIT_PASS` | `"TradeRecommendation created: <baseId>"` |
+| Stage 5 SL_HIT | `AUDIT_PASS` | `"TradeRecommendation transitioned -> STOPPED (SL_HIT)"` |
+| Stage 5 TP_HIT | `AUDIT_PASS` | `"TradeRecommendation transitioned -> FULFILLED (TP_HIT)"` |
+| Stage 5 expiry | `AUDIT_PASS` | `"TradeRecommendation transitioned -> EXPIRED"` |
+| Stage 0 dedup skip | *(none — steady-state no-op, not audited — see note below)* | — |
+| Overflow eviction | `AUDIT_WARNING` | `"TradeRecommendation evicted on overflow, exitReason at eviction: <value or NONE>"` |
+
+**Note on the dedup skip:** Module 8 and Module 9 both record one `AUDIT_SKIPPED` per duplicate-detected attempt. Module 10 does **not**, because — per §4.3 — Module 10's dedup key is marked on first *attempt*, not first *success*, so a "duplicate" can only mean "already attempted on a prior bar," which by construction never happens more than once per candidate (Stage 0 checks the key before Stage 1 runs, every bar, for every `TRIGGERED` candidate still resident in `g_m9_registry`) — there is structurally no repeated-attempt case left to skip and audit. This is called out explicitly as a deliberate divergence from the M8/M9 audit pattern, not an omission.
+
+`AUDIT_SCHEMA_VERSION`, correlation ID convention (`"M10-" + str.tostring(bar_index)`), and `f_push_audit(g_audit_registry, ..., MAX_AUDIT_REGISTRY)` are used exactly as established by Modules 5–9, unmodified. (Note: `g_audit_registry` uses the frozen `f_push_audit` helper as-is — the C1 resolution in §8 applies only to `g_trade_rec_registry` and its four parallel arrays, not to the shared audit/event buses, which have no evicted-instance-inspection requirement and so present no equivalent contradiction.)
+
+---
+
+## §11. Dashboard — Resolving M9-DASH-01
+
+### §11.1 What the frozen code actually does (ground truth, not the M9 architecture doc's aspirational table)
+
+Unchanged from v1.0. The Module 9 architecture document (§13) claims `LBL_M9_HIST` owns 5 data rows (58–62). **The shipped `f_update_dashboards` code does not implement that** — it writes only rows 58–60 for Module 9, with an explicit code comment admitting rows 61–62 were "already claimed by the pre-existing Module 10 diagnostic cells." The shipped code then writes Module 10 diagnostic data to rows 61 through 69:
+
+| Row | Owner (as shipped) | Content |
+|---|---|---|
+| 57 | Module 9 | Header, `LBL_M9_HIST` (merged col 0–1) |
+| 58 | Module 9 | Registry active/total count |
+| 59 | Module 9 | Q/C/R breakdown |
+| 60 | Module 9 | TRIG/INV/EXP breakdown |
+| **61** | **Module 10** | `m10_latest_action` |
+| **62** | **Module 10** | `m10_latest_rating` |
+| **63** | **Module 10 data** *(collides with header — see below)* | `m10_latest_score` |
+| 64 | Module 10 | `m10_latest_risk` / `m10_latest_risk_score` |
+| 65 | Module 10 | `m10_latest_rr` |
+| 66 | Module 10 | `m10_latest_entry` |
+| 67 | Module 10 | `m10_latest_sl` / `m10_latest_tp` |
+| 68 | Module 10 | `m10_latest_reasons` |
+| 69 | Module 10 | `m10_latest_penalties` |
+
+Separately, the `barstate.isfirst` header block's `start_rows` array places the **`LBL_M10_RATING` header itself at row 63** (`table_header` + `merge_cells(0, 63, 1, 63)`), which is the *third* row of Module 10's own data block — not the row before it. Row 63's column 1 is therefore written twice: once as part of the merged header cell (col 0–1, at `barstate.isfirst`) and once as `m10_latest_score` data (col 1, at `barstate.islast`). This is a genuine collision, confirmed present in the given source exactly as delivered.
+
+### §11.2 Root cause and ownership boundary
+
+Unchanged from v1.0. The collision is caused entirely by **Module 11's `start_rows` header-placement array**, not by anything Module 9 or Module 10 write. The same pattern recurs identically for `LBL_M11_EVENTS` (header at 73, data starts at 71), `LBL_M12_AUDIT` (header at 83, data starts at 81), and `LBL_M13_ANALYTICS` (header at 92, data starts at 90) — every section's header lands two rows into its own data block. This is a systemic Module 11 defect, not an M9/M10-specific one, and **Module 10 does not own `dash_table`'s header-row placement** (that logic lives entirely inside Module 11's `barstate.isfirst` block, outside anything Module 10's coordinator touches). Per the task's own constraint set, Module 10's architecture cannot redesign Module 11.
+
+### §11.3 Module 10's dashboard row ownership — resolved, unambiguous
+
+**[v1.1 — H2 resolved: this is the final, closed resolution, not a pending item.]** Given the above, Module 10's architecture defines its ownership as **exactly what the shipped code already writes**, with the collision documented rather than silently perpetuated or left ambiguous:
+
+- **Module 10 owns `dash_table` column 1, rows 61–69, inclusive** (9 rows: action, rating, score, risk, RR, entry, SL/TP, reasons, penalties). This is unambiguous and requires no further data-layout decision — Module 10's coordinator writes these nine values from its own diag fields exactly as the given rendering code already does.
+- **Module 10 does not own, and must never write to, `dash_table` column 0 at row 63** (the header cell) — that remains exclusively Module 11's.
+- **The row 63 / column 1 write is formally attributed to Module 11 as an inherited, unresolved rendering defect**, outside Module 10's remediation authority. Per the audit's H2 resolution guidance, this is treated as a closed, documented item rather than left open pending a Pine v6 runtime verification that falls outside this document's scope. The concrete recommendation, for whoever next revises Module 11 (a non-M9/M10 change): shift `LBL_M10_RATING`'s header from row 63 to row 61, and shift the four downstream headers (`LBL_M11_EVENTS`, `LBL_M12_AUDIT`, `LBL_M13_ANALYTICS`) each back by 2 rows to sit above their own actual data start row. This document does not implement that fix, since it falls outside Module 10's ownership.
+- **Module 9's actual row footprint is 58–60 (3 rows), not 58–62 (5 rows) as its own architecture document's §13 table claims.** This is a documentation-vs-implementation drift in the *frozen* Module 9 document, not a defect in Module 9's runtime behavior (the runtime behavior is internally consistent and correct) — flagged in §15.
+
+No ambiguity remains: every row from 57 to 69 has exactly one documented owner (Module 9: 57–60; Module 10: 61–69), and the single genuine collision (row 63, header vs. data) is named, attributed to Module 11, and closed as a documented inherited limitation for a future, correctly-scoped change — not guessed at.
+
+---
+
+## §12. Execution Pipeline
+
+Unchanged from v1.0. Module 10's coordinator runs immediately after Module 9's and before the dashboard, matching the codebase's strict-sequential dependency order (Module 10 requires `g_m9_registry`, populated by Module 9's turn this bar; and `g_poi_registry`/`g_poi_ext_registry`, current since Module 8's turn):
+
+```
+S.current_trace.pool_str += "\nRUN M9"
+f_m9_coordinator(S)
+
+S.current_trace.pool_str += "\nRUN M10"
+f_m10_coordinator(S)
+
+S.current_trace.pool_str += "\nRUN DASHBOARD"
+f_update_dashboards(S)
+```
+
+inserted between the existing `RUN M9` and `RUN DASHBOARD` lines. `f_m10_coordinator` internally sequences: Stage 0–4 (discovery/creation) then Stage 5 (lifecycle evaluation), per §9's ordering rule. No interaction with any module beyond Module 8/9 (read) and the dashboard (downstream reader of diag fields) is architected here, since no Module 11+ consumer contract beyond the dashboard and the implied future analytics consumer is specified in the material provided.
+
+---
+
+## §13. Replay Safety
+
+Unchanged from v1.0.
+
+1. **Determinism of discovery:** Stage 0 is gated on `barstate.isconfirmed` and iterates `g_m9_registry` in stable ascending index order — identical set of `TRIGGERED` candidates observed on a full-history replay as on a live run that reached the same bar.
+2. **No look-ahead:** entry/SL/TP are computed entirely from `candidate.entryZoneHigh/Low` (immutable, snapshotted at Module 9 creation, guaranteed unchanging per Module 8's POI-immutability contract) and the *current* confirmed bar's `S.current_context.atr` — no future bar is ever referenced.
+3. **No wall-clock dependency:** all timing is `bar_index`-delta based (`M10_REC_EXPIRY_BARS`); `time` is used only for audit/event timestamps, never for logic branching, matching Module 8's explicit `time`-not-`timenow` replay-safety discipline.
+4. **Stage 5 evaluates only the current confirmed bar's `low`/`high`** against fixed, already-computed `stopLoss`/`takeProfit` — identical mechanism to Module 9's own trigger-detection replay-safety argument.
+5. **At-most-one-transition-per-bar, fixed priority order** (§4.2) guarantees a single deterministic outcome regardless of whether the script evaluates bar-by-bar (live) or in one historical pass (backtest/replay) — same guarantee Module 9's document makes for its own state machine, and for the identical reason (no code path depends on evaluation mode).
+6. **Dedup keys are set synchronously within the same Stage 0 pass that discovers the candidate** — no window exists where a re-run of history could observe a different attempt count than a live run reaching the same bar.
+7. **FIFO eviction order is deterministic** (oldest-index-first) — identical outcome on replay and live for `g_trade_rec_registry` and `g_m10_dedup_keys`, now using the same manual push/shift primitives as Module 9 (§8.2), reinforcing rather than weakening this guarantee.
+8. **Event/Audit ordering** within one bar is fixed: Stage 0–4 (index order over `g_m9_registry`) then Stage 5 (index order over `g_trade_rec_registry`) — reproducible byte-for-byte across runs.
+
+No `request.security` call, no `timenow`, no `barstate.isrealtime`-gated branching exists anywhere in this architecture — the three classes of non-determinism Pine scripts most commonly introduce are all structurally absent from Module 10's design.
+
+---
+
+## §14. Edge Cases
+
+Unchanged from v1.0, with Edge Case 12 updated to reflect the closed H2 resolution.
+
+1. **Source POI evicted/resolved before Module 10 processes a `TRIGGERED` candidate.** Not a hard gate (§2) — link fields degrade to `"N/A"`/`""`, an `AUDIT_WARNING`-level note is folded into `confidenceFactors`, and the instance is still created (price geometry is self-sufficient on the `TradeCandidate` alone).
+2. **Candidate FIFO-evicted from `g_m9_registry` in the same bar it would have triggered.** Module 9's Stage 1 eviction (on overflow push) runs before its own Stage 5-equivalent trigger check within `f_m9_coordinator`; in the rare case the FIFO-oldest evicted entry is the same one about to trigger later that bar, Module 10 never observes the `TRIGGERED` transition at all. This is an inherited limitation of Module 9's frozen 100-slot FIFO registry, not fixable from Module 10 (which has no write access to `g_m9_registry`).
+3. **`S.current_context.atr` is `na`.** Only possible inside the `ATR_LENGTH`-bar (14-bar) warm-up window at the very start of chart history — by the time any candidate has traversed Module 9's full multi-stage lifecycle (create → confirm on a later bar → trigger), hundreds of bars have typically elapsed, so this gate is a correctness safeguard rather than a practically-common rejection path. (Carried forward as an acknowledged limitation per M1 — this "practically uncommon" characterization rests on an unstated assumption about `SWING_LOOKBACK`/`ATR_LENGTH` parameter values; not required to be resolved before freeze.)
+4. **Degenerate zone (`entryZoneHigh <= entryZoneLow`).** Should never occur given Module 8/9's own invariants; checked defensively per §5 Stage 1.
+5. **Confidence below floor but RR healthy, or vice versa.** Independent gates (§4 Stage 3) — either alone is sufficient to reject.
+6. **Multiple `TRIGGERED` candidates on the same confirmed bar.** Stage 0 processes each independently, in `g_m9_registry` index order — no shared mutable state between them within the loop, fully deterministic. (See also §3's H4 resolution: this is also the case that determines which candidate's outcome is reflected in the singleton `m10_latest_*` diagnostics.)
+7. **Registry overflow (`g_trade_rec_registry` > 500) evicting a still-ACTIVE instance.** Its eventual SL/TP/expiry outcome becomes permanently unknowable — flagged via `EVICTED_OVERFLOW` (§8.4/§9), the same accepted-limitation class as Module 9's own candidate eviction, and now using the same underlying push/shift mechanism (§8.2).
+8. **`g_m10_dedup_keys` overflow (>500) evicting an "attempted" marker while the source candidate is still `TRIGGERED` in `g_m9_registry`.** Theoretically permits a duplicate re-attempt at extreme volume. Mirrors the identical, already-accepted risk in `g_poi_dedup_keys` (capped at 50) and `g_m9_dedup_keys` (capped at 100) — not a new risk class introduced by Module 10.
+9. **`MOD_TR` shared between Module 9 and Module 10 events.** Any future consumer filtering `g_event_registry` by `module == MOD_TR` expecting only one module's events will get both, distinguishable only by `correlationId` prefix / `objectId` / `description` text, never by the `module` field alone. Documented in §9 as a deliberate, evidence-based reuse decision, not an oversight.
+10. **`POIInstance.confluenceScore`/`.grade` permanently `"UNSCORED"`.** Module 10 does not and cannot resolve this (§1, §0.7) — `TradeRecommendationInstance.confidence` is entirely independent.
+11. **`poi.mssLink`/`poi.brkLink` always `""`, `poi.liqTier` always `"N/A"` under the frozen Module 8 implementation.** Passed through as-is; Module 10 does not attempt independent MSS/Breaker correlation, since no data-linking infrastructure for that exists in the frozen registries and building one would be inventing a solution the task explicitly disallows.
+12. **Dashboard row 63 collision (§11).** **Closed as of v1.1** — formally attributed to Module 11 as an inherited defect, not remediated here, per the H2 resolution in §11.3.
+13. **A recommendation resolves (SL/TP/expiry) many bars after creation.** Per the H1 resolution (§3, §4.2), this is architecturally invisible on the dashboard's "latest" block by design — the block is creation-time-only. The resolution is fully visible via `g_trade_rec_registry` (by reference), the Event Bus, and the Audit Bus; it is simply not surfaced in the singleton diagnostics. Not a defect — a stated scope boundary.
+14. **More than one `TRIGGERED` candidate processed on the same bar, with differing outcomes (e.g., one accepted, one rejected).** Per the H4 resolution (§3), only the last-processed outcome (in `g_m9_registry` index order) appears in `m10_latest_*`/`m10_reject_reason`. Earlier same-bar outcomes remain fully retrievable via the Event Bus, Audit Bus, and — for accepted candidates — `g_trade_rec_registry`. Not a defect — a stated singleton-snapshot semantic.
+
+---
+
+## §15. Architecture Self-Audit
+
+Checked against the 15 required categories, updated for v1.1:
+
+- **Contradictions:** The one identified contradiction (C1, v1.0) is resolved in §8 — Module 10 no longer claims exclusive use of `f_push_trade_rec_registry` while also requiring evicted-instance inspection; it uses manual push/shift instead, and no other requirement in the document depends on the frozen helper's return value. No other contradictions found between this document's decisions and the frozen Module 9 architecture or the shipped Modules 1–9/11 source. Every field, row, counter, and constant referenced was verified present in the provided source before being used.
+- **Pine v6 implementation blockers:** None identified. This architecture relies exclusively on patterns already proven to compile and run correctly in the given source: `barstate.isconfirmed`-gated linear registry scans, reference-type UDT mutation (§0.11), the existing generic `f_push_*` helper family (still used for the shared audit/event buses, §10), manual `array.push`/`array.shift` (proven by `f_m9_push_candidate`, now also used by Module 10, §8.2), and the existing `f_emit_engine_event`/`f_push_audit` signatures. No new language construct is introduced.
+- **Replay issues:** Addressed exhaustively in §13; no `request.security`, no `timenow`, no realtime-only branching. The manual registry management in §8.2 uses the same replay-safe primitives Module 9 already relies on.
+- **Unreachable states:** Verified reachable — `EXPIRED` requires only that neither SL nor TP is touched within `M10_REC_EXPIRY_BARS` bars (ordinary, common case for a wide zone or low-volatility instrument); `STOPPED`/`FULFILLED` require only ordinary price movement past the constructed levels. `rating = "Reject"` on a `TradeRecommendationInstance` is now correctly documented as unreachable (§7, M3 resolution) — this is intentional, not a defect, since no such instance can exist by construction.
+- **Impossible transitions:** Verified impossible by construction — `exitReason` is write-once (no code path ever clears or reassigns a non-empty `exitReason`), so no terminal state can revert to `ACTIVE` or transition to a different terminal state.
+- **Registry ownership violations:** Explicitly avoided — Module 10 never writes to `g_m9_registry`, `g_m9_dedup_keys`, `g_m9_rt`, `g_poi_registry`, or `g_poi_ext_registry`. Only `g_trade_rec_registry` (now via manual push/shift, §8.2), its parallel arrays, and the new `g_m10_dedup_keys` are written, all exclusively by Module 10.
+- **Circular dependencies:** None — Module 10 reads Module 9 (which reads Module 8, which reads Module 7/5), and writes nothing back upstream. The dependency graph remains a strict DAG: 5 → 6 → 7 → 8 → 9 → 10 → 11 (dashboard).
+- **Hidden assumptions, made explicit:**
+  - Module 10's coordinator runs in the same single-threaded, per-confirmed-bar execution pass as every other module (true of the entire script's design; not unique to Module 10, but stated for completeness).
+  - `g_poi_registry`/`g_poi_ext_registry` index-synchronization (§0.8) is assumed to hold indefinitely because only Module 8's own coordinator ever pushes to either array, and it always does so via the shared `f_m8_push_poi_registry` helper that pushes/shifts both together. This assumption is correct given the frozen Module 8 source but would break silently if a future, non-Module-8 change ever pushed to one array without the other.
+  - The `MAX_M10_DEDUP_REGISTRY = 500` and `M10_REC_EXPIRY_BARS = 100` values are discretionary capacity/tuning choices (§5, §8), not derived from a hard correctness requirement — flagged so a future reviewer does not mistake them for load-bearing invariants.
+  - **[New in v1.1]** The dashboard's "latest recommendation" block being creation-time-only (§3, H1) and singleton across same-bar multiplicity (§3, H4) are both now explicit, stated design boundaries rather than implicit behavior a future reviewer would have to infer from the absence of code.
+- **Additional findings beyond the checklist**, surfaced during drafting and carried forward from v1.0's audit:
+  1. The Module 9 architecture document's own §13 dashboard table (5 rows, 58–62) does not match the shipped Module 9 implementation (3 rows, 58–60) — a documentation-vs-implementation drift in a document declared frozen. Module 10's row ownership (§11) is defined against the *implementation*, since that is what actually executes.
+  2. Two constant-naming near-collisions exist in Module 1 (`STRATEGY_SL_BUFFER_ATR`/`STRATEGY_TP_MULT`/`REC_EXPIRY_BARS` vs. this document's new `M10_SL_BUFFER_ATR_MULT`/`M10_TP_RR_MULT`/`M10_REC_EXPIRY_BARS`) — deliberately not consolidated, per §5's rationale, but worth flagging so a future maintainer does not assume they are the same constant.
+  3. `MOD_TR` reuse (§9) means the Event Bus's module-ID axis alone cannot distinguish Module 9 from Module 10 activity — a real, permanent limitation of the frozen constant set, not fully resolvable without modifying Module 1 (which this architecture deliberately declines to do).
+
+**No remaining `[UNRESOLVED]` items within Module 10's own ownership boundary.** All seven items raised by the independent audit (C1, H1, H2, H4, M3, M4, M5) are resolved by explicit, evidenced decisions in this document. M1, M2, and Low Priority items L1–L3 remain carried forward as documented, acknowledged limitations, exactly as the audit permitted.
+
+---
+
+## §16. Freeze Statement
+
+This document, Module 10 Architecture v1.1, is **FROZEN**. It incorporates the seven changes required by the independent audit of v1.0 and no others. It is internally consistent, fully specified against the frozen Module 9 architecture and the verified Modules 1–9/11 Pine source, and contains no remaining unresolved contradictions, implementation blockers, or ownership ambiguities within Module 10's boundary.
+
+**This document is ready for Pine Script generation.**
